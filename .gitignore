@@ -1,0 +1,25 @@
+# Forks and reference clones are separate git repositories, not submodules.
+# This repo tracks docs/, harness/, scripts/, and ghostty-patches/ only.
+/ghostty/
+/terminal/
+/reference/
+
+# Build outputs
+/build/
+zig-out/
+.zig-cache/
+zig-cache/
+/tools/
+
+# Visual Studio / MSBuild
+.vs/
+*.user
+*.suo
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+
+# OS
+Thumbs.db
+desktop.ini

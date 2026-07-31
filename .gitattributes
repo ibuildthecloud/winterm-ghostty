@@ -1,0 +1,15 @@
+# Keep LF in the working tree. This repo will hold `git format-patch` output for the
+# ghostty fork (ghostty-patches/, ADR 0004); CRLF conversion would corrupt those patches
+# and break `git am` against a LF upstream.
+* text=auto eol=lf
+
+# Windows-native build wrappers are invoked by cmd/PowerShell; CRLF is safer there.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Never touch archived diffs or binary assets.
+*.diff -text
+*.patch -text
+*.png binary
+*.dll binary
