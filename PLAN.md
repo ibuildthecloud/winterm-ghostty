@@ -15,7 +15,7 @@ follow 5.
 
 | Phase | Status | Session notes |
 |---|---|---|
-| 0 — Toolchain + baselines | 4/5 criteria met | [0001](docs/sessions/0001-phase-0.md): repo + pins + #11886 archived (incl. binary shaders); wintty runs a shell; **WT builds from source on VS2026/v145 and launches as a deployed dev package** (no VS2022 needed — PLAN text is stale). Criterion 2's premise is falsified, not outstanding: it asserts *unpatched* upstream builds, which is false at pin `4d605bf0` and only an upstream merge can change. Fixed in-session at the gate's direction: branch `windows`, patch 0 `75c31f2c` → **`ghostty-internal.dll` links, x64 PE, 231 C-API exports**, tests unchanged at 3061/55/0. Retro: amend that criterion's wording, and ratify the ADR 0004 patch-list change (§5.1). |
+| 0 — Toolchain + baselines | **complete** (retro done) | [0001](docs/sessions/0001-phase-0.md): repo + pins + #11886 archived (incl. binary shaders); wintty runs a shell; **WT builds from source on VS2026/v145 and launches as a deployed dev package** (no VS2022 needed — PLAN text is stale). Criterion 2's premise is falsified, not outstanding: it asserts *unpatched* upstream builds, which is false at pin `4d605bf0` and only an upstream merge can change. Fixed in-session at the gate's direction: branch `windows`, patch 0 `75c31f2c` → **`ghostty-internal.dll` links, x64 PE, 231 C-API exports**, tests unchanged at 3061/55/0. Retro: amend that criterion's wording, and ratify the ADR 0004 patch-list change (§5.1). |
 | 1 — Fork bootstrap + first pixels | not started | |
 | 2 — SwapChainPanel proof | not started | |
 | 3 — Real terminal rendering | not started | |
@@ -41,8 +41,11 @@ code is written.
   commit at session end (and every session thereafter, per PROCESS.md). The `ghostty/`
   and `terminal/` forks created in later phases are their own clones — add them to
   `.gitignore` here; this repo tracks docs, `harness/`, and `scripts/` only.
-- Install: Zig (version from ghostty `build.zig.zon`), VS2022 + Windows SDK, `dxc`,
-  Windows Terminal build prereqs (see terminal repo README).
+- Install: Zig (version from ghostty `build.zig.zon`), **Visual Studio 2026 (MSVC v145)**
+  with `terminal/.vsconfig` applied, Windows SDK ≥ 10.0.26100.8249, `fxc`/`dxc`.
+  *(Amended at retro: WT's `src/common.build.pre.props` selects v145 when
+  `VisualStudioVersion >= 18.0`, and WT's README ships a winget config for VS 2026 —
+  VS2022/v143 is not required. `.vsconfig` is the authoritative component list.)*
 - Clone upstream `ghostty-org/ghostty`; build `zig build -Dapp-runtime=none` (libghostty
   DLL+static) and `zig build test` on Windows. Record the pinned commit.
 - Clone `microsoft/terminal`; build and launch unpackaged WT from source. Record pin.
@@ -54,18 +57,28 @@ code is written.
 - Write `scripts/` wrappers for the two builds.
 
 Exit criteria (all demonstrable):
-- [ ] This repo is a git repository with the docs committed.
-- [ ] `libghostty` (upstream, unpatched) builds and its tests pass on this machine.
-- [ ] Windows Terminal builds from source and launches.
-- [ ] wintty runs a shell locally.
-- [ ] PR #11886 diff archived; upstream pins recorded in DESIGN.md.
+- [x] This repo is a git repository with the docs committed.
+- [x] `libghostty` builds and its tests pass on this machine, with the minimum patch set
+      required to do so, and that patch set is recorded in `ghostty-patches/`.
+      *(Amended at the Phase 0 retro. The original wording said "upstream, **unpatched**",
+      which assumed upstream built on Windows. It does not, at pin `4d605bf0` — so as
+      written the criterion asserted something only an upstream merge could make true.
+      See `docs/sessions/0001-phase-0.md` §2 and §5.1.)*
+- [x] Windows Terminal builds from source and launches.
+- [x] wintty runs a shell locally.
+- [x] PR #11886 diff archived; upstream pins recorded in DESIGN.md.
 
-Open questions (resolve at readiness):
-- Which physical machine/GPU is the dev box, and does it have a second config (VM/RDP)
-  for WARP-path testing later?
-- None design-level — this phase exists to *answer* questions, not consume them.
+Open questions — **all resolved**:
+- ~~Which physical machine/GPU is the dev box, second config for WARP?~~ SER9, Ryzen AI 9
+  HX 370, **integrated AMD Radeon 890M**, 64 GB. WARP validation is done over **RDP into
+  this same machine**; there is no second physical config. Recorded in DESIGN.md.
 
-Re-evaluate: Zig version friction? WT build friction that affects Phase 4 scoping?
+Re-evaluated: **Zig version friction — none** (0.16.0 pinned by `build.zig.zon` +
+`flake.nix`, installed locally under `tools/`). **WT build friction — low, and it does not
+affect Phase 4 scoping**: v145 builds everything, and WT already builds/launches from
+source, so Phase 4's test-suite baseline can be captured before any seam work.
+**New friction found where none was expected**: upstream libghostty did not link on
+Windows/MSVC at all (now fixed by patch 0 — see the session report).
 
 ## Phase 1 — Ghostty fork bootstrap + first pixels (patch series, ADR 0002/0004)
 
@@ -92,7 +105,13 @@ through the embedded C API.
   `src/renderer/backend.zig` defaulting on Windows; `src/renderer/D3D11.zig` implementing
   the `GraphicsAPI` contract enumerated in `src/renderer/generic.zig` — port the revived
   #11886 diff (archived in Phase 0) as the base, wintty's `src/renderer/directx12/` as
-  the pattern reference for device lifecycle/surface modes. Scope: device creation with
+  the pattern reference for device lifecycle/surface modes.
+  **Retro correction: #11886 is infrastructure only** — COM bindings, device lifecycle,
+  DXGI, an instanced cell-grid pipeline, and hand-written SM 5.0 HLSL. Its `DirectX11.zig`
+  contains no `pub fn` at all, only re-exports, and its own header says the GenericRenderer
+  integration (Target, Frame, RenderPass, Buffer, Texture, Sampler, shaders) is "planned
+  for follow-up work". **We write the `GraphicsAPI` implementation ourselves**; #11886 is
+  the layer beneath it, not a shortcut past it. Scope: device creation with
   hardware→WARP fallback chain, hwnd-mode swapchain, and a frame that clears and
   presents. Pipelines/atlas/shaders are Phase 3 — stub the option-factory methods with
   compiling no-ops. **If `GenericRenderer.drawFrame` cannot run end-to-end without real
@@ -186,11 +205,15 @@ Exit criteria:
 
 Open questions (resolve at readiness):
 - ADR 0005 flipped to `Accepted`?
-- **Shader toolchain for D3D11**: D3D11 consumes DXBC (classic `fxc`, SM 5.0), not the
-  DXIL that `dxc`/SM 6 emits — wintty's SM 6 HLSL is a D3D12-ism we can't copy blind.
-  Decide: route ghostty's existing glslang→SPIRV-Cross pipeline to HLSL output compiled
-  with `fxc`, or hand-port the shaders to SM 5.0? (Check what #11886 actually did — it
-  shipped pre-compiled shaders.)
+- ~~**Shader toolchain for D3D11**~~ — **ANSWERED in Phase 0.** #11886 hand-wrote HLSL and
+  compiled it with `fxc /T vs_5_0` / `ps_5_0`, embedding the resulting `.cso` via
+  `@embedFile`. That is SM 5.0 DXBC, confirming the suspicion that `dxc`/SM 6 DXIL is a
+  D3D12-ism we cannot copy from wintty. Both `fxc` and `dxc` ship in SDK 26100.8249 on the
+  dev box. The blobs and the exact commands are in
+  `docs/research/pr-11886-assets/README.md`.
+  Remaining sub-question for this phase: hand-port the full shader set to SM 5.0 (what
+  #11886 did, for one pipeline), or route ghostty's glslang→SPIRV-Cross pipeline to HLSL
+  output and compile that with `fxc`? Decide once the Phase 3 shader inventory is known.
 - Exit bar for emoji: is CBDT-only (no COLRv1 Segoe glyphs) acceptable for this phase's
   exit, with COLRv1 as a tracked gap re-evaluated at Phase 6?
 - Benchmark methodology: pick the throughput/latency harness now (vtebench? plain

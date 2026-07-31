@@ -16,11 +16,17 @@ winterm-ghostty/
   PLAN.md              staged implementation plan (one phase ≈ one agent session)
   docs/adr/            architecture decision records
   docs/research/       feasibility study + synthesis design (background, superseded by this file)
-  ghostty/             fork of ghostty-org/ghostty      (created in Phase 1; patch series per ADR 0004)
-  terminal/            fork of microsoft/terminal       (created in Phase 4)
+  ghostty/             fork of ghostty-org/ghostty      (gitignored clone; branch `windows`, patch series per ADR 0004)
+  terminal/            fork of microsoft/terminal       (gitignored clone; created in Phase 4)
+  reference/           read-only clones: wintty, winghostty, phantty (gitignored)
+  ghostty-patches/     exported `git format-patch` output — the tracked, reviewable form of the fork
   harness/             minimal Win32/WinUI hosts for testing libghostty.dll without WT (Phase 1–3)
   scripts/             build/CI helpers (Zig build wrappers, MSBuild invocations, patch-queue tooling)
+  tools/               pinned Zig toolchain (gitignored; fetched by scripts/zigenv.ps1)
 ```
+
+The forks are clones, not submodules. Only `ghostty-patches/` is tracked, so the fork is
+always reproducible from *recorded upstream pin + exported patches* (ADR 0004).
 
 ## Architecture
 
