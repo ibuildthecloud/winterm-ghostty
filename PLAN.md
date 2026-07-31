@@ -16,7 +16,7 @@ follow 5.
 | Phase | Status | Session notes |
 |---|---|---|
 | 0 — Toolchain + baselines | **complete** (retro done) | [0001](docs/sessions/0001-phase-0.md): repo + pins + #11886 archived (incl. binary shaders); wintty runs a shell; **WT builds from source on VS2026/v145 and launches as a deployed dev package** (no VS2022 needed — PLAN text is stale). Criterion 2's premise is falsified, not outstanding: it asserts *unpatched* upstream builds, which is false at pin `4d605bf0` and only an upstream merge can change. Fixed in-session at the gate's direction: branch `windows`, patch 0 `75c31f2c` → **`ghostty-internal.dll` links, x64 PE, 231 C-API exports**, tests unchanged at 3061/55/0. Retro: amend that criterion's wording, and ratify the ADR 0004 patch-list change (§5.1). |
-| 1 — Fork bootstrap + first pixels | not started | |
+| 1 — Fork bootstrap + first pixels | **ready** (readiness passed 2026-07-31) | Fork exists at pin `4d605bf0` on branch `windows` with patch 0 (`windows-build`) already landed; ADRs 0002/0004 Accepted; all open questions resolved. |
 | 2 — SwapChainPanel proof | not started | |
 | 3 — Real terminal rendering | not started | |
 | 4 — WT seam (IControlCore) | not started | |
@@ -139,14 +139,31 @@ Exit criteria:
 - [ ] Each patch builds + `zig build test` passes independently.
 - [ ] Appcontainer/MSIX answer recorded.
 
-Open questions (resolve at readiness):
-- ADRs 0002 and 0004 flipped to `Accepted`? (This phase builds directly against both.)
-- Did Phase 0 archive the #11886 diff intact, and does a first read confirm it matches
-  what the research claimed (GraphicsAPI-shaped, composition swapchain)?
-- Fork remote strategy: private GitHub fork vs local-only clone for now? (Affects nothing
-  technical; decide for backup/collaboration reasons.)
-- WTF-16 entry point: new `ghostty_init_w` vs platform-conditional argv type — currently
-  delegated to the agent; confirm we're comfortable delegating, or decide now.
+Open questions — **all resolved at the Phase 0 retro (2026-07-31); phase is ready**:
+- ~~ADRs 0002 and 0004 flipped to `Accepted`?~~ **Both Accepted.** 0004 additionally
+  amended: `windows-build` added as patch 0, and the per-patch build rule reworded so an
+  indivisible topic isn't forced into non-building halves.
+- ~~Did Phase 0 archive #11886 intact, and does a first read confirm the research?~~
+  **Archived and binary-complete** (text diff + the two `.cso` blobs, which `gh pr diff`
+  drops). First read **partially** confirms: the module layout and composition approach are
+  as described, but the PR is **infrastructure only** and implements none of the
+  `GraphicsAPI` contract. Phase 1 writes that itself — the phase text above is corrected.
+- ~~Fork remote strategy?~~ **Local only, no remote, nothing pushed.** `ghostty-patches/`
+  in this repo is the durable artifact. ADR 0004 amendment §3.
+- ~~WTF-16 entry point: `ghostty_init_w` vs platform-conditional argv?~~ **Confirmed
+  delegated to the agent**, within the envelope "keep the C signature additive"; record the
+  choice in the session report.
+
+Starting state (not assumptions — verified in Phase 0):
+- `ghostty/` clone exists at pin `4d605bf0`, branch `windows`, carrying patch 0
+  (`75c31f2c`). `zig build -Dapp-runtime=none` → `ghostty-internal.dll` with 231 C-API
+  exports; `zig build test` → 3061 pass / 55 skip / 0 fail.
+- Build wrappers exist: `scripts/zigenv.ps1`, `scripts/build-ghostty.ps1`
+  (`-Test`, `-Target` for the ARM64 cross-build), `scripts/build-terminal.ps1`.
+- Still to build in this phase: `scripts/rebase-upstream.*` and `scripts/export-patches`
+  (patch 0 was exported with a raw `git format-patch` — the tooling itself is Phase 1 work).
+- Harness screenshots must use `PrintWindow` against a specific `HWND`, never
+  `Graphics.CopyFromScreen` (session 0001, deviation 10).
 
 Re-evaluate: how much of #11886 survived the rebase vs rewritten? Is the GraphicsAPI
 contract stable enough on upstream main, or do we need a tighter pin cadence?
@@ -372,10 +389,14 @@ Exit criteria:
 
 Open questions (standing, revisit each retro):
 - When to contact deblasis — before Phase 1 (shared heritage, avoid divergence) or after
-  first pixels (something concrete to show)? Recommendation: before Phase 1.
-- Attribution/provenance notes for harvested MIT code (wintty/winghostty/AtlasEngine) —
-  decide the convention (per-file header note vs NOTICES file) before the first harvest
-  lands in Phase 1.
+  first pixels (something concrete to show)? Recommendation: before Phase 1. **Now also
+  relevant:** patch 0 already harvests wintty's pipe helpers, and both of its fixes are
+  upstream bugs deblasis has plainly already hit.
+- ~~Attribution/provenance convention~~ — **DECIDED at the Phase 0 retro: per-file header
+  note** naming project + license at the harvested code, plus a commit-message line. See
+  ADR 0004 "Amendments from Phase 0" §4. First instance: patch 0.
+- **New:** patch 0 (`windows-build`) is upstreamable as-is and is the first thing to offer
+  — ahead of `init-wtf16`. Both halves are upstream bugs, not port scaffolding.
 
 - Immediately: libxev IOCP timer fix → mitchellh/libxev; contact deblasis re:
   collaboration/patch heritage.

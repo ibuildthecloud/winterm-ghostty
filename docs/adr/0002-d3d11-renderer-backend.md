@@ -1,6 +1,6 @@
 # 0002 — D3D11 as the ghostty GPU backend on Windows
 
-Status: Proposed (2026-07-31)
+Status: **Accepted** (2026-07-31, at the Phase 0 retro)
 
 ## Context
 
