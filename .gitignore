@@ -25,3 +25,8 @@ zig-cache/
 # OS
 Thumbs.db
 desktop.ini
+
+# Probe build output
+harness/warp-probe/*.exe
+harness/warp-probe/*.obj
+

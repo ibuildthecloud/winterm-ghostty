@@ -161,6 +161,20 @@ behavior; this change is upstreamable on its own.
 binding makes re-attach clean) → 4. engine init failure → `RendererEnteredErrorState` +
 profile fallback to `"engine": "cascadia"`.
 
+Steps 1–2 are **verified on the dev box** (`harness/warp-probe`, 2026-07-31): hardware,
+`D3D_DRIVER_TYPE_WARP`, and the explicit `EnumWarpAdapter` adapter all create a device at
+**feature level 11_1** with `D3D11_CREATE_DEVICE_BGRA_SUPPORT`. WARP presenting as an
+equal feature level to hardware is what lets step 2 be "the same code path" rather than a
+reduced one. `dcomp.dll` and `DCompositionCreateSurfaceHandle` are present, so the Phase 2
+composition path has its prerequisites.
+
+Caveat for Phase 7: `D3D11_FEATURE_DATA_THREADING` reports
+`DriverConcurrentCreates=1` but **`DriverCommandLists=0` on both hardware and WARP** —
+deferred-context command lists are runtime-emulated on this hardware, not driver-native.
+That does not affect the design (ADR 0002 keeps a single renderer thread on the immediate
+context), but it rules out "record command lists on worker threads" as a free Phase 7
+optimisation; it would have to be measured, not assumed.
+
 ### Accessibility
 
 Reimplement `ITextProvider`/`ITextRangeProvider` over the read-back API behind WT's

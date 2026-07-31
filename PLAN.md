@@ -131,7 +131,11 @@ Escalation triggers (stop the item, report DECISION-NEEDED, per PROCESS.md):
   #11886/wintty implement (new required methods are fine to stub; changed semantics are
   not).
 - The WTF-16 fix can't stay additive (would break existing C API signatures).
-- WARP device creation fails on this machine (invalidates the ADR 0002 fallback story).
+- ~~WARP device creation fails on this machine~~ — **PRE-CLEARED 2026-07-31.**
+  `harness/warp-probe` creates a D3D11 device three ways on this box: hardware,
+  `D3D_DRIVER_TYPE_WARP`, and the explicit `IDXGIFactory4::EnumWarpAdapter` adapter. All
+  three succeed at **feature level 11_1** with `BGRA_SUPPORT`. ADR 0002's fallback story
+  holds. Re-run the probe over RDP before Phase 7's remote-session work.
 
 Exit criteria:
 - [ ] Harness shows a libghostty-cleared, resizable, DPI-correct surface (hardware AND
