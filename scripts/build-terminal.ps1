@@ -13,6 +13,19 @@
          native projects actually consume.
       2. Building an individual .vcxproj requires -SolutionDir, because the
          projects import `$(SolutionDir)common.openconsole.props`.
+      3. MSBuild's default `/m` (one node per core) exhausts commit charge on
+         the C++/WinRT + XAML translation units: cl.exe dies with
+         "C1076: compiler limit: internal heap limit reached" and the underlying
+         "the system returned code 1455: The paging file is too small". Hence
+         -MaxCpuCount 4 / CL_MPCount 2 by default. Raise at your own risk.
+      4. If a build dies that way, the XAML/cppwinrt codegen is left half
+         written and MSBuild then considers it up to date, so the next build
+         fails with a wall of "Cannot open include file: 'Xxx.g.h'". Use
+         -CleanCodegen to delete the stale "Generated Files" + obj dirs.
+      5. The unpackaged bin\x64\Debug\WindowsTerminal\WindowsTerminal.exe
+         calls abort() on launch. The supported run-from-source path is
+         -Project package followed by -Deploy (DeployAppRecipe), which
+         registers WindowsTerminalDev_8wekyb3d8bbwe!App.
 
     MSBuild is located through vswhere, so this follows whichever Visual
     Studio is installed (VS 2026 / v145 on the Phase 0 machine; WT's
@@ -39,6 +52,17 @@ param(
 
     # Skip the NuGet restore (it is idempotent but not free).
     [switch] $NoRestore,
+
+    # Parallel MSBuild nodes. Defaults to 4 deliberately - see note 3 above.
+    [int] $MaxCpuCount = 4,
+
+    # Delete the XAML/cppwinrt generated output before building, to recover
+    # from a half-written codegen left by an out-of-memory build (note 4).
+    [switch] $CleanCodegen,
+
+    # After building, deploy the loose layout via DeployAppRecipe and print
+    # the AUMID. Only meaningful with -Project package.
+    [switch] $Deploy,
 
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]] $Rest
@@ -90,6 +114,24 @@ if (-not $NoRestore) {
 }
 if ($RestoreOnly) { return }
 
+# --- Recover from a half-written codegen ----------------------------------
+if ($CleanCodegen) {
+    foreach ($proj in 'TerminalSettingsEditor', 'TerminalApp', 'TerminalControl', 'TerminalSettingsModel') {
+        $gen = Join-Path $TerminalRoot "src\cascadia\$proj\Generated Files"
+        if (Test-Path $gen) {
+            Write-Host "  removing $gen" -ForegroundColor DarkYellow
+            Remove-Item -Recurse -Force $gen
+        }
+    }
+    $obj = Join-Path $TerminalRoot "obj\$Platform\$Configuration"
+    if (Test-Path $obj) {
+        Get-ChildItem $obj -Directory | Where-Object Name -match 'Terminal' | ForEach-Object {
+            Write-Host "  removing $($_.FullName)" -ForegroundColor DarkYellow
+            Remove-Item -Recurse -Force $_.FullName
+        }
+    }
+}
+
 # --- Build ----------------------------------------------------------------
 $msbuildArgs = @(
     $projectFull
@@ -98,11 +140,12 @@ $msbuildArgs = @(
     "/p:Platform=$Platform"
     '/v:m'
     '/nologo'
-    '/m'
+    "/m:$MaxCpuCount"
+    '/p:CL_MPCount=2'
 )
 if ($Rest) { $msbuildArgs += $Rest }
 
-Write-Host "msbuild $projectPath ($Configuration|$Platform)" -ForegroundColor Cyan
+Write-Host "msbuild $projectPath ($Configuration|$Platform, /m:$MaxCpuCount)" -ForegroundColor Cyan
 & $msbuild @msbuildArgs
 if ($LASTEXITCODE -ne 0) { throw "msbuild failed with exit code $LASTEXITCODE" }
 
@@ -110,4 +153,23 @@ $binDir = Join-Path $TerminalRoot "bin\$Platform\$Configuration"
 if (Test-Path $binDir) {
     Write-Host "`nOutput in $binDir" -ForegroundColor Green
     Get-ChildItem $binDir -Filter *.exe | ForEach-Object { '  {0}' -f $_.Name }
+}
+
+# --- Deploy ---------------------------------------------------------------
+if ($Deploy) {
+    $recipe = Join-Path $TerminalRoot `
+        "src\cascadia\CascadiaPackage\bin\$Platform\$Configuration\CascadiaPackage.build.appxrecipe"
+    if (-not (Test-Path $recipe)) {
+        throw "appxrecipe not found at $recipe - build with -Project package first."
+    }
+    $vsRoot  = & $vswhere -latest -prerelease -products * -property installationPath
+    $deployer = Join-Path $vsRoot 'Common7\IDE\DeployAppRecipe.exe'
+    if (-not (Test-Path $deployer)) { throw "DeployAppRecipe.exe not found at $deployer" }
+
+    Write-Host "`nDeployAppRecipe $recipe" -ForegroundColor Cyan
+    & $deployer $recipe
+    if ($LASTEXITCODE -ne 0) { throw "DeployAppRecipe failed with exit code $LASTEXITCODE" }
+
+    Write-Host "`nLaunch with:" -ForegroundColor Green
+    Write-Host '  Start-Process "shell:appsFolder\WindowsTerminalDev_8wekyb3d8bbwe!App"'
 }

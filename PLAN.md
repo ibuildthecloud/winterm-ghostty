@@ -15,7 +15,7 @@ follow 5.
 
 | Phase | Status | Session notes |
 |---|---|---|
-| 0 — Toolchain + baselines | 3/5 criteria met | [0001](docs/sessions/0001-phase-0.md): repo + pins + #11886 archived; wintty runs a shell. **Upstream libghostty does not link on MSVC** (memset + POSIX `close`/`write`); WT native builds on v145, XAML tower blocked on the UWP workload (install started). Two DECISION-NEEDED. |
+| 0 — Toolchain + baselines | 4/5 criteria met | [0001](docs/sessions/0001-phase-0.md): repo + pins + #11886 archived (incl. binary shaders); wintty runs a shell; **WT builds from source on VS2026/v145 and launches as a deployed dev package** (no VS2022 needed — PLAN text is stale). Unmet: **upstream libghostty does not link on MSVC** (memset vs libvcruntime, then POSIX `close`/`write` in `termio/Exec.zig`); `zig build test` passes 3061/0. One DECISION-NEEDED: ADR 0004 needs a `windows-build` patch ahead of `init-wtf16`. |
 | 1 — Fork bootstrap + first pixels | not started | |
 | 2 — SwapChainPanel proof | not started | |
 | 3 — Real terminal rendering | not started | |
