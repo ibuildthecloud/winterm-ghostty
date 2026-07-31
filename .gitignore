@@ -1,5 +1,7 @@
 # Forks and reference clones are separate git repositories, not submodules.
 # This repo tracks docs/, harness/, scripts/, and ghostty-patches/ only.
+# The fork's commits are reproducible from the recorded upstream pin plus the
+# exported patches in ghostty-patches/ (ADR 0004), which ARE tracked here.
 /ghostty/
 /terminal/
 /reference/

@@ -1,0 +1,231 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Fri, 31 Jul 2026 14:54:55 -0700
+Subject: [PATCH] windows: fix libghostty.dll link against the MSVC CRT
+
+libghostty does not link on x86_64-windows-msvc. `zig build test` passes
+(3061/3116, 55 skipped), but `zig build -Dapp-runtime=none` fails at the
+DLL link step with two unrelated causes.
+
+1. Duplicate `memset`.
+
+   GhosttyLib.zig links libvcruntime to satisfy the CRT initialization
+   chain (__vcrt_initialize / __acrt_initialize). libvcruntime defines a
+   strong `memset`, and quirks_memset.zig exports one too, so lld-link
+   reports a duplicate symbol.
+
+   The existing guard already anticipated this - its comment says "MSVC
+   has CRT which links so we don't need this there anyways" - but it only
+   excluded the weak-COFF case, not the msvc ABI generally. Widen it to
+   `builtin.abi != .msvc`. The quirk exists to beat compiler_rt's scalar
+   memset; the MSVC CRT already ships a vectorized one, so nothing is lost.
+
+2. Undefined `close` / `write`.
+
+   os/pipe.zig's `pipe()` returns Windows HANDLEs from CreatePipe, but
+   termio/Exec.zig passed them to `posix.system.close` and
+   `posix.system.write`. Those symbols do not exist in the MSVC CRT, so
+   they surfaced as undefined at link time - but the calls were already
+   wrong on Windows regardless of ABI: a HANDLE is not a file descriptor
+   and CloseHandle is not close.
+
+   Add `closeEnd` / `writeEnd` beside `pipe()` so the close and write
+   paths mirror the platform split that `pipe()` itself already makes,
+   and route Exec.zig's four Windows-reachable call sites through them.
+   `writeEnd` returns an enum rather than an errno so callers can branch
+   on broken-pipe without a POSIX-shaped error type; for the quit-signal
+   pipes broken-pipe is the intended outcome, not a failure.
+
+   threadMainPosix keeps its direct posix call - it is correct there and
+   comptime-excluded on Windows. The remaining posix.system.close sites
+   in pty.zig and Exec.zig are likewise POSIX-only paths.
+
+   Zig 0.16 removed WriteFile from std.os.windows entirely (no wrapper
+   and no kernel32 decl), so declare it alongside the existing CloseHandle
+   extern in os/windows.zig.
+
+The pipe helpers are adapted from deblasis/wintty (MIT), noted in-file.
+
+Result on x86_64-windows-msvc, Zig 0.16.0, MSVC 14.51:
+  zig build -Dapp-runtime=none  -> ghostty-internal.dll, x64 PE,
+                                   231 exports incl. the ghostty_* C API
+  zig build test                -> 3061 passed, 55 skipped, 0 failed
+                                   (unchanged from upstream)
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/os/main.zig       |  2 ++
+ src/os/pipe.zig       | 58 +++++++++++++++++++++++++++++++++++++++++++
+ src/os/windows.zig    |  9 +++++++
+ src/quirks_memset.zig |  1 +
+ src/termio/Exec.zig   | 23 ++++++++---------
+ 5 files changed, 80 insertions(+), 13 deletions(-)
+
+diff --git a/src/os/main.zig b/src/os/main.zig
+index 7f9e12cf9..c465d8828 100644
+--- a/src/os/main.zig
++++ b/src/os/main.zig
+@@ -50,6 +50,8 @@ pub const clickInterval = mouse.clickInterval;
+ pub const open = openpkg.open;
+ pub const OpenType = openpkg.Type;
+ pub const pipe = pipepkg.pipe;
++pub const closePipeEnd = pipepkg.closeEnd;
++pub const writePipeEnd = pipepkg.writeEnd;
+ pub const resourcesDir = resourcesdir.resourcesDir;
+ pub const ResourcesDir = resourcesdir.ResourcesDir;
+ pub const ShellEscapeWriter = shell.ShellEscapeWriter;
+diff --git a/src/os/pipe.zig b/src/os/pipe.zig
+index 0310fb3ed..3bd42dc44 100644
+--- a/src/os/pipe.zig
++++ b/src/os/pipe.zig
+@@ -20,3 +20,61 @@ pub fn pipe() ![2]posix.fd_t {
+         },
+     }
+ }
++
++/// Close one end of a pipe from `pipe()`. Mirrors the platform split
++/// above: POSIX ends are fds and close with the syscall, Windows ends
++/// are HANDLEs and need CloseHandle. `posix.system.close` does not
++/// link at all against the MSVC CRT.
++///
++/// Harvested from deblasis/wintty (MIT).
++pub fn closeEnd(fd: posix.fd_t) void {
++    switch (builtin.os.tag) {
++        else => _ = posix.system.close(fd),
++        .windows => _ = windows.exp.kernel32.CloseHandle(fd),
++    }
++}
++
++/// What a `writeEnd` call did, collapsing the two platforms' very
++/// different error reporting to the cases callers actually branch on.
++pub const WriteResult = enum {
++    ok,
++    /// The reader closed its end. For the quit-signal pipes this is the
++    /// intended outcome, not a failure.
++    broken_pipe,
++    failed,
++};
++
++/// Write to one end of a pipe from `pipe()`. See `closeEnd` for why
++/// this can't just be `posix.system.write` everywhere.
++///
++/// Harvested from deblasis/wintty (MIT).
++pub fn writeEnd(fd: posix.fd_t, bytes: []const u8) WriteResult {
++    switch (builtin.os.tag) {
++        else => return switch (posix.errno(posix.system.write(
++            fd,
++            bytes.ptr,
++            bytes.len,
++        ))) {
++            .SUCCESS => .ok,
++            .PIPE => .broken_pipe,
++            else => .failed,
++        },
++
++        .windows => {
++            var written: windows.DWORD = 0;
++            if (windows.exp.kernel32.WriteFile(
++                fd,
++                bytes.ptr,
++                @intCast(bytes.len),
++                &written,
++                null,
++            ) == windows.FALSE) {
++                return switch (windows.GetLastError()) {
++                    .BROKEN_PIPE, .NO_DATA => .broken_pipe,
++                    else => .failed,
++                };
++            }
++            return .ok;
++        },
++    }
++}
+diff --git a/src/os/windows.zig b/src/os/windows.zig
+index feef8ce92..aeaddf319 100644
+--- a/src/os/windows.zig
++++ b/src/os/windows.zig
+@@ -202,6 +202,15 @@ pub const exp = struct {
+         pub extern "kernel32" fn CloseHandle(
+             hObject: HANDLE,
+         ) callconv(.winapi) BOOL;
++        /// Zig 0.16's std.os.windows dropped WriteFile entirely (there is no
++        /// wrapper and no kernel32 decl), so declare it here.
++        pub extern "kernel32" fn WriteFile(
++            hFile: HANDLE,
++            lpBuffer: [*]const u8,
++            nNumberOfBytesToWrite: DWORD,
++            lpNumberOfBytesWritten: ?*DWORD,
++            lpOverlapped: ?*OVERLAPPED,
++        ) callconv(.winapi) BOOL;
+         pub extern "kernel32" fn VirtualAlloc(
+             lpAddress: ?LPVOID,
+             dwSize: SIZE_T,
+diff --git a/src/quirks_memset.zig b/src/quirks_memset.zig
+index cb6f15b98..8e54b0542 100644
+--- a/src/quirks_memset.zig
++++ b/src/quirks_memset.zig
+@@ -70,6 +70,7 @@ comptime {
+     const enabled =
+         std.simd.suggestVectorLength(u8) != null and
+         builtin.object_format != .c and
++        builtin.abi != .msvc and
+         !(linkage == .weak and builtin.object_format == .coff);
+ 
+     if (enabled) @export(&memset, .{
+diff --git a/src/termio/Exec.zig b/src/termio/Exec.zig
+index 7b520a759..b441d53e9 100644
+--- a/src/termio/Exec.zig
++++ b/src/termio/Exec.zig
+@@ -124,8 +124,8 @@ pub fn threadEnter(
+     // Create our pipe that we'll use to kill our read thread.
+     // pipe[0] is the read end, pipe[1] is the write end.
+     const pipe = try internal_os.pipe();
+-    errdefer _ = posix.system.close(pipe[0]);
+-    errdefer _ = posix.system.close(pipe[1]);
++    errdefer internal_os.closePipeEnd(pipe[0]);
++    errdefer internal_os.closePipeEnd(pipe[1]);
+ 
+     // Setup our stream so that we can write.
+     var stream = xev.Stream.initFd(pty_fds.write);
+@@ -204,17 +204,14 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
+     // Quit our read thread after exiting the subprocess so that
+     // we don't get stuck waiting for data to stop flowing if it is
+     // a particularly noisy process.
+-    switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
+-        .SUCCESS => {},
++    switch (internal_os.writePipeEnd(exec.read_thread_pipe, "x")) {
++        .ok => {},
+ 
+-        // EPIPE means that our read thread is closed already, which is
+-        // completely fine since that is what we were trying to achieve.
+-        .PIPE => {},
++        // A broken pipe means that our read thread is closed already, which
++        // is completely fine since that is what we were trying to achieve.
++        .broken_pipe => {},
+ 
+-        else => |e| log.warn(
+-            "error writing to read thread quit pipe err=E{s}",
+-            .{@tagName(e)},
+-        ),
++        .failed => log.warn("error writing to read thread quit pipe", .{}),
+     }
+ 
+     if (comptime builtin.os.tag == .windows) {
+@@ -539,7 +536,7 @@ pub const ThreadData = struct {
+     termios_mode: ptypkg.Mode = .{},
+ 
+     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
+-        _ = posix.system.close(self.read_thread_pipe);
++        internal_os.closePipeEnd(self.read_thread_pipe);
+ 
+         // Clear our write pools. We know we aren't ever going to do
+         // any more IO since we stop our data stream below so we can just
+@@ -1769,7 +1766,7 @@ pub const ReadThread = struct {
+ 
+     fn threadMainWindows(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
+         // Always close our end of the pipe when we exit.
+-        defer _ = posix.system.close(quit);
++        defer internal_os.closePipeEnd(quit);
+ 
+         // Setup our crash metadata
+         crash.sentry.thread_state = .{
