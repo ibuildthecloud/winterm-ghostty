@@ -15,7 +15,7 @@ follow 5.
 
 | Phase | Status | Session notes |
 |---|---|---|
-| 0 — Toolchain + baselines | not started | |
+| 0 — Toolchain + baselines | 3/5 criteria met | [0001](docs/sessions/0001-phase-0.md): repo + pins + #11886 archived; wintty runs a shell. **Upstream libghostty does not link on MSVC** (memset + POSIX `close`/`write`); WT native builds on v145, XAML tower blocked on the UWP workload (install started). Two DECISION-NEEDED. |
 | 1 — Fork bootstrap + first pixels | not started | |
 | 2 — SwapChainPanel proof | not started | |
 | 3 — Real terminal rendering | not started | |

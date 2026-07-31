@@ -179,5 +179,30 @@ criterion, with "engine DLL hosted outside the packaged component" as the record
 | mite (marler8997/mite) | clean-code D3D11+DWrite reference | **no license — read, don't copy** |
 | zcg/ghostty-win | independent D3D11/D2D confirmation | MIT |
 
-Upstream pins are recorded per-fork once created (Phase 1/4); research was conducted
-against ghostty `4d605bf` (2026-07-30) and microsoft/terminal main (2026-07).
+## Upstream pins
+
+Recorded in Phase 0 (2026-07-31). Never advance a pin outside a readiness/retro step.
+
+| Repo | Pin | Date | Role |
+|---|---|---|---|
+| `ghostty-org/ghostty` | `4d605bf0d819df901a0332bbb320dc849fdd82e4` | 2026-07-30 | fork base for `ghostty/` (Phase 1) |
+| `microsoft/terminal` | `ca7996296a48322c1c7310af59d4ee2949421679` | 2026-07-31 | fork base for `terminal/` (Phase 4) |
+| PR #11886 head | `bb8909dcba933025556378d2f323edc90b5bc929` | 2026-03-27 | D3D11 base; diff + shader blobs archived in `docs/research/` |
+| `deblasis/wintty` | `f4b3ac8ff09a6ef7f1c3397ce2aa9622140b24e8` | 2026-07-30 | reference (read-only) |
+| `amanthanvi/winghostty` | `cff48552a942faeca24c8eda12b375bd3445fbec` | 2026-07-31 | reference (read-only) |
+| `arya-s/phantty` | `d8b63ae6e1bca54a198c9435bf449d3a36ee2ca1` | 2026-02-12 | reference (read-only, **no LICENSE — read, don't copy**) |
+
+The research that produced this document was conducted against the same ghostty pin.
+
+## Toolchain (Phase 0 machine)
+
+| Tool | Version | Notes |
+|---|---|---|
+| Zig | **0.16.0** | pinned by ghostty `build.zig.zon` (`.minimum_zig_version`) and `flake.nix`; local copy under `tools/`, installed by `scripts/zigenv.ps1` |
+| Visual Studio | Community **2026** 18.8.12023.21 | MSVC **v145** (14.51.36231). WT's `src/common.build.pre.props` selects v145 when `VisualStudioVersion >= 18.0`, and WT's README ships a winget config for VS 2026 — VS 2022/v143 is *not* required. |
+| Windows SDK | 10.0.**26100.8249** | meets WT's `>= 10.0.26100.8249` floor |
+| Shader compilers | `fxc` + `dxc` from the SDK | D3D11 needs **`fxc` / SM 5.0 DXBC**; `dxc`/SM 6 DXIL is D3D12-only (see `docs/research/pr-11886-assets/README.md`) |
+| .NET SDK | 10.0.302 | for wintty's WinUI 3 harness reference only |
+
+GPU: AMD Radeon 890M (integrated, Ryzen AI 9 HX 370). WARP-path validation is done over
+an RDP session into the same machine.
