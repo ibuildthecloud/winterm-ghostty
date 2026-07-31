@@ -15,7 +15,7 @@ follow 5.
 
 | Phase | Status | Session notes |
 |---|---|---|
-| 0 — Toolchain + baselines | 4/5 criteria met | [0001](docs/sessions/0001-phase-0.md): repo + pins + #11886 archived (incl. binary shaders); wintty runs a shell; **WT builds from source on VS2026/v145 and launches as a deployed dev package** (no VS2022 needed — PLAN text is stale). Criterion 2 unmet *as worded* (unpatched upstream does not link on MSVC), but fixed in-session at the gate's direction: branch `windows`, patch 0 `75c31f2c` → **`ghostty-internal.dll` links, x64 PE, 231 C-API exports**, tests unchanged at 3061/55/0. Retro must ratify the ADR 0004 patch-list change (§5.1). |
+| 0 — Toolchain + baselines | 4/5 criteria met | [0001](docs/sessions/0001-phase-0.md): repo + pins + #11886 archived (incl. binary shaders); wintty runs a shell; **WT builds from source on VS2026/v145 and launches as a deployed dev package** (no VS2022 needed — PLAN text is stale). Criterion 2's premise is falsified, not outstanding: it asserts *unpatched* upstream builds, which is false at pin `4d605bf0` and only an upstream merge can change. Fixed in-session at the gate's direction: branch `windows`, patch 0 `75c31f2c` → **`ghostty-internal.dll` links, x64 PE, 231 C-API exports**, tests unchanged at 3061/55/0. Retro: amend that criterion's wording, and ratify the ADR 0004 patch-list change (§5.1). |
 | 1 — Fork bootstrap + first pixels | not started | |
 | 2 — SwapChainPanel proof | not started | |
 | 3 — Real terminal rendering | not started | |
