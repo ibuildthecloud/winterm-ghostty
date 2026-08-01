@@ -11,6 +11,24 @@
 //
 // Force the software rasterizer with:
 //     set GHOSTTY_D3D11_DRIVER=warp
+//
+// Show libghostty's own logs with:
+//     set GHOSTTY_LOG=stderr
+// They are OFF by default: src/global.zig defaults stderr logging to
+// `build_config.app_runtime != .none`, and libghostty is built with
+// -Dapp-runtime=none. Without this, log statements inside libghostty produce
+// nothing, which is very easy to misread as the code not running at all.
+//
+// TWO WINDOWS ARE EXPECTED. This is a console-subsystem executable (it traces
+// with fprintf), so Windows gives it a console window of its own alongside the
+// terminal window. That empty console with a blinking cursor is NOT a leaked
+// ConPTY/conhost for the child shell - the child is attached to our pseudo
+// console correctly. Do not go hunting for a PTY bug because of it.
+//
+// Note also that PrintWindow cannot capture the terminal window's contents:
+// the D3D11 backend presents through a flip-model/DirectComposition swap chain
+// which DWM composites outside the GDI paint path. Use harness/wgc-shot, which
+// captures via Windows Graphics Capture and is scoped to a single window.
 
 // UNICODE selects the wide variants of the resource macros (IDC_ARROW and
 // friends) so they match the *W APIs we call throughout.

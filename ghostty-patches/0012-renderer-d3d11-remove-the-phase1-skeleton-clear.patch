@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Fri, 31 Jul 2026 23:53:14 -0700
+Subject: [PATCH] renderer/d3d11: remove the phase1 skeleton clear
+
+The cell pipelines draw now, so the substitute clear can go. `generic.zig`
+clears each pass to transparent black and paints the real background with the
+`bg_color` pipeline, deliberately avoiding `clear_color` so the colour-space
+conversion happens in the shader rather than on the CPU. That is now what
+happens, and `Frame.skeletonClear` with its CPU-side sRGB conversion goes away
+with it.
+
+Verified by capture rather than by reasoning: the shell renders identically
+with the skeleton removed (10200 vs 10205 non-background samples), so the
+background really is coming from the pipeline and not from the clear.
+
+All `phase1_skeleton` markers are gone. Full suite: 3065 pass, 55 skip, 0 fail.
+
+Still not ported: the image (kitty graphics) and bg_image pipelines. Those
+carry no shaders, so `step` skips them rather than drawing with whatever was
+bound last.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/renderer/D3D11.zig                | 22 ++++++--------
+ src/renderer/directx11/Frame.zig      | 41 ---------------------------
+ src/renderer/directx11/RenderPass.zig | 30 +++++++++-----------
+ src/renderer/directx11/shaders.zig    | 13 +++++----
+ 4 files changed, 29 insertions(+), 77 deletions(-)
+
+diff --git a/src/renderer/D3D11.zig b/src/renderer/D3D11.zig
+index 40da6a978..a95749e65 100644
+--- a/src/renderer/D3D11.zig
++++ b/src/renderer/D3D11.zig
+@@ -3,21 +3,15 @@
+ //! This implements the `GraphicsAPI` contract that `renderer/generic.zig`
+ //! requires, mirroring the structure of `Metal.zig` and `OpenGL.zig`.
+ //!
+-//! ## Phase 1 status
++//! Device creation with the hardware -> WARP degradation ladder, hwnd and
++//! composition swap chains, render targets, textures, samplers, buffers,
++//! resize, device-lost detection, the cell pipelines and their HLSL, and
++//! present. `GenericRenderer.drawFrame` runs end to end and puts the terminal
++//! on screen.
+ //!
+-//! What is real: device creation with the hardware -> WARP degradation ladder,
+-//! the hwnd-mode swap chain, render targets, textures, samplers, buffers,
+-//! resize, device-lost detection, and clear + present. That is enough for
+-//! `GenericRenderer.drawFrame` to run end to end and produce a correctly
+-//! cleared, correctly sized surface.
+-//!
+-//! What is not, and is marked `phase1_skeleton` where it matters: the cell
+-//! pipelines, the HLSL shader set, and therefore any actual drawing.
+-//! `RenderPass.step` accepts steps and ignores them. PLAN Phase 3 fills these
+-//! in; the markers must all be gone by the end of it.
+-//!
+-//! Composition mode (the DirectComposition surface handle that a XAML
+-//! SwapChainPanel consumes, and the mode Windows Terminal uses) is Phase 2.
++//! Not yet ported: the `image` (kitty graphics) and `bg_image` pipelines, whose
++//! steps are skipped because their pipelines carry no shaders, and custom
++//! post-processing shaders.
+ 
+ pub const D3D11 = @This();
+ 
+diff --git a/src/renderer/directx11/Frame.zig b/src/renderer/directx11/Frame.zig
+index 05c495983..788d788fc 100644
+--- a/src/renderer/directx11/Frame.zig
++++ b/src/renderer/directx11/Frame.zig
+@@ -43,50 +43,9 @@ pub inline fn renderPass(
+     return RenderPass.begin(.{
+         .api = &self.renderer.api,
+         .attachments = attachments,
+-        .skeleton_clear = self.skeletonClear(),
+     });
+ }
+ 
+-/// phase1_skeleton: the colour the surface should end up when nothing can be
+-/// drawn yet.
+-///
+-/// `generic.zig` clears each pass to transparent black and paints the real
+-/// background with the `bg_color` *pipeline*, deliberately avoiding
+-/// `clear_color` so it does not have to do colour-space conversion on the CPU.
+-/// With draw steps stubbed out that leaves a black window, which is
+-/// indistinguishable from a broken swap chain and proves nothing.
+-///
+-/// So until Phase 3 supplies pipelines, clear to the terminal's own background
+-/// colour instead. It comes from the same uniforms the shader would have read,
+-/// so the window visibly tracks the config - `--background=ff0000` turns it
+-/// red - which is what makes this phase's deliverable meaningful.
+-///
+-/// The colour-space handling here is the thing `generic.zig`'s comment is
+-/// warning about. When alpha blending is linear the render target has an
+-/// `_SRGB` format, and `ClearRenderTargetView` treats the value it is given as
+-/// *linear*, re-encoding it to sRGB on store. Passing the config's sRGB bytes
+-/// straight through therefore renders visibly too bright - #282C34 came out as
+-/// #6E737D before this conversion was added.
+-fn skeletonClear(self: *const Self) ?[4]f32 {
+-    const bg = self.renderer.uniforms.bg_color;
+-    const to_linear = self.renderer.api.blending.isLinear();
+-
+-    var out: [4]f32 = .{ 0, 0, 0, 1 };
+-    for (0..3) |i| {
+-        const c = @as(f32, @floatFromInt(bg[i])) / 255.0;
+-        out[i] = if (to_linear) srgbToLinear(c) else c;
+-    }
+-    return out;
+-}
+-
+-/// The standard sRGB electro-optical transfer function.
+-fn srgbToLinear(c: f32) f32 {
+-    return if (c <= 0.04045)
+-        c / 12.92
+-    else
+-        std.math.pow(f32, (c + 0.055) / 1.055, 2.4);
+-}
+-
+ /// Complete this frame and present the target.
+ ///
+ /// `sync` is ignored: Phase 1 presents on the immediate context and does not
+diff --git a/src/renderer/directx11/RenderPass.zig b/src/renderer/directx11/RenderPass.zig
+index 23083c379..b1d44a96f 100644
+--- a/src/renderer/directx11/RenderPass.zig
++++ b/src/renderer/directx11/RenderPass.zig
+@@ -1,10 +1,12 @@
+ //! Wrapper for handling render passes.
+ //!
+-//! Phase 1 status: attachment handling (bind + clear) is real, because that is
+-//! what produces the cleared surface this phase has to demonstrate. Draw steps
+-//! are **not** - `step` is a documented no-op until the cell pipelines, glyph
+-//! atlas, and HLSL land in Phase 3. See the `phase1_skeleton` marker in
+-//! `../D3D11.zig`.
++//! `begin` binds the attachments, clears those that ask for it, and sets the
++//! viewport; `step` binds a pipeline's resources and issues its draw.
++//!
++//! The viewport is not incidental. D3D11 starts with none bound, and
++//! `ClearRenderTargetView` ignores it while every draw is clipped away by it,
++//! so forgetting it produces a correctly cleared surface that silently refuses
++//! to draw anything, with no D3D error to go on.
+ 
+ const Self = @This();
+ 
+@@ -31,10 +33,6 @@ pub const Options = struct {
+     /// Color attachments for this render pass.
+     attachments: []const Attachment,
+ 
+-    /// phase1_skeleton: substituted for a fully-transparent `clear_color`.
+-    /// See `Frame.skeletonClear` for why this exists.
+-    skeleton_clear: ?[4]f32 = null,
+-
+     pub const Attachment = struct {
+         target: union(enum) {
+             texture: Texture,
+@@ -109,14 +107,12 @@ pub fn begin(opts: Options) Self {
+         count += 1;
+ 
+         if (attachment.clear_color) |c| {
+-            // phase1_skeleton: a fully transparent clear means "the pipelines
+-            // will paint this", which they cannot yet. Substitute the
+-            // terminal background so the surface shows something real.
+-            const use_skeleton = c[3] == 0.0 and opts.skeleton_clear != null;
+-            ctx.ClearRenderTargetView(rtv, if (use_skeleton)
+-                &opts.skeleton_clear.?
+-            else
+-                &c);
++            // Cleared to whatever the renderer asked for, which is normally
++            // transparent black: `generic.zig` paints the real background with
++            // the `bg_color` pipeline rather than the clear, so that the
++            // colour-space conversion happens in the shader instead of on the
++            // CPU.
++            ctx.ClearRenderTargetView(rtv, &c);
+         }
+     }
+ 
+diff --git a/src/renderer/directx11/shaders.zig b/src/renderer/directx11/shaders.zig
+index 92665a62c..93f92421e 100644
+--- a/src/renderer/directx11/shaders.zig
++++ b/src/renderer/directx11/shaders.zig
+@@ -6,11 +6,14 @@
+ //! compile error. The alignments are copied verbatim from the Metal versions
+ //! for that reason - do not "tidy" them.
+ //!
+-//! Phase 1 status: the data layouts are real and complete. The pipeline
+-//! objects are not - HLSL, the glyph atlas, and the cell pipelines are Phase 3
+-//! (ADR 0002, PLAN Phase 3). `Shaders.init` therefore produces an empty
+-//! collection, and `RenderPass.step` ignores steps. See the `phase1_skeleton`
+-//! marker in `../D3D11.zig`.
++//! The HLSL lives in `../shaders/hlsl/` and is compiled to DXBC at build time
++//! by `src/build/FxcStep.zig`, so the blobs below are `@embedFile`d rather
++//! than compiled at runtime. The `Globals` cbuffer in `common.hlsli` mirrors
++//! `Uniforms` here field for field; see the warning there before changing
++//! either.
++//!
++//! `image` and `bg_image` have no HLSL yet, so those pipelines stay empty and
++//! their steps are skipped.
+ 
+ const std = @import("std");
+ const Allocator = std.mem.Allocator;
