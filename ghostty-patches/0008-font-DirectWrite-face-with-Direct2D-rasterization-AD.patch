@@ -1,0 +1,1932 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Fri, 31 Jul 2026 21:27:15 -0700
+Subject: [PATCH] font: DirectWrite face with Direct2D rasterization (ADR 0005)
+
+Adds a directwrite_harfbuzz backend: DirectWrite for face creation and
+rasterization, HarfBuzz for shaping. Mirrors the existing coretext_harfbuzz
+combination rather than inventing a shape - ghostty already uses a
+platform-native rasterizer where one exists.
+
+Opt-in via -Dfont-backend=directwrite_harfbuzz. The Windows default stays
+freetype_windows so upstream's existing path keeps working while this
+converges.
+
+  directwrite_harfbuzz : 3065 pass, 56 skip, 0 fail
+  default (freetype)   : 3065 pass, 55 skip, 0 fail  (baseline, unchanged)
+
+The DLL imports DWrite.dll, d2d1.dll and ole32.dll, and contains no FT_*
+symbols in this configuration.
+
+Colour glyphs
+-------------
+Rasterization is one Direct2D path for both monochrome and colour glyphs:
+TranslateColorGlyphRun returning DWRITE_E_NOCOLOR *is* the "this glyph is
+monochrome" test, so there is no second rasterizer and no rule for choosing.
+
+That call goes through IDWriteFactory4 with the full DWRITE_GLYPH_IMAGE_FORMATS
+set, dispatching per glyphImageFormat to DrawColorBitmapGlyphRun /
+DrawSvgGlyphRun / DrawGlyphRun - what ADR 0005 specifies and what AtlasEngine
+does. IDWriteFactory2's TranslateColorGlyphRun is documented in dwrite_3.h as
+"equivalent to passing TRUETYPE|CFF|COLR", so it answers NOCOLOR for any font
+whose colour is not in a COLR table. Segoe UI Emoji is COLR/CPAL and works
+either way, but Noto Color Emoji is CBDT/CBLC and renders only via the bitmap
+path. Requesting the colour formats without TRUETYPE|CFF keeps NOCOLOR meaning
+exactly "monochrome", so isColorGlyph and renderGlyph agree by construction.
+
+Glyphs go into ghostty's CPU-side font.Atlas exactly as the FreeType face does,
+rasterized once per unique glyph, so the WIC readback is not on any hot path.
+This corrects a consequence stated in ADR 0005 (which claimed the atlas would
+become a D2D-rendered DXGI surface); font.Atlas owns rect packing and is what
+CodepointResolver/SharedGrid build on. See DESIGN.md.
+
+A WIC bitmap render target QueryInterfaces to ID2D1DeviceContext4, so the
+colour bitmap and SVG draw calls need no D3D device.
+
+Vtable offsets
+--------------
+Slot indices were derived from the SDK headers and then confirmed by calling
+through the raw vtable and diffing rendered pixels against the equivalent C++
+virtual call - identical output, 996 opaque px. TranslateColorGlyphRun is slot
+40, DrawColorBitmapGlyphRun 111, DrawSvgGlyphRun 112, GetCurrentRun 5 (the
+IDWriteColorGlyphRunEnumerator1 variant, not the base one at 4). Tests assert
+both the vtable size and the offset of every method actually called, and
+comptime asserts pin DWRITE_COLOR_GLYPH_RUN1's layout, including the six bytes
+of base tail padding MSVC does not reuse.
+
+This also fixes an existing IDWriteFactory2 assertion that expected (3 + 5)
+slots after subtracting 26, double-counting IUnknown. It had never run: the
+default backend does not compile dwrite/api.zig at all.
+
+Font metrics
+------------
+ex_height and cap_height come from the OS/2 table, not DWRITE_FONT_METRICS.
+DirectWrite synthesizes those fields when a font omits them - a symbols-only
+Nerd Font reports exactly 0.5em and ~0.7em, which look like real metrics and
+are not. ghostty needs them undefined so that size adjustment falls through to
+matching line height, which is what font.Collection's "adjusted sizes" test
+checks. Falls back to measuring 'H' and 'x' ink when OS/2 predates version 2,
+matching the FreeType backend. ic_width measures the CJK water ideograph so
+the .ic_width adjustment is not silently inert.
+
+Three things that would have been silent failures
+-------------------------------------------------
+name() parses the SFNT name table for real. The Windows font scanner matches
+requested families against it, and only reaches FreeType's parsed family_name
+when the backend has FreeType - so a placeholder would have made every font
+lookup fail at runtime rather than at compile time.
+
+HarfBuzz has no DirectWrite integration (no hb_dwrite to match hb_ft or
+hb_coretext), so the font is built blob -> face -> font from the font bytes.
+That required hb_font_set_scale to px*64: a blob-built font defaults to design
+units, which would have put every advance out by upem/px - roughly 64x at 32px
+in a 2048-upem face. Text would have drawn, just catastrophically mis-spaced.
+
+syntheticBold/syntheticItalic copy the Face by value, so adding hb_font made
+them share a handle that deinit destroys. Both now take an hb_font_reference
+alongside the existing COM AddRef.
+
+Errors reuse CannotOpenResource and CannotRenderGlyph, which already exist in
+SharedGrid.RenderGlyphError - a hand-maintained union carrying its own FIXME
+about consolidation, which adding Windows-specific names to would worsen.
+
+Not yet done
+------------
+Discovery still uses the existing Windows font-directory scanner. DirectWrite
+discovery with IDWriteFontFallback::MapCharacters and a negative cache - the
+other half of ADR 0005, and the part that gives a real system fallback chain -
+lands separately; GetSystemFontFallback is already bound for it. setVariations
+is a no-op pending IDWriteFontFace5, so variable fonts render at their default
+instance.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/font/DeferredFace.zig     |   26 +-
+ src/font/backend.zig          |    9 +
+ src/font/discovery.zig        |   19 +-
+ src/font/face.zig             |    3 +
+ src/font/face/directwrite.zig | 1058 +++++++++++++++++++++++++++++++++
+ src/font/face/dwrite/api.zig  |  248 +++++++-
+ src/font/face/dwrite/d2d.zig  |  104 ++++
+ src/font/library.zig          |  142 +++++
+ src/font/shape.zig            |    1 +
+ 9 files changed, 1590 insertions(+), 20 deletions(-)
+ create mode 100644 src/font/face/directwrite.zig
+
+diff --git a/src/font/DeferredFace.zig b/src/font/DeferredFace.zig
+index 425f3c283..59f6a8239 100644
+--- a/src/font/DeferredFace.zig
++++ b/src/font/DeferredFace.zig
+@@ -27,8 +27,10 @@ ct: if (font.Discover == font.discovery.CoreText) ?CoreText else void =
+     if (font.Discover == font.discovery.CoreText) null else {},
+ 
+ /// Windows (FreeType directory scan)
+-win: if (options.backend == .freetype_windows) ?Windows else void =
+-    if (options.backend == .freetype_windows) null else {},
++win: if (options.backend == .freetype_windows or
++    options.backend == .directwrite_harfbuzz) ?Windows else void =
++    if (options.backend == .freetype_windows or
++        options.backend == .directwrite_harfbuzz) null else {},
+ 
+ /// Canvas
+ wc: if (options.backend == .web_canvas) ?WebCanvas else void =
+@@ -128,7 +130,9 @@ pub fn deinit(self: *DeferredFace) void {
+     switch (options.backend) {
+         .fontconfig_freetype => if (self.fc) |*fc| fc.deinit(),
+         .freetype => {},
+-        .freetype_windows => if (self.win) |*w| w.deinit(),
++        .freetype_windows,
++        .directwrite_harfbuzz,
++        => if (self.win) |*w| w.deinit(),
+         .web_canvas => if (self.wc) |*wc| wc.deinit(),
+         .coretext,
+         .coretext_freetype,
+@@ -144,7 +148,9 @@ pub fn familyName(self: DeferredFace, buf: []u8) ![]const u8 {
+     switch (options.backend) {
+         .freetype => {},
+ 
+-        .freetype_windows => if (self.win) |w| return try w.peek.name(buf),
++        .freetype_windows,
++        .directwrite_harfbuzz,
++        => if (self.win) |w| return try w.peek.name(buf),
+ 
+         .fontconfig_freetype => if (self.fc) |fc|
+             return (try fc.pattern.get(.family, 0)).string,
+@@ -174,7 +180,9 @@ pub fn name(self: DeferredFace, buf: []u8) ![]const u8 {
+     switch (options.backend) {
+         .freetype => {},
+ 
+-        .freetype_windows => if (self.win) |w| return try w.peek.name(buf),
++        .freetype_windows,
++        .directwrite_harfbuzz,
++        => if (self.win) |w| return try w.peek.name(buf),
+ 
+         .fontconfig_freetype => if (self.fc) |fc|
+             return (try fc.pattern.get(.fullname, 0)).string,
+@@ -209,7 +217,9 @@ pub fn load(
+ ) !Face {
+     return switch (options.backend) {
+         .fontconfig_freetype => try self.loadFontconfig(lib, opts),
+-        .freetype_windows => try self.loadWindows(lib, opts),
++        .freetype_windows,
++        .directwrite_harfbuzz,
++        => try self.loadWindows(lib, opts),
+         .coretext, .coretext_harfbuzz, .coretext_noshape => try self.loadCoreText(lib, opts),
+         .coretext_freetype => try self.loadCoreTextFreetype(lib, opts),
+         .web_canvas => try self.loadWebCanvas(opts),
+@@ -346,7 +356,9 @@ pub fn hasCodepoint(self: DeferredFace, cp: u32, p: ?Presentation) bool {
+             }
+         },
+ 
+-        .freetype_windows => {
++        .freetype_windows,
++        .directwrite_harfbuzz,
++        => {
+             // Use the pre-loaded peek face for a cheap CMap lookup.
+             if (self.win) |w| {
+                 if (p) |desired| if (w.presentation != desired) return false;
+diff --git a/src/font/backend.zig b/src/font/backend.zig
+index 867421de7..31dd8f80e 100644
+--- a/src/font/backend.zig
++++ b/src/font/backend.zig
+@@ -28,6 +28,11 @@ pub const Backend = enum {
+     /// CoreText for font discovery and rendering, no shaping.
+     coretext_noshape,
+ 
++    /// DirectWrite for font discovery and rendering, HarfBuzz for shaping
++    /// (Windows). Mirrors `coretext_harfbuzz`: platform-native discovery and
++    /// rasterization, ghostty's cross-platform shaper. See ADR 0005.
++    directwrite_harfbuzz,
++
+     /// Use the browser font system and the Canvas API (wasm). This limits
+     /// the available fonts to browser fonts (anything Canvas natively
+     /// supports).
+@@ -74,6 +79,7 @@ pub const Backend = enum {
+             .coretext,
+             .coretext_harfbuzz,
+             .coretext_noshape,
++            .directwrite_harfbuzz,
+             .web_canvas,
+             => false,
+         };
+@@ -90,6 +96,7 @@ pub const Backend = enum {
+             .freetype,
+             .freetype_windows,
+             .fontconfig_freetype,
++            .directwrite_harfbuzz,
+             .web_canvas,
+             => false,
+         };
+@@ -105,6 +112,7 @@ pub const Backend = enum {
+             .coretext_freetype,
+             .coretext_harfbuzz,
+             .coretext_noshape,
++            .directwrite_harfbuzz,
+             .web_canvas,
+             => false,
+         };
+@@ -117,6 +125,7 @@ pub const Backend = enum {
+             .fontconfig_freetype,
+             .coretext_freetype,
+             .coretext_harfbuzz,
++            .directwrite_harfbuzz,
+             => true,
+ 
+             .coretext,
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index d1e60fd34..b5443aea5 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -19,7 +19,13 @@ const log = std.log.scoped(.discovery);
+ /// Discover implementation for the compile options.
+ pub const Discover = switch (options.backend) {
+     .freetype => void, // no discovery
+-    .freetype_windows => Windows,
++    // Both Windows backends share the font-directory scanner for now.
++    // Upgrading this to DirectWrite discovery with
++    // IDWriteFontFallback::MapCharacters is the remaining half of ADR 0005;
++    // rasterization is independent of it, so it lands separately.
++    .freetype_windows,
++    .directwrite_harfbuzz,
++    => Windows,
+     .fontconfig_freetype => Fontconfig,
+     .web_canvas => void, // no discovery
+     .coretext,
+@@ -1136,9 +1142,14 @@ pub const Windows = struct {
+     /// FreeType's family_name first, then falls back to the SFNT name
+     /// table entry.
+     fn familyMatches(face: *Face, family: [:0]const u8) bool {
+-        const ft_family: ?[*:0]const u8 = face.face.handle.*.family_name;
+-        if (ft_family) |f| {
+-            if (std.ascii.eqlIgnoreCase(std.mem.span(f), family)) return true;
++        // FreeType exposes a parsed family name directly. Other backends
++        // (DirectWrite) fall through to the SFNT name table, which every
++        // backend can read and which is the authoritative source anyway.
++        if (comptime options.backend.hasFreetype()) {
++            const ft_family: ?[*:0]const u8 = face.face.handle.*.family_name;
++            if (ft_family) |f| {
++                if (std.ascii.eqlIgnoreCase(std.mem.span(f), family)) return true;
++            }
+         }
+         var buf: [256]u8 = undefined;
+         const sfnt = face.name(&buf) catch "";
+diff --git a/src/font/face.zig b/src/font/face.zig
+index aeb7280c7..05581bcdb 100644
+--- a/src/font/face.zig
++++ b/src/font/face.zig
+@@ -5,6 +5,7 @@ const options = @import("main.zig").options;
+ const config = @import("../config.zig");
+ const freetype = @import("face/freetype.zig");
+ const coretext = @import("face/coretext.zig");
++const directwrite = @import("face/directwrite.zig");
+ pub const web_canvas = @import("face/web_canvas.zig");
+ 
+ /// Face implementation for the compile options.
+@@ -20,6 +21,8 @@ pub const Face = switch (options.backend) {
+     .coretext_noshape,
+     => coretext.Face,
+ 
++    .directwrite_harfbuzz => directwrite.Face,
++
+     .web_canvas => web_canvas.Face,
+ };
+ 
+diff --git a/src/font/face/directwrite.zig b/src/font/face/directwrite.zig
+new file mode 100644
+index 000000000..963afa89c
+--- /dev/null
++++ b/src/font/face/directwrite.zig
+@@ -0,0 +1,1058 @@
++//! Font face backed by DirectWrite, rasterized through Direct2D (ADR 0005).
++//!
++//! Every COM interaction here was validated by standalone spikes before being
++//! written, because a vtable slot at the wrong offset calls a different
++//! function silently rather than failing to compile. See the commit messages
++//! on `dwrite/api.zig` for the measurements.
++//!
++//! Rasterization writes into ghostty's CPU-side `font.Atlas`, exactly as the
++//! FreeType face does - **not** D2D-direct into a GPU texture. `font.Atlas`
++//! owns rect packing and is what `CodepointResolver`/`SharedGrid` build on,
++//! and glyphs are rasterized once per unique glyph rather than per frame, so
++//! the readback costs almost nothing. This corrects a consequence stated in
++//! ADR 0005; see DESIGN.md.
++
++/// This file *is* the Face. Exported so `face.zig` can refer to
++/// `directwrite.Face`, matching how the freetype and coretext backends read.
++pub const Face = @This();
++
++const std = @import("std");
++const builtin = @import("builtin");
++const Allocator = std.mem.Allocator;
++const global = @import("../../global.zig");
++
++const harfbuzz = @import("harfbuzz");
++
++const font = @import("../main.zig");
++const Glyph = font.Glyph;
++const Library = font.Library;
++const Metrics = font.Metrics;
++
++const dw = @import("dwrite/api.zig");
++const d2d = @import("dwrite/d2d.zig");
++
++const log = std.log.scoped(.font_face);
++
++/// Shared DirectWrite/D2D/WIC state. Borrowed; the Library outlives faces.
++lib: Library,
++
++/// The underlying DirectWrite face.
++face: *dw.IDWriteFontFace,
++
++/// Font file reference, when this face was built from memory. Held so it can
++/// be released with the face.
++file: ?*dw.IDWriteFontFile = null,
++
++/// Size this face renders at.
++size: font.face.DesiredSize,
++
++/// Cached design metrics; DirectWrite returns these in font design units and
++/// they never change for a face, so read them once.
++design: dw.DWRITE_FONT_METRICS,
++
++/// True if the font has colour glyphs at all (a COLR/CBDT/sbix table).
++/// Checked once at init because it gates a `TranslateColorGlyphRun` call per
++/// glyph otherwise.
++color: bool,
++
++/// HarfBuzz font used for shaping.
++///
++/// Built from the font bytes rather than from the rasterizer, because
++/// HarfBuzz has its own OpenType parser and no DirectWrite integration exists
++/// (unlike `hb_ft_font_create` / `hb_coretext`). Shaping is therefore
++/// identical to every other ghostty platform, which is the point of the
++/// `directwrite_harfbuzz` combination.
++hb_font: harfbuzz.Font,
++
++/// Set quirks.disableDefaultFontFeatures
++quirks_disable_default_font_features: bool = false,
++
++/// Synthetic styling applied by us rather than present in the font.
++synthetic: packed struct {
++    bold: bool = false,
++    italic: bool = false,
++} = .{},
++
++/// Deliberately reuses error names that already exist in
++/// `SharedGrid.RenderGlyphError`. That set is a large hand-maintained union
++/// carrying its own FIXME about being consolidated; adding Windows-specific
++/// names to a shared upstream set for one backend would make it worse, and
++/// these two carry exactly the right meaning:
++///
++///   CannotOpenResource - the font could not be opened / face not created
++///   CannotRenderGlyph  - rasterization failed
++pub const Error = error{
++    CannotOpenResource,
++    CannotRenderGlyph,
++};
++
++/// Initialize from font bytes. This is ghostty's primary Face entry point and
++/// is how embedded fonts are loaded.
++pub fn init(
++    lib: Library,
++    source: [:0]const u8,
++    opts: font.face.Options,
++) !Face {
++    lib.mutex.lockUncancelable(global.io());
++    defer lib.mutex.unlock(global.io());
++
++    var file: ?*dw.IDWriteFontFile = null;
++    if (dw.FAILED(lib.in_memory_loader.CreateInMemoryFontFileReference(
++        lib.factory,
++        source,
++        &file,
++    )) or file == null) return Error.CannotOpenResource;
++    errdefer _ = file.?.Release();
++
++    const files = [_]*dw.IDWriteFontFile{file.?};
++    var face: ?*dw.IDWriteFontFace = null;
++    if (dw.FAILED(lib.factory.CreateFontFace(
++        .TRUETYPE,
++        &files,
++        0,
++        &face,
++    )) or face == null) return Error.CannotOpenResource;
++    errdefer _ = face.?.Release();
++
++    var self = try initFace(lib, face.?, source, 0, opts);
++    self.file = file;
++    return self;
++}
++
++/// Initialize from a font file on disk.
++///
++/// This is what the Windows font-directory discovery produces, and
++/// DirectWrite references files natively so no bytes are read by us.
++pub fn initFile(
++    lib: Library,
++    path: [:0]const u8,
++    index: i32,
++    opts: font.face.Options,
++) !Face {
++    lib.mutex.lockUncancelable(global.io());
++    defer lib.mutex.unlock(global.io());
++
++    // DirectWrite paths are UTF-16.
++    var buf: [std.fs.max_path_bytes]u16 = undefined;
++    const len = std.unicode.utf8ToUtf16Le(&buf, path) catch return Error.CannotOpenResource;
++    if (len >= buf.len) return Error.CannotOpenResource;
++    buf[len] = 0;
++    const wpath: [*:0]const u16 = @ptrCast(&buf);
++
++    var file: ?*dw.IDWriteFontFile = null;
++    if (dw.FAILED(lib.factory.CreateFontFileReference(wpath, &file)) or file == null) {
++        return Error.CannotOpenResource;
++    }
++    errdefer _ = file.?.Release();
++
++    const files = [_]*dw.IDWriteFontFile{file.?};
++    var face: ?*dw.IDWriteFontFace = null;
++    if (dw.FAILED(lib.factory.CreateFontFace(
++        .TRUETYPE,
++        &files,
++        @intCast(@max(index, 0)),
++        &face,
++    )) or face == null) return Error.CannotOpenResource;
++    errdefer _ = face.?.Release();
++
++    // HarfBuzz needs the raw bytes; DirectWrite referenced the file itself, so
++    // read it once here and let HarfBuzz duplicate what it keeps.
++    const bytes = readFile(lib.alloc, path) catch return Error.CannotOpenResource;
++    defer lib.alloc.free(bytes);
++
++    var self = try initFace(lib, face.?, bytes, @intCast(@max(index, 0)), opts);
++    self.file = file;
++    return self;
++}
++
++fn readFile(alloc: Allocator, path: [:0]const u8) ![]u8 {
++    // `cwd()` with an absolute path works and avoids opening a Dir handle.
++    return try std.Io.Dir.cwd().readFileAlloc(
++        global.io(),
++        path,
++        alloc,
++        // Fonts are large but bounded; a CJK TTC can exceed 30 MB.
++        std.Io.Limit.limited(64 * 1024 * 1024),
++    );
++}
++
++/// Initialize from a DirectWrite face plus the font bytes that back it.
++///
++/// The bytes are only used to build the HarfBuzz font; DirectWrite keeps its
++/// own reference, and HarfBuzz duplicates what it needs, so the caller's
++/// buffer does not have to outlive this call.
++pub fn initFace(
++    lib: Library,
++    face: *dw.IDWriteFontFace,
++    bytes: []const u8,
++    face_index: u32,
++    opts: font.face.Options,
++) !Face {
++    var blob = harfbuzz.Blob.create(bytes, .duplicate) catch
++        return Error.CannotOpenResource;
++    defer blob.destroy();
++
++    const hb_face_handle = harfbuzz.c.hb_face_create(blob.handle, face_index) orelse
++        return Error.CannotOpenResource;
++    var hb_face = harfbuzz.Face{ .handle = hb_face_handle };
++    defer hb_face.destroy();
++
++    var hb_font = harfbuzz.Font.create(hb_face) catch return Error.CannotOpenResource;
++    errdefer hb_font.destroy();
++
++    // Match what hb_ft_font_create does: scale so shaped positions come back
++    // in 26.6 fixed-point pixels rather than font design units. Without this
++    // every advance would be off by a factor of upem/px.
++    const px = opts.size.pixels();
++    const scale: c_int = @intFromFloat(@round(px * 64.0));
++    harfbuzz.c.hb_font_set_scale(hb_font.handle, scale, scale);
++    harfbuzz.c.hb_font_set_ppem(
++        hb_font.handle,
++        @intFromFloat(@round(px)),
++        @intFromFloat(@round(px)),
++    );
++
++    return .{
++        .lib = lib,
++        .face = face,
++        .size = opts.size,
++        .design = face.GetMetrics(),
++        .color = hasColorTable(face),
++        .hb_font = hb_font,
++    };
++}
++
++pub fn deinit(self: *Face) void {
++    self.hb_font.destroy();
++    _ = self.face.Release();
++    if (self.file) |f| _ = f.Release();
++    self.* = undefined;
++}
++
++/// A font has colour glyphs if it carries any of the colour tables. Checking
++/// the tables is far cheaper than probing glyphs, and lets `renderGlyph` skip
++/// `TranslateColorGlyphRun` entirely for ordinary text fonts.
++fn hasColorTable(face: *dw.IDWriteFontFace) bool {
++    for ([_]u32{
++        dw.tag("COLR"),
++        dw.tag("CBDT"),
++        dw.tag("sbix"),
++        dw.tag("SVG "),
++    }) |t| {
++        var data: ?*const anyopaque = null;
++        var size: u32 = 0;
++        var ctx: ?*anyopaque = null;
++        var exists: i32 = 0;
++        if (dw.SUCCEEDED(face.TryGetFontTable(t, &data, &size, &ctx, &exists))) {
++            defer face.ReleaseFontTable(ctx);
++            if (exists != 0) return true;
++        }
++    }
++    return false;
++}
++
++pub fn hasColor(self: *const Face) bool {
++    return self.color;
++}
++
++/// Whether a specific glyph is coloured.
++///
++/// Answered by asking DirectWrite to translate the glyph into colour layers:
++/// `DWRITE_E_NOCOLOR` means monochrome. That is the same question
++/// `renderGlyph` has to answer, so the two agree by construction rather than
++/// by two heuristics that might diverge.
++pub fn isColorGlyph(self: *const Face, glyph_id: u32) bool {
++    if (!self.color) return false;
++
++    var indices = [_]u16{@intCast(glyph_id)};
++    const run: dw.DWRITE_GLYPH_RUN = .{
++        .fontFace = self.face,
++        .fontEmSize = self.pixelSize(),
++        .glyphCount = 1,
++        .glyphIndices = &indices,
++        .glyphAdvances = null,
++        .glyphOffsets = null,
++        .isSideways = 0,
++        .bidiLevel = 0,
++    };
++
++    var enumerator: ?*dw.IDWriteColorGlyphRunEnumerator1 = null;
++    const hr = self.lib.factory4.TranslateColorGlyphRun(
++        .{ .x = 0, .y = 0 },
++        &run,
++        dw.GLYPH_IMAGE_COLOR,
++        &enumerator,
++    );
++    if (enumerator) |e| _ = e.Release();
++    return hr != dw.DWRITE_E_NOCOLOR and dw.SUCCEEDED(hr);
++}
++
++fn pixelSize(self: *const Face) f32 {
++    return self.size.pixels();
++}
++
++/// Map a codepoint to a glyph index, or null if this face has no glyph for it.
++pub fn glyphIndex(self: Face, cp: u32) ?u32 {
++    var cps = [_]u32{cp};
++    var out = [_]u16{0};
++    if (dw.FAILED(self.face.GetGlyphIndices(&cps, &out))) return null;
++    // Index 0 is .notdef, i.e. "this face does not have it". Returning null
++    // is what lets the fallback chain take over.
++    return if (out[0] == 0) null else out[0];
++}
++
++/// The font's family name, read from the SFNT `name` table.
++///
++/// Discovery matches requested families against this, so it has to be real
++/// rather than a placeholder. DirectWrite can report family names through
++/// IDWriteFontFamily, but a face created from a file has no family object -
++/// the name table is available either way and is the authoritative source.
++pub fn name(self: *const Face, buf: []u8) Allocator.Error![]const u8 {
++    var data: ?*const anyopaque = null;
++    var size: u32 = 0;
++    var ctx: ?*anyopaque = null;
++    var exists: i32 = 0;
++    if (dw.FAILED(self.face.TryGetFontTable(
++        dw.tag("name"),
++        &data,
++        &size,
++        &ctx,
++        &exists,
++    )) or exists == 0 or data == null) return buf[0..0];
++    defer self.face.ReleaseFontTable(ctx);
++
++    const t: [*]const u8 = @ptrCast(data.?);
++    const table = t[0..size];
++    return parseNameTable(table, buf) orelse buf[0..0];
++}
++
++/// Extract nameID 1 (font family) from an OpenType `name` table.
++///
++/// All fields are big-endian. Windows records (platform 3, encoding 1) are
++/// UTF-16BE and preferred; Macintosh records (platform 1) are single-byte and
++/// used as a fallback for fonts that omit the Windows entry.
++fn parseNameTable(table: []const u8, out: []u8) ?[]const u8 {
++    if (table.len < 6) return null;
++    const be16 = struct {
++        fn f(b: []const u8, off: usize) u16 {
++            return (@as(u16, b[off]) << 8) | b[off + 1];
++        }
++    }.f;
++
++    const count = be16(table, 2);
++    const string_offset = be16(table, 4);
++
++    var best_mac: ?[]const u8 = null;
++    for (0..count) |i| {
++        const rec = 6 + i * 12;
++        if (rec + 12 > table.len) break;
++
++        const platform = be16(table, rec + 0);
++        const encoding = be16(table, rec + 2);
++        const name_id = be16(table, rec + 6);
++        const length = be16(table, rec + 8);
++        const offset = be16(table, rec + 10);
++        if (name_id != 1) continue; // family name
++
++        const start = @as(usize, string_offset) + offset;
++        if (start + length > table.len) continue;
++        const raw = table[start .. start + length];
++
++        if (platform == 3 and encoding == 1) {
++            // UTF-16BE. Decode only the ASCII subset, which is all a family
++            // name comparison needs and avoids pulling in a full decoder.
++            var n: usize = 0;
++            var j: usize = 0;
++            while (j + 1 < raw.len and n < out.len) : (j += 2) {
++                const cp = (@as(u16, raw[j]) << 8) | raw[j + 1];
++                if (cp == 0 or cp > 0x7F) continue;
++                out[n] = @intCast(cp);
++                n += 1;
++            }
++            if (n > 0) return out[0..n];
++        } else if (platform == 1 and best_mac == null) {
++            const n = @min(raw.len, out.len);
++            @memcpy(out[0..n], raw[0..n]);
++            best_mac = out[0..n];
++        }
++    }
++    return best_mac;
++}
++
++pub fn setSize(self: *Face, opts: font.face.Options) !void {
++    self.size = opts.size;
++}
++
++pub fn setVariations(
++    self: *Face,
++    vs: []const font.face.Variation,
++    opts: font.face.Options,
++) !void {
++    _ = vs;
++    _ = opts;
++    // Variable font axes need IDWriteFontFace5::GetFontResource and a
++    // variation-aware face. Not wired yet; a variable font renders at its
++    // default instance rather than failing.
++    _ = self;
++}
++
++pub fn syntheticBold(self: *const Face, opts: font.face.Options) !Face {
++    var f = self.*;
++    f.size = opts.size;
++    f.synthetic.bold = true;
++    // Both the COM face and the HarfBuzz font are refcounted and shared with
++    // the copy; without these the copy's deinit would free them out from
++    // under the original.
++    _ = self.face.vtable.AddRef(self.face);
++    _ = harfbuzz.c.hb_font_reference(self.hb_font.handle);
++    f.file = null; // the copy does not own the file reference
++    return f;
++}
++
++pub fn syntheticItalic(self: *const Face, opts: font.face.Options) !Face {
++    var f = self.*;
++    f.size = opts.size;
++    f.synthetic.italic = true;
++    _ = self.face.vtable.AddRef(self.face);
++    _ = harfbuzz.c.hb_font_reference(self.hb_font.handle);
++    f.file = null;
++    return f;
++}
++
++pub fn copyTable(
++    self: Face,
++    alloc: Allocator,
++    table_tag: *const [4]u8,
++) Allocator.Error!?[]u8 {
++    var data: ?*const anyopaque = null;
++    var size: u32 = 0;
++    var ctx: ?*anyopaque = null;
++    var exists: i32 = 0;
++
++    const t = (@as(u32, table_tag[0])) |
++        (@as(u32, table_tag[1]) << 8) |
++        (@as(u32, table_tag[2]) << 16) |
++        (@as(u32, table_tag[3]) << 24);
++
++    if (dw.FAILED(self.face.TryGetFontTable(t, &data, &size, &ctx, &exists)) or
++        exists == 0 or data == null) return null;
++    defer self.face.ReleaseFontTable(ctx);
++
++    const src: [*]const u8 = @ptrCast(data.?);
++    const buf = try alloc.alloc(u8, size);
++    @memcpy(buf, src[0..size]);
++    return buf;
++}
++
++/// Metrics describing the grid this face implies.
++///
++/// DirectWrite reports these in design units; dividing by `designUnitsPerEm`
++/// and multiplying by the pixel size converts to pixels. `cell_width` comes
++/// from measuring ASCII rather than trusting a single advance, matching what
++/// the other backends do for proportional-ish monospace fonts.
++/// sxHeight and sCapHeight straight out of the OS/2 table.
++///
++/// DWRITE_FONT_METRICS carries xHeight/capHeight too, but DirectWrite
++/// *synthesizes* them when the font does not define them: a symbols-only Nerd
++/// Font reports exactly 0.5em and ~0.7em, which look like real metrics and are
++/// not. ghostty relies on these being null for such fonts so that size
++/// adjustment falls through to matching line height instead, so the table has
++/// to be read directly. Only version 2 and later define these fields.
++fn os2Heights(face: *dw.IDWriteFontFace) ?struct { cap: i16, ex: i16 } {
++    var data: ?*const anyopaque = null;
++    var size: u32 = 0;
++    var ctx: ?*anyopaque = null;
++    var exists: i32 = 0;
++    if (dw.FAILED(face.TryGetFontTable(dw.tag("OS/2"), &data, &size, &ctx, &exists)) or
++        exists == 0 or data == null) return null;
++    defer face.ReleaseFontTable(ctx);
++
++    // sxHeight is at 86 and sCapHeight at 88, so the table must reach 90.
++    if (size < 90) return null;
++    const bytes: [*]const u8 = @ptrCast(data.?);
++    if (std.mem.readInt(u16, bytes[0..2], .big) < 2) return null;
++    return .{
++        .ex = std.mem.readInt(i16, bytes[86..88], .big),
++        .cap = std.mem.readInt(i16, bytes[88..90], .big),
++    };
++}
++
++/// Ink height of one character in design units, or null when the face has no
++/// glyph for it. The fallback the FreeType backend uses when OS/2 is too old.
++fn inkHeight(self: *Face, cp: u32) ?f64 {
++    const gid = self.glyphIndex(cp) orelse return null;
++    var indices = [_]u16{@intCast(gid)};
++    var gm: [1]dw.DWRITE_GLYPH_METRICS = undefined;
++    if (dw.FAILED(self.face.GetDesignGlyphMetrics(&indices, &gm))) return null;
++    const h = @as(i64, self.design.ascent) + self.design.descent -
++        gm[0].topSideBearing - gm[0].bottomSideBearing;
++    if (h <= 0) return null;
++    return @floatFromInt(h);
++}
++
++pub fn getMetrics(self: *Face) Metrics.FaceMetrics {
++    const px_per_em = self.pixelSize();
++    const upem: f64 = @floatFromInt(self.design.designUnitsPerEm);
++    const scale = @as(f64, px_per_em) / upem;
++
++    // Widest printable ASCII advance. A monospace font gives the same value
++    // for all of them, but measuring is correct either way.
++    var cell_width: f64 = 0;
++    {
++        var cps: [95]u32 = undefined;
++        for (&cps, 0..) |*c, i| c.* = @intCast(0x20 + i);
++        var indices: [95]u16 = undefined;
++        if (dw.SUCCEEDED(self.face.GetGlyphIndices(&cps, &indices))) {
++            var gm: [95]dw.DWRITE_GLYPH_METRICS = undefined;
++            if (dw.SUCCEEDED(self.face.GetDesignGlyphMetrics(&indices, &gm))) {
++                for (gm) |g| {
++                    const adv: f64 = @floatFromInt(g.advanceWidth);
++                    cell_width = @max(cell_width, adv * scale);
++                }
++            }
++        }
++    }
++
++    // Both null for a font that defines neither and has no 'H'/'x' - which is
++    // the signal ghostty needs in order to harmonize such a face by line height.
++    const cap_height: ?f64, const ex_height: ?f64 = heights: {
++        if (os2Heights(self.face)) |h| break :heights .{
++            @as(f64, @floatFromInt(h.cap)) * scale,
++            @as(f64, @floatFromInt(h.ex)) * scale,
++        };
++        break :heights .{
++            if (self.inkHeight('H')) |v| v * scale else null,
++            if (self.inkHeight('x')) |v| v * scale else null,
++        };
++    };
++
++    // Width of the CJK water ideograph, for the ic_width adjustment.
++    const ic_width: ?f64 = icw: {
++        const gid = self.glyphIndex('水') orelse break :icw null;
++        var indices = [_]u16{@intCast(gid)};
++        var gm: [1]dw.DWRITE_GLYPH_METRICS = undefined;
++        if (dw.FAILED(self.face.GetDesignGlyphMetrics(&indices, &gm))) break :icw null;
++        break :icw @as(f64, @floatFromInt(gm[0].advanceWidth)) * scale;
++    };
++
++    return .{
++        .px_per_em = px_per_em,
++        .cell_width = cell_width,
++        .ic_width = ic_width,
++        .ascent = @as(f64, @floatFromInt(self.design.ascent)) * scale,
++        // FaceMetrics wants +Y=up, so descent is negative.
++        .descent = -@as(f64, @floatFromInt(self.design.descent)) * scale,
++        .line_gap = @as(f64, @floatFromInt(self.design.lineGap)) * scale,
++        .underline_position = @as(f64, @floatFromInt(self.design.underlinePosition)) * scale,
++        .underline_thickness = @as(f64, @floatFromInt(self.design.underlineThickness)) * scale,
++        .strikethrough_position = @as(f64, @floatFromInt(self.design.strikethroughPosition)) * scale,
++        .strikethrough_thickness = @as(f64, @floatFromInt(self.design.strikethroughThickness)) * scale,
++        .cap_height = cap_height,
++        .ex_height = ex_height,
++    };
++}
++
++/// Rasterize a glyph into the atlas and return its placement.
++///
++/// One D2D path serves both monochrome and colour glyphs:
++/// `TranslateColorGlyphRun` returning `DWRITE_E_NOCOLOR` *is* the "this glyph
++/// is monochrome" answer, so there is no separate rasterizer and no rule for
++/// choosing between them. AtlasEngine works the same way, and it forces
++/// grayscale AA for colour glyphs, which we mirror.
++pub fn renderGlyph(
++    self: Face,
++    alloc: Allocator,
++    atlas: *font.Atlas,
++    glyph_index: u32,
++    opts: font.Glyph.RenderOptions,
++) !Glyph {
++    _ = opts;
++
++    self.lib.mutex.lockUncancelable(global.io());
++    defer self.lib.mutex.unlock(global.io());
++
++    const px_per_em = self.pixelSize();
++    const upem: f32 = @floatFromInt(self.design.designUnitsPerEm);
++    const scale = px_per_em / upem;
++
++    var indices = [_]u16{@intCast(glyph_index)};
++    var gm: [1]dw.DWRITE_GLYPH_METRICS = undefined;
++    if (dw.FAILED(self.face.GetDesignGlyphMetrics(&indices, &gm))) {
++        return Error.CannotRenderGlyph;
++    }
++
++    // Ink box in design units. topSideBearing is measured down from the
++    // ascent, and bottomSideBearing up from the descent, so the ink height is
++    // what remains between them.
++    const m = &gm[0];
++    const ink_w_du = @as(i64, m.advanceWidth) - m.leftSideBearing - m.rightSideBearing;
++    const ink_h_du = @as(i64, self.design.ascent) + self.design.descent -
++        m.topSideBearing - m.bottomSideBearing;
++
++    // Whitespace and other empty glyphs are legitimate; reserve nothing.
++    if (ink_w_du <= 0 or ink_h_du <= 0) {
++        return .{ .width = 0, .height = 0, .offset_x = 0, .offset_y = 0, .atlas_x = 0, .atlas_y = 0 };
++    }
++
++    // A pixel of slack on each side so antialiased edges are not clipped.
++    const pad: u32 = 2;
++    const w: u32 = @as(u32, @intFromFloat(@ceil(@as(f32, @floatFromInt(ink_w_du)) * scale))) + pad * 2;
++    const h: u32 = @as(u32, @intFromFloat(@ceil(@as(f32, @floatFromInt(ink_h_du)) * scale))) + pad * 2;
++
++    // Where the baseline sits inside the bitmap, and where the ink starts.
++    const left_px = @as(f32, @floatFromInt(m.leftSideBearing)) * scale;
++    const top_px = @as(f32, @floatFromInt(m.topSideBearing)) * scale;
++    const ascent_px = @as(f32, @floatFromInt(self.design.ascent)) * scale;
++    const origin_x = pad_f(pad) - left_px;
++    const origin_y = pad_f(pad) + (ascent_px - top_px);
++
++    // --- WIC bitmap + D2D target ---
++    var bmp: ?*d2d.IWICBitmap = null;
++    if (dw.FAILED(self.lib.wic_factory.CreateBitmap(
++        w,
++        h,
++        &d2d.GUID_WICPixelFormat32bppPBGRA,
++        .CacheOnLoad,
++        &bmp,
++    )) or bmp == null) return Error.CannotRenderGlyph;
++    defer _ = bmp.?.Release();
++
++    const props: d2d.D2D1_RENDER_TARGET_PROPERTIES = .{
++        .type = .SOFTWARE, // WIC targets must be software
++        .pixelFormat = .{
++            .format = d2d.DXGI_FORMAT_B8G8R8A8_UNORM,
++            .alphaMode = .PREMULTIPLIED,
++        },
++        .dpiX = 96,
++        .dpiY = 96,
++        .usage = 0,
++        .minLevel = .DEFAULT,
++    };
++    var rt: ?*d2d.ID2D1RenderTarget = null;
++    if (dw.FAILED(self.lib.d2d_factory.CreateWicBitmapRenderTarget(
++        @ptrCast(bmp.?),
++        &props,
++        &rt,
++    )) or rt == null) return Error.CannotRenderGlyph;
++    defer _ = rt.?.Release();
++
++    const white: d2d.D2D1_COLOR_F = .{ .r = 1, .g = 1, .b = 1, .a = 1 };
++    var brush: ?*d2d.ID2D1SolidColorBrush = null;
++    if (dw.FAILED(rt.?.CreateSolidColorBrush(&white, &brush)) or brush == null) {
++        return Error.CannotRenderGlyph;
++    }
++    defer _ = brush.?.Release();
++
++    const run: dw.DWRITE_GLYPH_RUN = .{
++        .fontFace = self.face,
++        .fontEmSize = px_per_em,
++        .glyphCount = 1,
++        .glyphIndices = &indices,
++        .glyphAdvances = null,
++        .glyphOffsets = null,
++        .isSideways = 0,
++        .bidiLevel = 0,
++    };
++
++    // Colour layers, if this glyph has any. Requesting only the colour formats
++    // means NOCOLOR is the "draw it as ordinary text" answer.
++    var enumerator: ?*dw.IDWriteColorGlyphRunEnumerator1 = null;
++    var is_color = false;
++    if (self.color) {
++        const hr = self.lib.factory4.TranslateColorGlyphRun(
++            .{ .x = origin_x, .y = origin_y },
++            &run,
++            dw.GLYPH_IMAGE_COLOR,
++            &enumerator,
++        );
++        is_color = hr != dw.DWRITE_E_NOCOLOR and dw.SUCCEEDED(hr) and enumerator != null;
++    }
++    defer if (enumerator) |e| {
++        _ = e.Release();
++    };
++
++    // Colour bitmap (CBDT/sbix) and SVG runs can only be drawn through
++    // ID2D1DeviceContext4. A WIC bitmap render target supports it, so this is a
++    // QueryInterface rather than a second device. Only needed for colour.
++    var dc4: ?*d2d.ID2D1DeviceContext4 = null;
++    defer if (dc4) |c| {
++        _ = c.Release();
++    };
++    if (is_color) {
++        var dc4_o: ?*anyopaque = null;
++        if (dw.FAILED(rt.?.QueryInterface(&d2d.ID2D1DeviceContext4.IID, &dc4_o)) or
++            dc4_o == null) return Error.CannotRenderGlyph;
++        dc4 = @ptrCast(@alignCast(dc4_o.?));
++        // D2D measures in DIPs by default. At 96 dpi that already equals
++        // pixels, but the glyph geometry above is all in pixels, so say so.
++        dc4.?.SetUnitMode(.PIXELS);
++    }
++
++    rt.?.SetTextAntialiasMode(.GRAYSCALE);
++    rt.?.BeginDraw();
++    const clear: d2d.D2D1_COLOR_F = .{ .r = 0, .g = 0, .b = 0, .a = 0 };
++    rt.?.Clear(&clear);
++
++    if (is_color) {
++        while (true) {
++            var has: i32 = 0;
++            if (dw.FAILED(enumerator.?.MoveNext(&has)) or has == 0) break;
++            var cr: ?*const dw.DWRITE_COLOR_GLYPH_RUN1 = null;
++            if (dw.FAILED(enumerator.?.GetCurrentRun(&cr)) or cr == null) break;
++
++            const origin: d2d.D2D1_POINT_2F = .{
++                .x = cr.?.baselineOriginX,
++                .y = cr.?.baselineOriginY,
++            };
++
++            // TranslateColorGlyphRun has already split the run so that exactly
++            // one format bit is set. Each format has its own draw call, and
++            // using the wrong one draws nothing at all rather than failing.
++            if (cr.?.glyphImageFormat & dw.GLYPH_IMAGE_BITMAP != 0) {
++                // CBDT/sbix: an embedded PNG/JPEG/TIFF bitmap. This is the path
++                // Noto Color Emoji takes.
++                dc4.?.DrawColorBitmapGlyphRun(
++                    cr.?.glyphImageFormat,
++                    origin,
++                    &cr.?.glyphRun,
++                    cr.?.measuringMode,
++                );
++            } else if (cr.?.glyphImageFormat & dw.GLYPH_IMAGE_SVG != 0) {
++                dc4.?.DrawSvgGlyphRun(origin, &cr.?.glyphRun, brush.?, cr.?.measuringMode);
++            } else {
++                // COLR layers, as in Segoe UI Emoji. A palette index of 0xFFFF
++                // means this layer takes the text colour rather than a palette
++                // colour: we rasterize those white so the shader can tint them,
++                // while palette layers keep their own colour.
++                const col: d2d.D2D1_COLOR_F = if (cr.?.paletteIndex == dw.DWRITE_NO_PALETTE_INDEX)
++                    white
++                else
++                    .{
++                        .r = cr.?.runColor.r,
++                        .g = cr.?.runColor.g,
++                        .b = cr.?.runColor.b,
++                        .a = cr.?.runColor.a,
++                    };
++                brush.?.SetColor(&col);
++                rt.?.DrawGlyphRun(origin, &cr.?.glyphRun, brush.?);
++            }
++        }
++    } else {
++        rt.?.DrawGlyphRun(.{ .x = origin_x, .y = origin_y }, &run, brush.?);
++    }
++
++    if (dw.FAILED(rt.?.EndDraw())) return Error.CannotRenderGlyph;
++
++    // --- read back into the atlas ---
++    var lock: ?*d2d.IWICBitmapLock = null;
++    const rect: d2d.WICRect = .{ .X = 0, .Y = 0, .Width = @intCast(w), .Height = @intCast(h) };
++    if (dw.FAILED(bmp.?.Lock(&rect, d2d.WICBitmapLockRead, &lock)) or lock == null) {
++        return Error.CannotRenderGlyph;
++    }
++    defer _ = lock.?.Release();
++
++    var stride: u32 = 0;
++    _ = lock.?.GetStride(&stride);
++    var buf_size: u32 = 0;
++    var data: ?[*]u8 = null;
++    if (dw.FAILED(lock.?.GetDataPointer(&buf_size, &data)) or data == null) {
++        return Error.CannotRenderGlyph;
++    }
++
++    const region = try atlas.reserve(alloc, w, h);
++
++    switch (atlas.format) {
++        // Grayscale atlas: alpha is coverage, since we drew with a white brush.
++        .grayscale => {
++            const tmp = try alloc.alloc(u8, w * h);
++            defer alloc.free(tmp);
++            for (0..h) |y| {
++                for (0..w) |x| {
++                    tmp[y * w + x] = data.?[y * stride + x * 4 + 3];
++                }
++            }
++            atlas.set(region, tmp);
++        },
++
++        // Colour atlas: BGRA, already premultiplied by D2D, which is what the
++        // shader expects.
++        .bgra => {
++            const tmp = try alloc.alloc(u8, w * h * 4);
++            defer alloc.free(tmp);
++            for (0..h) |y| {
++                const src = data.?[y * stride ..][0 .. w * 4];
++                @memcpy(tmp[y * w * 4 ..][0 .. w * 4], src);
++            }
++            atlas.set(region, tmp);
++        },
++
++        else => return Error.CannotRenderGlyph,
++    }
++
++    return .{
++        .width = w,
++        .height = h,
++        // offset_x is the left bearing; offset_y is measured from the baseline
++        // up to the top of the ink box, which is where the padding lives too.
++        .offset_x = @intFromFloat(@floor(left_px) - pad_f(pad)),
++        .offset_y = @intFromFloat(@ceil(ascent_px - top_px + pad_f(pad))),
++        .atlas_x = region.x,
++        .atlas_y = region.y,
++    };
++}
++
++inline fn pad_f(p: u32) f32 {
++    return @floatFromInt(p);
++}
++
++test {
++    // Referenced so the bindings' own vtable-layout tests run.
++    _ = dw;
++    _ = d2d;
++}
++
++test "undefined ex/cap heights stay null" {
++    // DirectWrite synthesizes xHeight/capHeight for fonts that define neither.
++    // ghostty needs null here, otherwise size adjustment harmonizes against a
++    // made-up metric instead of falling through to line height.
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var lib = try Library.init(alloc);
++    defer lib.deinit();
++
++    const opts: font.face.Options = .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } };
++
++    var text = try Face.init(lib, font.embedded.inconsolata, opts);
++    defer text.deinit();
++    const tm = text.getMetrics();
++    try testing.expect(tm.ex_height != null);
++    try testing.expect(tm.cap_height != null);
++
++    // The symbols font carries an OS/2 v2 table whose sxHeight/sCapHeight are
++    // zero. The FreeType backend passes that zero through too, and ghostty's
++    // Metrics.exHeight/capHeight accessors treat "not > 0" as undefined - so
++    // null and zero are equally valid answers here. What must not happen is a
++    // plausible positive number, which is what DWRITE_FONT_METRICS reports
++    // (exactly 0.5em) and what made size adjustment harmonize against a
++    // fabricated metric.
++    var symbols = try Face.init(lib, font.embedded.symbols_nerd_font, opts);
++    defer symbols.deinit();
++    const sm = symbols.getMetrics();
++    try testing.expect(sm.ex_height == null or sm.ex_height.? <= 0);
++    try testing.expect(sm.cap_height == null or sm.cap_height.? <= 0);
++}
++
++test "render ascii" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    const testFont = font.embedded.inconsolata;
++
++    var lib = try Library.init(alloc);
++    defer lib.deinit();
++
++    var atlas = try font.Atlas.init(alloc, 512, .grayscale);
++    defer atlas.deinit(alloc);
++
++    var face = try Face.init(
++        lib,
++        testFont,
++        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
++    );
++    defer face.deinit();
++
++    var i: u8 = 32;
++    while (i < 127) : (i += 1) {
++        _ = try face.renderGlyph(
++            alloc,
++            &atlas,
++            face.glyphIndex(i).?,
++            .{ .grid_metrics = font.Metrics.calc(face.getMetrics()) },
++        );
++    }
++
++    // Doubling the point size should grow the rasterized glyph. The exact
++    // pixel heights are deliberately not asserted: those are properties of
++    // the rasterizer, and pinning FreeType's numbers here would encode an
++    // expectation DirectWrite has no reason to meet.
++    {
++        const g1 = try face.renderGlyph(
++            alloc,
++            &atlas,
++            face.glyphIndex('A').?,
++            .{ .grid_metrics = font.Metrics.calc(face.getMetrics()) },
++        );
++
++        try face.setSize(.{ .size = .{ .points = 24, .xdpi = 96, .ydpi = 96 } });
++        const g2 = try face.renderGlyph(
++            alloc,
++            &atlas,
++            face.glyphIndex('A').?,
++            .{ .grid_metrics = font.Metrics.calc(face.getMetrics()) },
++        );
++
++        try testing.expect(g1.height > 0);
++        try testing.expect(g2.height > g1.height);
++    }
++}
++
++test "render produces non-blank coverage" {
++    // renderGlyph returning a plausible-looking Glyph is not evidence that
++    // anything was drawn: a D2D target that silently fails to draw yields
++    // correct metrics over an empty bitmap. Check the atlas actually has ink.
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var lib = try Library.init(alloc);
++    defer lib.deinit();
++
++    var atlas = try font.Atlas.init(alloc, 512, .grayscale);
++    defer atlas.deinit(alloc);
++
++    var face = try Face.init(
++        lib,
++        font.embedded.inconsolata,
++        .{ .size = .{ .points = 24, .xdpi = 96, .ydpi = 96 } },
++    );
++    defer face.deinit();
++
++    const g = try face.renderGlyph(
++        alloc,
++        &atlas,
++        face.glyphIndex('M').?,
++        .{ .grid_metrics = font.Metrics.calc(face.getMetrics()) },
++    );
++
++    var ink: usize = 0;
++    var y: u32 = 0;
++    while (y < g.height) : (y += 1) {
++        var x: u32 = 0;
++        while (x < g.width) : (x += 1) {
++            if (atlas.data[(g.atlas_y + y) * atlas.size + (g.atlas_x + x)] != 0) {
++                ink += 1;
++            }
++        }
++    }
++    try testing.expect(ink > 0);
++}
++
++test "color emoji" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var lib = try Library.init(alloc);
++    defer lib.deinit();
++
++    var atlas = try font.Atlas.init(alloc, 512, .bgra);
++    defer atlas.deinit(alloc);
++
++    var face = try Face.init(
++        lib,
++        font.embedded.emoji,
++        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
++    );
++    defer face.deinit();
++
++    const glyph_id = face.glyphIndex('🥸').?;
++    const g = try face.renderGlyph(
++        alloc,
++        &atlas,
++        glyph_id,
++        .{ .grid_metrics = font.Metrics.calc(face.getMetrics()) },
++    );
++
++    try testing.expect(face.hasColor());
++    try testing.expect(face.isColorGlyph(glyph_id));
++
++    // Two distinct failures to rule out. Fully transparent means the colour
++    // path ran and composited nothing. Opaque but grey means we fell back to
++    // rasterizing the outline, which for a CBDT font is blank or a blob - so
++    // "it drew something" is not enough, the pixels have to actually be
++    // coloured. Noto Color Emoji is CBDT, so this only passes via
++    // DrawColorBitmapGlyphRun.
++    var opaque_px: usize = 0;
++    var chromatic_px: usize = 0;
++    var y: u32 = 0;
++    while (y < g.height) : (y += 1) {
++        var x: u32 = 0;
++        while (x < g.width) : (x += 1) {
++            const i = ((g.atlas_y + y) * atlas.size + (g.atlas_x + x)) * 4;
++            if (atlas.data[i + 3] == 0) continue;
++            opaque_px += 1;
++            const b = atlas.data[i];
++            const gr = atlas.data[i + 1];
++            const r = atlas.data[i + 2];
++            const hi = @max(r, @max(gr, b));
++            const lo = @min(r, @min(gr, b));
++            if (hi - lo > 24) chromatic_px += 1;
++        }
++    }
++    try testing.expect(opaque_px > 0);
++    try testing.expect(chromatic_px > 0);
++}
++
++test "monochrome font reports no color" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var lib = try Library.init(alloc);
++    defer lib.deinit();
++
++    var face = try Face.init(
++        lib,
++        font.embedded.inconsolata,
++        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
++    );
++    defer face.deinit();
++
++    try testing.expect(!face.hasColor());
++    try testing.expect(!face.isColorGlyph(face.glyphIndex('A').?));
++}
++
++test "name" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var lib = try Library.init(alloc);
++    defer lib.deinit();
++
++    var face = try Face.init(
++        lib,
++        font.embedded.inconsolata,
++        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
++    );
++    defer face.deinit();
++
++    // The Windows font scanner matches requested families against this, so a
++    // wrong answer here fails at runtime as "font not found", not at build.
++    var buf: [1024]u8 = undefined;
++    try testing.expectEqualStrings("Inconsolata", try face.name(&buf));
++}
++
++test "cff outlines" {
++    // init() asks DirectWrite for a TRUETYPE face. CFF-flavoured OpenType is
++    // a different DWRITE_FONT_FACE_TYPE, so this is the case that catches a
++    // hardcoded face type.
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var lib = try Library.init(alloc);
++    defer lib.deinit();
++
++    var atlas = try font.Atlas.init(alloc, 512, .grayscale);
++    defer atlas.deinit(alloc);
++
++    var face = try Face.init(
++        lib,
++        font.embedded.code_new_roman,
++        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
++    );
++    defer face.deinit();
++
++    _ = try face.renderGlyph(
++        alloc,
++        &atlas,
++        face.glyphIndex('A').?,
++        .{ .grid_metrics = font.Metrics.calc(face.getMetrics()) },
++    );
++}
+diff --git a/src/font/face/dwrite/api.zig b/src/font/face/dwrite/api.zig
+index 99da35ded..2c35b84a8 100644
+--- a/src/font/face/dwrite/api.zig
++++ b/src/font/face/dwrite/api.zig
+@@ -396,7 +396,12 @@ pub const IDWriteFactory = extern struct {
+         CreateCustomFontCollection: Reserved,
+         RegisterFontCollectionLoader: Reserved,
+         UnregisterFontCollectionLoader: Reserved,
+-        CreateFontFileReference: Reserved,
++        CreateFontFileReference: *const fn (
++            *IDWriteFactory,
++            [*:0]const u16, // filePath
++            ?*const anyopaque, // lastWriteTime, null = query it
++            *?*IDWriteFontFile,
++        ) callconv(.winapi) HRESULT,
+         CreateCustomFontFileReference: Reserved,
+         CreateFontFace: *const fn (
+             *IDWriteFactory,
+@@ -472,6 +477,15 @@ pub const IDWriteFactory = extern struct {
+         );
+     }
+ 
++    /// Reference a font file on disk. `path` must be UTF-16.
++    pub inline fn CreateFontFileReference(
++        self: *IDWriteFactory,
++        path: [*:0]const u16,
++        out: *?*IDWriteFontFile,
++    ) HRESULT {
++        return self.vtable.CreateFontFileReference(self, path, null, out);
++    }
++
+     /// `face_type` is TRUETYPE for the fonts we care about; DirectWrite will
+     /// reject a mismatch rather than misparse.
+     pub inline fn CreateFontFace(
+@@ -656,6 +670,190 @@ pub const IDWriteColorGlyphRunEnumerator = extern struct {
+     }
+ };
+ 
++/// Which glyph image formats `TranslateColorGlyphRun` should split a run into.
++///
++/// This is the crux of colour emoji support. dwrite_3.h states that
++/// IDWriteFactory2's TranslateColorGlyphRun "is equivalent to passing
++/// TRUETYPE|CFF|COLR" - so it answers DWRITE_E_NOCOLOR for any font whose
++/// colour lives somewhere other than a COLR table. Segoe UI Emoji is COLR/CPAL
++/// and works either way, but Noto Color Emoji - which ghostty embeds and falls
++/// back to - is CBDT/CBLC and surfaces as PNG. Requesting only the COLR subset
++/// renders it as blank or monochrome.
++pub const DWRITE_GLYPH_IMAGE_FORMATS = u32;
++pub const GLYPH_IMAGE_NONE: u32 = 0x00;
++pub const GLYPH_IMAGE_TRUETYPE: u32 = 0x01;
++pub const GLYPH_IMAGE_CFF: u32 = 0x02;
++pub const GLYPH_IMAGE_COLR: u32 = 0x04;
++pub const GLYPH_IMAGE_SVG: u32 = 0x08;
++pub const GLYPH_IMAGE_PNG: u32 = 0x10;
++pub const GLYPH_IMAGE_JPEG: u32 = 0x20;
++pub const GLYPH_IMAGE_TIFF: u32 = 0x40;
++pub const GLYPH_IMAGE_PREMULTIPLIED_B8G8R8A8: u32 = 0x80;
++
++/// Every format DirectWrite can produce. AtlasEngine requests exactly this set
++/// (see Backend.cpp), so asking for less would render fewer emoji than Windows
++/// Terminal does today.
++pub const GLYPH_IMAGE_ALL: u32 = GLYPH_IMAGE_TRUETYPE | GLYPH_IMAGE_CFF |
++    GLYPH_IMAGE_COLR | GLYPH_IMAGE_SVG | GLYPH_IMAGE_PNG | GLYPH_IMAGE_JPEG |
++    GLYPH_IMAGE_TIFF | GLYPH_IMAGE_PREMULTIPLIED_B8G8R8A8;
++
++/// Formats that arrive as a colour bitmap and must be drawn with
++/// `DrawColorBitmapGlyphRun`; `DrawGlyphRun` silently draws nothing for these.
++pub const GLYPH_IMAGE_BITMAP: u32 = GLYPH_IMAGE_PNG | GLYPH_IMAGE_JPEG |
++    GLYPH_IMAGE_TIFF | GLYPH_IMAGE_PREMULTIPLIED_B8G8R8A8;
++
++/// The colour-bearing formats, without TRUETYPE/CFF.
++///
++/// AtlasEngine asks for GLYPH_IMAGE_ALL because it wants one unified draw loop
++/// and is happy to get plain outline runs back. We ask for this subset instead,
++/// so that DWRITE_E_NOCOLOR means precisely "this glyph is monochrome" - which
++/// is the question both `isColorGlyph` and `renderGlyph` need answered, and it
++/// keeps the two agreeing by construction. Including TRUETYPE here would make
++/// every glyph in a colour font look coloured.
++pub const GLYPH_IMAGE_COLOR: u32 = GLYPH_IMAGE_COLR | GLYPH_IMAGE_SVG |
++    GLYPH_IMAGE_BITMAP;
++
++/// `DWRITE_COLOR_GLYPH_RUN` plus the format and measuring mode, as returned by
++/// `IDWriteColorGlyphRunEnumerator1::GetCurrentRun`. Exactly one format bit is
++/// set: TranslateColorGlyphRun has already split the run by format.
++///
++/// The C++ type derives from DWRITE_COLOR_GLYPH_RUN and MSVC does not reuse the
++/// base's tail padding, so the six bytes after `paletteIndex` are explicit here.
++/// The comptime asserts below are what keep that honest.
++pub const DWRITE_COLOR_GLYPH_RUN1 = extern struct {
++    glyphRun: DWRITE_GLYPH_RUN,
++    glyphRunDescription: ?*anyopaque,
++    baselineOriginX: f32,
++    baselineOriginY: f32,
++    runColor: DWRITE_COLOR_F,
++    paletteIndex: u16,
++    _tail_padding: [6]u8 = @splat(0),
++    glyphImageFormat: DWRITE_GLYPH_IMAGE_FORMATS,
++    measuringMode: DWRITE_MEASURING_MODE,
++};
++
++comptime {
++    // Verified against the SDK with offsetof/sizeof; a mismatch here would be
++    // read as garbage format bits rather than as a compile error.
++    std.debug.assert(@sizeOf(DWRITE_COLOR_GLYPH_RUN1) == 96);
++    std.debug.assert(@offsetOf(DWRITE_COLOR_GLYPH_RUN1, "paletteIndex") == 80);
++    std.debug.assert(@offsetOf(DWRITE_COLOR_GLYPH_RUN1, "glyphImageFormat") == 88);
++    std.debug.assert(@offsetOf(DWRITE_COLOR_GLYPH_RUN1, "measuringMode") == 92);
++}
++
++// =============================================================================
++// IDWriteColorGlyphRunEnumerator1 — adds GetCurrentRun returning the *1* struct.
++// Slots: MoveNext(3), GetCurrentRun(4, base), GetCurrentRun(5, this one).
++// =============================================================================
++pub const IDWriteColorGlyphRunEnumerator1 = extern struct {
++    vtable: *const VTable,
++
++    pub const IID = GUID{
++        .data1 = 0x7c5f86da,
++        .data2 = 0xc7a1,
++        .data3 = 0x4f05,
++        .data4 = .{ 0xb8, 0xe1, 0x55, 0xa1, 0x79, 0xfe, 0x5a, 0x35 },
++    };
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*IDWriteColorGlyphRunEnumerator1, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDWriteColorGlyphRunEnumerator1) callconv(.winapi) u32,
++        Release: *const fn (*IDWriteColorGlyphRunEnumerator1) callconv(.winapi) u32,
++        // IDWriteColorGlyphRunEnumerator 3-4
++        MoveNext: *const fn (*IDWriteColorGlyphRunEnumerator1, *i32) callconv(.winapi) HRESULT,
++        _GetCurrentRun0: Reserved,
++        // IDWriteColorGlyphRunEnumerator1 5
++        GetCurrentRun: *const fn (*IDWriteColorGlyphRunEnumerator1, *?*const DWRITE_COLOR_GLYPH_RUN1) callconv(.winapi) HRESULT,
++    };
++
++    pub inline fn MoveNext(self: *IDWriteColorGlyphRunEnumerator1, has_run: *i32) HRESULT {
++        return self.vtable.MoveNext(self, has_run);
++    }
++
++    pub inline fn GetCurrentRun(
++        self: *IDWriteColorGlyphRunEnumerator1,
++        out: *?*const DWRITE_COLOR_GLYPH_RUN1,
++    ) HRESULT {
++        return self.vtable.GetCurrentRun(self, out);
++    }
++
++    pub inline fn Release(self: *IDWriteColorGlyphRunEnumerator1) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// IDWriteFactory4 — inherits IDWriteFactory (21) + 1 (2) + 2 (5) + 3 (9),
++// so its own methods start at 40:
++//   40 TranslateColorGlyphRun   <- the full-format version
++//   41 ComputeGlyphOrigins
++//   42 ComputeGlyphOrigins (overload)
++//
++// Note this takes the baseline origin as a D2D1_POINT_2F by value, where
++// IDWriteFactory2 took two floats.
++// =============================================================================
++pub const IDWriteFactory4 = extern struct {
++    vtable: *const VTable,
++
++    pub const IID = GUID{
++        .data1 = 0x4b0b5bd3,
++        .data2 = 0x0797,
++        .data3 = 0x4549,
++        .data4 = .{ 0x8a, 0xc5, 0xfe, 0x91, 0x5c, 0xc5, 0x38, 0x56 },
++    };
++
++    pub const POINT_2F = extern struct { x: f32, y: f32 };
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*IDWriteFactory4, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDWriteFactory4) callconv(.winapi) u32,
++        Release: *const fn (*IDWriteFactory4) callconv(.winapi) u32,
++        // IDWriteFactory 3-23, IDWriteFactory1 24-25,
++        // IDWriteFactory2 26-30, IDWriteFactory3 31-39
++        _reserved: [37]Reserved,
++        // IDWriteFactory4 40-42
++        TranslateColorGlyphRun: *const fn (
++            *IDWriteFactory4,
++            POINT_2F,
++            *const DWRITE_GLYPH_RUN,
++            ?*const anyopaque,
++            DWRITE_GLYPH_IMAGE_FORMATS,
++            DWRITE_MEASURING_MODE,
++            ?*const anyopaque,
++            u32,
++            *?*IDWriteColorGlyphRunEnumerator1,
++        ) callconv(.winapi) HRESULT,
++        _ComputeGlyphOrigins0: Reserved,
++        _ComputeGlyphOrigins1: Reserved,
++    };
++
++    /// Returns DWRITE_E_NOCOLOR when the glyph has no colour in any of the
++    /// requested formats; that is the "render it as normal text" answer.
++    pub inline fn TranslateColorGlyphRun(
++        self: *IDWriteFactory4,
++        origin: POINT_2F,
++        run: *const DWRITE_GLYPH_RUN,
++        formats: DWRITE_GLYPH_IMAGE_FORMATS,
++        out: *?*IDWriteColorGlyphRunEnumerator1,
++    ) HRESULT {
++        return self.vtable.TranslateColorGlyphRun(
++            self,
++            origin,
++            run,
++            null,
++            formats,
++            .NATURAL,
++            null,
++            0,
++            out,
++        );
++    }
++
++    pub inline fn Release(self: *IDWriteFactory4) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
+ // =============================================================================
+ // IDWriteFactory2 — inherits IDWriteFactory (24 slots) + IDWriteFactory1 (2).
+ // Its own methods start at 26:
+@@ -665,12 +863,15 @@ pub const IDWriteColorGlyphRunEnumerator = extern struct {
+ //   29 CreateCustomRenderingParams
+ //   30 CreateGlyphRunAnalysis
+ //
+-// Deliberately Factory2 rather than Factory4. Factory4's TranslateColorGlyphRun
+-// additionally handles SVG/PNG/bitmap glyph formats, but sits ~43 slots deep
+-// through two more inheritance levels - a lot of hand-counted offsets, each of
+-// which fails silently. Factory2 handles COLR, which is what Segoe UI Emoji
+-// uses and exactly what AtlasEngine renders. Factory4 is a later upgrade for
+-// the rarer formats.
++// Kept for GetSystemFontFallback (slot 26), which discovery needs.
++//
++// Its TranslateColorGlyphRun is deliberately NOT used: it is defined as
++// TRUETYPE|CFF|COLR only, so it reports DWRITE_E_NOCOLOR for CBDT/sbix/SVG
++// colour fonts. Rasterization goes through IDWriteFactory4 instead. An earlier
++// version of this file claimed the COLR subset was "exactly what AtlasEngine
++// renders" and that the other formats were rare; both were wrong. AtlasEngine
++// requests all eight formats, and Noto Color Emoji - the font ghostty embeds -
++// is CBDT.
+ // =============================================================================
+ pub const IDWriteFactory2 = extern struct {
+     vtable: *const VTable,
+@@ -924,12 +1125,41 @@ test "vtable slot counts" {
+         (3 + 11) * @sizeOf(usize), // IDWriteFontFace has 11 own methods
+         @sizeOf(IDWriteFontFace.VTable),
+     );
++    // 3 IUnknown + 21 IDWriteFactory + 2 IDWriteFactory1 + 5 IDWriteFactory2.
++    // Assert the total and the offset of the one method we actually call,
++    // rather than a subtraction that is easy to get wrong in either direction.
++    try std.testing.expectEqual(
++        31 * @sizeOf(usize),
++        @sizeOf(IDWriteFactory2.VTable),
++    );
+     try std.testing.expectEqual(
+-        (3 + 5) * @sizeOf(usize), // IDWriteFactory1 adds 2, IDWriteFactory2 adds 5
+-        @sizeOf(IDWriteFactory2.VTable) - (3 + 21 + 2) * @sizeOf(usize),
++        26 * @sizeOf(usize),
++        @offsetOf(IDWriteFactory2.VTable, "GetSystemFontFallback"),
+     );
+     try std.testing.expectEqual(
+         (3 + 2) * @sizeOf(usize), // MoveNext, GetCurrentRun
+         @sizeOf(IDWriteColorGlyphRunEnumerator.VTable),
+     );
++
++    // IDWriteFactory4: 3 IUnknown + 37 inherited + 3 own = 43 slots, with
++    // TranslateColorGlyphRun at 40. Confirmed empirically by calling through
++    // the raw vtable and comparing against the C++ virtual call.
++    try std.testing.expectEqual(
++        43 * @sizeOf(usize),
++        @sizeOf(IDWriteFactory4.VTable),
++    );
++    try std.testing.expectEqual(
++        40 * @sizeOf(usize),
++        @offsetOf(IDWriteFactory4.VTable, "TranslateColorGlyphRun"),
++    );
++
++    // GetCurrentRun is the *1* variant at slot 5, not the base one at 4.
++    try std.testing.expectEqual(
++        6 * @sizeOf(usize),
++        @sizeOf(IDWriteColorGlyphRunEnumerator1.VTable),
++    );
++    try std.testing.expectEqual(
++        5 * @sizeOf(usize),
++        @offsetOf(IDWriteColorGlyphRunEnumerator1.VTable, "GetCurrentRun"),
++    );
+ }
+diff --git a/src/font/face/dwrite/d2d.zig b/src/font/face/dwrite/d2d.zig
+index dff858258..dc4f79696 100644
+--- a/src/font/face/dwrite/d2d.zig
++++ b/src/font/face/dwrite/d2d.zig
+@@ -440,6 +440,110 @@ pub const IWICImagingFactory = extern struct {
+     }
+ };
+ 
++pub const D2D1_UNIT_MODE = enum(u32) { DIPS = 0, PIXELS = 1 };
++pub const D2D1_COLOR_BITMAP_GLYPH_SNAP_OPTION = enum(u32) { DEFAULT = 0, DISABLE = 1 };
++
++// =============================================================================
++// ID2D1DeviceContext4 — the interface that can draw colour *bitmap* and SVG
++// glyph runs. A WIC bitmap render target created from an ID2D1Factory1
++// QueryInterfaces to this successfully, so the face keeps its CPU-side target
++// and needs no D3D device.
++//
++// Slot numbering (derived from the SDK headers, then confirmed by calling
++// through the raw vtable and diffing the rendered pixels against the C++
++// virtual call):
++//   ID2D1RenderTarget    4-56    (53)
++//   ID2D1DeviceContext   57-91   (35)   SetUnitMode at 80
++//   ID2D1DeviceContext1  92-94   (3)
++//   ID2D1DeviceContext2  95-105  (11)
++//   ID2D1DeviceContext3  106-107 (2)
++//   ID2D1DeviceContext4  108-114 (7)    DrawColorBitmapGlyphRun 111, DrawSvgGlyphRun 112
++// =============================================================================
++pub const ID2D1DeviceContext4 = extern struct {
++    vtable: *const VTable,
++
++    pub const IID = GUID{
++        .data1 = 0x8c427831,
++        .data2 = 0x3d90,
++        .data3 = 0x4476,
++        .data4 = .{ 0xb6, 0x47, 0xc4, 0xfa, 0xe3, 0x49, 0xe4, 0xdb },
++    };
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*ID2D1DeviceContext4, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*ID2D1DeviceContext4) callconv(.winapi) u32,
++        Release: *const fn (*ID2D1DeviceContext4) callconv(.winapi) u32,
++        GetFactory: Reserved, // 3
++        _rt: [76]Reserved, // 4-79
++        SetUnitMode: *const fn (*ID2D1DeviceContext4, D2D1_UNIT_MODE) callconv(.winapi) void, // 80
++        _dc: [30]Reserved, // 81-110
++        DrawColorBitmapGlyphRun: *const fn (
++            *ID2D1DeviceContext4,
++            u32, // DWRITE_GLYPH_IMAGE_FORMATS
++            D2D1_POINT_2F,
++            *const dw.DWRITE_GLYPH_RUN,
++            dw.DWRITE_MEASURING_MODE,
++            D2D1_COLOR_BITMAP_GLYPH_SNAP_OPTION,
++        ) callconv(.winapi) void, // 111
++        DrawSvgGlyphRun: *const fn (
++            *ID2D1DeviceContext4,
++            D2D1_POINT_2F,
++            *const dw.DWRITE_GLYPH_RUN,
++            *ID2D1SolidColorBrush,
++            ?*anyopaque, // ID2D1SvgGlyphStyle
++            u32, // colorPaletteIndex
++            dw.DWRITE_MEASURING_MODE,
++        ) callconv(.winapi) void, // 112
++        _tail: [2]Reserved, // 113-114
++    };
++
++    pub inline fn SetUnitMode(self: *ID2D1DeviceContext4, mode: D2D1_UNIT_MODE) void {
++        self.vtable.SetUnitMode(self, mode);
++    }
++
++    pub inline fn DrawColorBitmapGlyphRun(
++        self: *ID2D1DeviceContext4,
++        format: u32,
++        origin: D2D1_POINT_2F,
++        run: *const dw.DWRITE_GLYPH_RUN,
++        measuring_mode: dw.DWRITE_MEASURING_MODE,
++    ) void {
++        self.vtable.DrawColorBitmapGlyphRun(self, format, origin, run, measuring_mode, .DEFAULT);
++    }
++
++    pub inline fn DrawSvgGlyphRun(
++        self: *ID2D1DeviceContext4,
++        origin: D2D1_POINT_2F,
++        run: *const dw.DWRITE_GLYPH_RUN,
++        brush: *ID2D1SolidColorBrush,
++        measuring_mode: dw.DWRITE_MEASURING_MODE,
++    ) void {
++        self.vtable.DrawSvgGlyphRun(self, origin, run, brush, null, 0, measuring_mode);
++    }
++
++    pub inline fn Release(self: *ID2D1DeviceContext4) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++test "ID2D1DeviceContext4 slot layout" {
++    // A wrong slot here calls a different method with the wrong arguments,
++    // which corrupts state instead of failing to compile.
++    try std.testing.expectEqual(115 * @sizeOf(usize), @sizeOf(ID2D1DeviceContext4.VTable));
++    try std.testing.expectEqual(
++        80 * @sizeOf(usize),
++        @offsetOf(ID2D1DeviceContext4.VTable, "SetUnitMode"),
++    );
++    try std.testing.expectEqual(
++        111 * @sizeOf(usize),
++        @offsetOf(ID2D1DeviceContext4.VTable, "DrawColorBitmapGlyphRun"),
++    );
++    try std.testing.expectEqual(
++        112 * @sizeOf(usize),
++        @offsetOf(ID2D1DeviceContext4.VTable, "DrawSvgGlyphRun"),
++    );
++}
++
+ // COM apartment + object creation, from ole32.
+ pub const CLSCTX_INPROC_SERVER: u32 = 1;
+ pub const COINIT_APARTMENTTHREADED: u32 = 2;
+diff --git a/src/font/library.zig b/src/font/library.zig
+index 49c2e8808..86ebc768e 100644
+--- a/src/font/library.zig
++++ b/src/font/library.zig
+@@ -21,6 +21,10 @@ pub const Library = switch (options.backend) {
+     .coretext_noshape,
+     .web_canvas,
+     => NoopLibrary,
++
++    // DirectWrite needs per-process factories and a registered in-memory
++    // font file loader.
++    .directwrite_harfbuzz => DirectWriteLibrary,
+ };
+ 
+ pub const FreetypeLibrary = struct {
+@@ -62,3 +66,141 @@ pub const NoopLibrary = struct {
+         _ = self;
+     }
+ };
++
++/// Process-wide DirectWrite/Direct2D/WIC state (ADR 0005).
++///
++/// These really are per-process rather than per-face: the DirectWrite factory
++/// is created SHARED so DirectWrite caches font data across every face, and
++/// the in-memory font file loader has to be registered with that factory
++/// exactly once. Creating them per face would defeat DirectWrite's caching and
++/// leak loader registrations.
++pub const DirectWriteLibrary = struct {
++    const dw = @import("face/dwrite/api.zig");
++    const d2d = @import("face/dwrite/d2d.zig");
++
++    /// Base factory: discovery, font faces, glyph run analysis.
++    factory: *dw.IDWriteFactory,
++    /// System font fallback (GetSystemFontFallback), used by discovery.
++    factory2: *dw.IDWriteFactory2,
++    /// Colour glyph translation. Factory4 rather than Factory2 because only
++    /// this version splits runs into CBDT/sbix/SVG formats as well as COLR;
++    /// Factory2 reports NOCOLOR for a bitmap emoji font like Noto Color Emoji.
++    factory4: *dw.IDWriteFactory4,
++    /// Owns the in-memory font file loader.
++    factory5: *dw.IDWriteFactory5,
++    /// Registered with `factory`; turns font bytes into a font file reference.
++    in_memory_loader: *dw.IDWriteInMemoryFontFileLoader,
++
++    /// Rasterization: D2D renders glyph runs into a WIC bitmap we read back.
++    d2d_factory: *d2d.ID2D1Factory,
++    wic_factory: *d2d.IWICImagingFactory,
++
++    alloc: Allocator,
++
++    /// Held whenever a face is created or a glyph rasterized. The DirectWrite
++    /// SHARED factory is documented thread-safe, but the D2D factory is
++    /// created SINGLE_THREADED and the render targets built from it are not,
++    /// so rasterization is serialized.
++    mutex: *std.Io.Mutex,
++
++    pub const InitError = error{
++        DirectWriteUnavailable,
++        Direct2DUnavailable,
++        WICUnavailable,
++    } || Allocator.Error;
++
++    pub fn init(alloc: Allocator) InitError!Library {
++        // WIC is a COM object, so the calling thread needs an apartment. This
++        // is idempotent and safe if the host already initialized COM; a
++        // failure here is not fatal because the host may have chosen a
++        // different apartment model, which is fine for our usage.
++        _ = d2d.CoInitializeEx(null, d2d.COINIT_MULTITHREADED);
++
++        var factory_o: ?*anyopaque = null;
++        if (dw.FAILED(dw.DWriteCreateFactory(
++            .SHARED,
++            &dw.IDWriteFactory.IID,
++            &factory_o,
++        )) or factory_o == null) return error.DirectWriteUnavailable;
++        const factory: *dw.IDWriteFactory = @ptrCast(@alignCast(factory_o.?));
++        errdefer _ = factory.Release();
++
++        var f2_o: ?*anyopaque = null;
++        if (dw.FAILED(factory.QueryInterface(&dw.IDWriteFactory2.IID, &f2_o)) or
++            f2_o == null) return error.DirectWriteUnavailable;
++        const factory2: *dw.IDWriteFactory2 = @ptrCast(@alignCast(f2_o.?));
++        errdefer _ = factory2.Release();
++
++        var f4_o: ?*anyopaque = null;
++        if (dw.FAILED(factory.QueryInterface(&dw.IDWriteFactory4.IID, &f4_o)) or
++            f4_o == null) return error.DirectWriteUnavailable;
++        const factory4: *dw.IDWriteFactory4 = @ptrCast(@alignCast(f4_o.?));
++        errdefer _ = factory4.Release();
++
++        var f5_o: ?*anyopaque = null;
++        if (dw.FAILED(factory.QueryInterface(&dw.IDWriteFactory5.IID, &f5_o)) or
++            f5_o == null) return error.DirectWriteUnavailable;
++        const factory5: *dw.IDWriteFactory5 = @ptrCast(@alignCast(f5_o.?));
++        errdefer _ = factory5.Release();
++
++        var loader: ?*dw.IDWriteInMemoryFontFileLoader = null;
++        if (dw.FAILED(factory5.CreateInMemoryFontFileLoader(&loader)) or
++            loader == null) return error.DirectWriteUnavailable;
++        errdefer _ = loader.?.Release();
++
++        // A loader must be registered before any file reference it produces
++        // can become a font face.
++        if (dw.FAILED(factory.RegisterFontFileLoader(@ptrCast(loader.?)))) {
++            return error.DirectWriteUnavailable;
++        }
++        errdefer _ = factory.UnregisterFontFileLoader(@ptrCast(loader.?));
++
++        var d2d_o: ?*anyopaque = null;
++        if (dw.FAILED(d2d.D2D1CreateFactory(
++            .SINGLE_THREADED,
++            &d2d.ID2D1Factory.IID,
++            null,
++            &d2d_o,
++        )) or d2d_o == null) return error.Direct2DUnavailable;
++        const d2d_factory: *d2d.ID2D1Factory = @ptrCast(@alignCast(d2d_o.?));
++        errdefer _ = d2d_factory.Release();
++
++        var wic_o: ?*anyopaque = null;
++        if (dw.FAILED(d2d.CoCreateInstance(
++            &d2d.CLSID_WICImagingFactory,
++            null,
++            d2d.CLSCTX_INPROC_SERVER,
++            &d2d.IID_IWICImagingFactory,
++            &wic_o,
++        )) or wic_o == null) return error.WICUnavailable;
++        const wic_factory: *d2d.IWICImagingFactory = @ptrCast(@alignCast(wic_o.?));
++        errdefer _ = wic_factory.Release();
++
++        const mutex = try alloc.create(std.Io.Mutex);
++        mutex.* = .init;
++
++        return Library{
++            .factory = factory,
++            .factory2 = factory2,
++            .factory4 = factory4,
++            .factory5 = factory5,
++            .in_memory_loader = loader.?,
++            .d2d_factory = d2d_factory,
++            .wic_factory = wic_factory,
++            .alloc = alloc,
++            .mutex = mutex,
++        };
++    }
++
++    pub fn deinit(self: *Library) void {
++        self.alloc.destroy(self.mutex);
++        _ = self.wic_factory.Release();
++        _ = self.d2d_factory.Release();
++        _ = self.factory.UnregisterFontFileLoader(@ptrCast(self.in_memory_loader));
++        _ = self.in_memory_loader.Release();
++        _ = self.factory5.Release();
++        _ = self.factory4.Release();
++        _ = self.factory2.Release();
++        _ = self.factory.Release();
++    }
++};
+diff --git a/src/font/shape.zig b/src/font/shape.zig
+index bc19c1f23..8fab44d99 100644
+--- a/src/font/shape.zig
++++ b/src/font/shape.zig
+@@ -23,6 +23,7 @@ pub const Shaper = switch (options.backend) {
+     .fontconfig_freetype,
+     .coretext_freetype,
+     .coretext_harfbuzz,
++    .directwrite_harfbuzz,
+     => harfbuzz.Shaper,
+ 
+     // Note that coretext_freetype cannot use the coretext

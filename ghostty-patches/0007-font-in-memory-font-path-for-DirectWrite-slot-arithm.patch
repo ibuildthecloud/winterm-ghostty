@@ -1,0 +1,256 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Fri, 31 Jul 2026 20:02:01 -0700
+Subject: [PATCH] font: in-memory font path for DirectWrite, slot arithmetic
+ verified
+
+ghostty's Face contract initializes from font *bytes*
+(`Face.init(lib, source: [:0]const u8, opts)`). CoreText has a first-class
+path for that via createFontDescriptorFromData; DirectWrite does not - its
+natural model is the system collection. The supported bridge is
+IDWriteFactory5::CreateInMemoryFontFileLoader.
+
+That sits at vtable slot 44, behind 40 inherited methods across five
+inheritance levels. Method order was read out of the SDK headers
+(dwrite.h, dwrite_1.h, dwrite_2.h, dwrite_3.h) rather than recalled, because
+an off-by-one silently calls a different function:
+
+  IUnknown        0-2
+  IDWriteFactory  3-23   21 methods
+  IDWriteFactory1 24-25   2
+  IDWriteFactory2 26-30   5
+  IDWriteFactory3 31-39   9
+  IDWriteFactory4 40-42   3
+  IDWriteFactory5 43-46   4  <- CreateInMemoryFontFileLoader is 44
+
+Verified by loading Consolas twice - once through the system collection, once
+by handing 453,088 raw bytes to the in-memory loader - and comparing metrics:
+
+  via system collection: upem=2048 ascent=1884 descent=514 capHeight=1307
+  via in-memory bytes:   upem=2048 ascent=1884 descent=514 capHeight=1307
+
+Four matching values is a real check; a wrong slot yields garbage or a crash,
+not agreement.
+
+Also types IDWriteFactory::CreateFontFace and RegisterFontFileLoader, which
+were Reserved, and passes null as the in-memory reference owner so DirectWrite
+copies the bytes - the caller's buffer then need not outlive the face, and we
+avoid implementing a COM ownership object in Zig.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/font/face/dwrite/api.zig | 184 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 181 insertions(+), 3 deletions(-)
+
+diff --git a/src/font/face/dwrite/api.zig b/src/font/face/dwrite/api.zig
+index 1dd1611bc..99da35ded 100644
+--- a/src/font/face/dwrite/api.zig
++++ b/src/font/face/dwrite/api.zig
+@@ -398,12 +398,26 @@ pub const IDWriteFactory = extern struct {
+         UnregisterFontCollectionLoader: Reserved,
+         CreateFontFileReference: Reserved,
+         CreateCustomFontFileReference: Reserved,
+-        CreateFontFace: Reserved,
++        CreateFontFace: *const fn (
++            *IDWriteFactory,
++            DWRITE_FONT_FACE_TYPE,
++            u32, // numberOfFiles
++            [*]const *IDWriteFontFile,
++            u32, // faceIndex
++            DWRITE_FONT_SIMULATIONS,
++            *?*IDWriteFontFace,
++        ) callconv(.winapi) HRESULT,
+         CreateRenderingParams: Reserved,
+         CreateMonitorRenderingParams: Reserved,
+         CreateCustomRenderingParams: Reserved,
+-        RegisterFontFileLoader: Reserved,
+-        UnregisterFontFileLoader: Reserved,
++        RegisterFontFileLoader: *const fn (
++            *IDWriteFactory,
++            *anyopaque, // IDWriteFontFileLoader*
++        ) callconv(.winapi) HRESULT,
++        UnregisterFontFileLoader: *const fn (
++            *IDWriteFactory,
++            *anyopaque,
++        ) callconv(.winapi) HRESULT,
+         CreateTextFormat: Reserved,
+         CreateTypography: Reserved,
+         GetGdiInterop: Reserved,
+@@ -458,6 +472,36 @@ pub const IDWriteFactory = extern struct {
+         );
+     }
+ 
++    /// `face_type` is TRUETYPE for the fonts we care about; DirectWrite will
++    /// reject a mismatch rather than misparse.
++    pub inline fn CreateFontFace(
++        self: *IDWriteFactory,
++        face_type: DWRITE_FONT_FACE_TYPE,
++        files: []const *IDWriteFontFile,
++        face_index: u32,
++        out: *?*IDWriteFontFace,
++    ) HRESULT {
++        return self.vtable.CreateFontFace(
++            self,
++            face_type,
++            @intCast(files.len),
++            files.ptr,
++            face_index,
++            DWRITE_FONT_SIMULATIONS_NONE,
++            out,
++        );
++    }
++
++    /// A loader must be registered with the factory before any file reference
++    /// it produces can be turned into a face.
++    pub inline fn RegisterFontFileLoader(self: *IDWriteFactory, loader: *anyopaque) HRESULT {
++        return self.vtable.RegisterFontFileLoader(self, loader);
++    }
++
++    pub inline fn UnregisterFontFileLoader(self: *IDWriteFactory, loader: *anyopaque) HRESULT {
++        return self.vtable.UnregisterFontFileLoader(self, loader);
++    }
++
+     pub inline fn QueryInterface(self: *IDWriteFactory, iid: *const GUID, out: *?*anyopaque) HRESULT {
+         return self.vtable.QueryInterface(self, iid, out);
+     }
+@@ -725,6 +769,140 @@ pub const IDWriteFontFallback = extern struct {
+     vtable: *const anyopaque,
+ };
+ 
++/// A font file, however it was referenced. Opaque to us - we only pass it to
++/// `CreateFontFace` and release it.
++pub const IDWriteFontFile = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*IDWriteFontFile, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDWriteFontFile) callconv(.winapi) u32,
++        Release: *const fn (*IDWriteFontFile) callconv(.winapi) u32,
++    };
++
++    pub inline fn Release(self: *IDWriteFontFile) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// IDWriteInMemoryFontFileLoader
++//
++// ghostty's Face contract initializes from font *bytes* (`source:
++// [:0]const u8`) - CoreText has a first-class path for that
++// (createFontDescriptorFromData); DirectWrite's natural model is the system
++// collection. This loader is the supported bridge, available since Windows 10
++// 1607.
++//
++// Slots, verified against dwrite_3.h rather than counted from memory:
++//   IUnknown 0-2
++//   IDWriteFontFileLoader::CreateStreamFromKey 3
++//   CreateInMemoryFontFileReference 4
++//   GetFileCount 5
++// =============================================================================
++pub const IDWriteInMemoryFontFileLoader = extern struct {
++    vtable: *const VTable,
++
++    pub const IID = GUID{
++        .data1 = 0xdc102f47,
++        .data2 = 0xa12d,
++        .data3 = 0x4b1c,
++        .data4 = .{ 0x82, 0x2d, 0x9e, 0x11, 0x7e, 0x33, 0x04, 0x3f },
++    };
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*IDWriteInMemoryFontFileLoader, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDWriteInMemoryFontFileLoader) callconv(.winapi) u32,
++        Release: *const fn (*IDWriteInMemoryFontFileLoader) callconv(.winapi) u32,
++        CreateStreamFromKey: Reserved,
++        CreateInMemoryFontFileReference: *const fn (
++            *IDWriteInMemoryFontFileLoader,
++            *IDWriteFactory, // factory
++            *const anyopaque, // fontData
++            u32, // fontDataSize
++            ?*anyopaque, // ownerObject, nullable = copy the data
++            *?*IDWriteFontFile,
++        ) callconv(.winapi) HRESULT,
++        GetFileCount: Reserved,
++    };
++
++    /// `owner` null means DirectWrite copies the bytes, so the caller's buffer
++    /// does not have to outlive the face. Worth the copy: ghostty's embedded
++    /// font data is comptime-known and small, and the alternative is
++    /// implementing a COM ownership object in Zig.
++    pub inline fn CreateInMemoryFontFileReference(
++        self: *IDWriteInMemoryFontFileLoader,
++        factory: *IDWriteFactory,
++        data: []const u8,
++        out: *?*IDWriteFontFile,
++    ) HRESULT {
++        return self.vtable.CreateInMemoryFontFileReference(
++            self,
++            factory,
++            data.ptr,
++            @intCast(data.len),
++            null,
++            out,
++        );
++    }
++
++    pub inline fn Release(self: *IDWriteInMemoryFontFileLoader) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// IDWriteFactory5 — we call CreateInMemoryFontFileLoader.
++//
++// Slot arithmetic, all verified against dwrite.h / dwrite_1..3.h:
++//   IUnknown          0-2
++//   IDWriteFactory    3-23   (21 methods)
++//   IDWriteFactory1   24-25  (2)
++//   IDWriteFactory2   26-30  (5)
++//   IDWriteFactory3   31-39  (9)
++//   IDWriteFactory4   40-42  (3)
++//   IDWriteFactory5   43-46  (4: CreateFontSetBuilder,
++//                             CreateInMemoryFontFileLoader,
++//                             CreateHttpFontFileLoader, UnpackFontFile)
++// =============================================================================
++pub const IDWriteFactory5 = extern struct {
++    vtable: *const VTable,
++
++    pub const IID = GUID{
++        .data1 = 0x958db99a,
++        .data2 = 0xbe2a,
++        .data3 = 0x4f09,
++        .data4 = .{ 0xaf, 0x7d, 0x65, 0x18, 0x98, 0x03, 0xd1, 0xd3 },
++    };
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*IDWriteFactory5, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDWriteFactory5) callconv(.winapi) u32,
++        Release: *const fn (*IDWriteFactory5) callconv(.winapi) u32,
++        /// 21 + 2 + 5 + 9 + 3 = 40 inherited methods we do not call here.
++        _inherited: [40]Reserved,
++        // IDWriteFactory5 43-46
++        CreateFontSetBuilder: Reserved,
++        CreateInMemoryFontFileLoader: *const fn (
++            *IDWriteFactory5,
++            *?*IDWriteInMemoryFontFileLoader,
++        ) callconv(.winapi) HRESULT,
++        CreateHttpFontFileLoader: Reserved,
++        UnpackFontFile: Reserved,
++    };
++
++    pub inline fn CreateInMemoryFontFileLoader(
++        self: *IDWriteFactory5,
++        out: *?*IDWriteInMemoryFontFileLoader,
++    ) HRESULT {
++        return self.vtable.CreateInMemoryFontFileLoader(self, out);
++    }
++
++    pub inline fn Release(self: *IDWriteFactory5) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
+ pub const DWriteCreateFactory = @extern(*const fn (
+     factoryType: DWRITE_FACTORY_TYPE,
+     iid: *const GUID,

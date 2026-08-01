@@ -112,11 +112,24 @@ combination — platform-native discovery and rasterization, HarfBuzz shaping:
 
 - **Discovery**: DirectWrite with `IDWriteFontFallback::MapCharacters` (the locale-aware
   system fallback chain) plus a negative cache for unfallbackable codepoints.
-- **Rasterization**: Direct2D drawing into the glyph atlas via
-  `CreateDxgiSurfaceRenderTarget`, so glyphs land in the D3D11 atlas texture with no CPU
-  round-trip (AtlasEngine's `BackendD3D` is the reference). **Grayscale AA only** —
-  ClearType subpixel is wrong over a premultiplied-alpha composition surface, which is
-  AtlasEngine's own conclusion.
+- **Rasterization**: into ghostty's existing CPU-side `font.Atlas`, **not** D2D-direct into
+  the GPU texture. **Grayscale AA only** — ClearType subpixel is wrong over a
+  premultiplied-alpha composition surface, which is AtlasEngine's own conclusion.
+  - monochrome glyphs: `IDWriteGlyphRunAnalysis::CreateAlphaTexture`, which writes
+    coverage straight to CPU memory — no D2D involved.
+  - colour glyphs: D2D over a WIC bitmap, read back (AtlasEngine ships `wic.cpp` for the
+    same reason).
+
+  > **Corrects ADR 0005.** That ADR's Consequences claim the atlas becomes a D2D-rendered
+  > DXGI surface via `CreateDxgiSurfaceRenderTarget`, obsoleting
+  > `Texture.replaceRegion`/`UpdateSubresource`. That is wrong: `font.Atlas` is CPU-side
+  > (`data: []u8`), owns rect packing, and is what `CodepointResolver`/`SharedGrid` build
+  > on — AtlasEngine can draw GPU-direct only because it owns its whole atlas and ships its
+  > own rect packer. Since rasterization is cached per *unique glyph* rather than per
+  > frame, the CPU round-trip costs almost nothing, and keeping `font.Atlas` leaves
+  > ghostty's font/renderer contract untouched, which makes the patch more upstreamable.
+  > `Texture.replaceRegion` therefore stays. The ADR is accepted and immutable, so the
+  > correction lives here; see `docs/sessions/0004-phase-3.md`.
 - **Colour glyphs**: `IDWriteFactory4::TranslateColorGlyphRun`, dispatching per
   `glyphImageFormat` to `DrawColorBitmapGlyphRun` / `DrawSvgGlyphRun` / `DrawGlyphRun`;
   `paletteIndex == 0xffff` means use the foreground brush. Gets COLR v0/v1, SVG, PNG, sbix

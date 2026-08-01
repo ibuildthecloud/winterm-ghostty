@@ -1,0 +1,1272 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Fri, 31 Jul 2026 19:54:50 -0700
+Subject: [PATCH] font: DirectWrite/D2D bindings, validated against the live
+ system
+
+Foundation for the directwrite_harfbuzz backend (ADR 0005). Not yet referenced
+by the build - Zig does not compile unreachable files, so this cannot break
+anything; the Face commit that follows makes them reachable and is where
+zig build test starts covering them.
+
+Every interface here was validated empirically by spikes before being
+committed, because a COM vtable slot declared at the wrong offset silently
+calls the wrong function rather than failing to compile:
+
+  DirectWrite    194 font families enumerated; Consolas upem=2048 ascent=1884;
+                 glyph('A')=0x4; Consolas has no U+1F600 (notdef) while Segoe
+                 UI Emoji maps it to 0x8DA; COLR table reported as 7133988
+                 bytes version 1 - matching an independent binary parse of the
+                 font file exactly
+  D2D + WIC      rasterized 'A' at 32px into a WIC bitmap and read it back:
+                 22x42 cell, stride 88, recognisable glyph with grayscale AA
+  Colour glyphs  U+1F600 through TranslateColorGlyphRun: 6 layers, 55 distinct
+                 opaque colours
+
+Two design notes, both driven by reading what AtlasEngine actually ships.
+
+Rasterization goes through D2D rather than IDWriteGlyphRunAnalysis. AtlasEngine
+has both and its GlyphRunAnalysis path is behind #if 0, with the note that
+Direct2D is "roughly 2x faster". More importantly TranslateColorGlyphRun
+returning DWRITE_E_NOCOLOR *is* the "this glyph is monochrome" test, so one
+rasterizer covers both cases instead of two plus a rule for choosing.
+
+TranslateColorGlyphRun is taken from IDWriteFactory2, not Factory4. Factory4
+additionally handles SVG/PNG/bitmap glyph formats but sits ~43 vtable slots
+deep through two more inheritance levels, each hand-counted offset failing
+silently if wrong. Factory2 handles COLR, which is what Segoe UI Emoji uses
+and exactly what AtlasEngine renders - it requests COLR on an IDWriteFactory4
+and never asks for paint trees. Factory4 is a later upgrade for rarer formats.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/font/face/dwrite/api.zig | 757 +++++++++++++++++++++++++++++++++++
+ src/font/face/dwrite/d2d.zig | 455 +++++++++++++++++++++
+ 2 files changed, 1212 insertions(+)
+ create mode 100644 src/font/face/dwrite/api.zig
+ create mode 100644 src/font/face/dwrite/d2d.zig
+
+diff --git a/src/font/face/dwrite/api.zig b/src/font/face/dwrite/api.zig
+new file mode 100644
+index 000000000..1dd1611bc
+--- /dev/null
++++ b/src/font/face/dwrite/api.zig
+@@ -0,0 +1,757 @@
++//! DirectWrite COM bindings.
++//!
++//! Deliberately self-contained rather than sharing the renderer's
++//! `directx11/com.zig`: the font backend is its own upstream patch
++//! (`dwrite-discovery` in ADR 0004's series) and should not depend on the
++//! renderer patch landing first. The IUnknown boilerplate duplicated here is
++//! ~40 lines and buys that independence.
++//!
++//! Vtable layouts are ABI. A method declared in the wrong slot silently calls
++//! the wrong function rather than failing to compile, so the slot comments are
++//! load-bearing - keep them accurate and never insert into the middle.
++
++const std = @import("std");
++
++pub const HRESULT = i32;
++
++pub const GUID = extern struct {
++    data1: u32,
++    data2: u16,
++    data3: u16,
++    data4: [8]u8,
++};
++
++pub inline fn SUCCEEDED(hr: HRESULT) bool {
++    return hr >= 0;
++}
++pub inline fn FAILED(hr: HRESULT) bool {
++    return hr < 0;
++}
++
++pub const S_OK: HRESULT = 0;
++pub const E_NOINTERFACE: HRESULT = @bitCast(@as(u32, 0x80004002));
++
++/// Placeholder for vtable slots we do not call. Present so that the slots we
++/// do call land at the right offsets.
++pub const Reserved = *const fn () callconv(.winapi) void;
++
++pub const IUnknown = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*IUnknown, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IUnknown) callconv(.winapi) u32,
++        Release: *const fn (*IUnknown) callconv(.winapi) u32,
++    };
++
++    pub inline fn Release(self: *IUnknown) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// Enums and structs
++// =============================================================================
++
++pub const DWRITE_FACTORY_TYPE = enum(u32) {
++    SHARED = 0,
++    ISOLATED = 1,
++};
++
++pub const DWRITE_FONT_WEIGHT = enum(u32) {
++    THIN = 100,
++    NORMAL = 400,
++    BOLD = 700,
++    _,
++};
++
++pub const DWRITE_FONT_STYLE = enum(u32) {
++    NORMAL = 0,
++    OBLIQUE = 1,
++    ITALIC = 2,
++};
++
++pub const DWRITE_FONT_STRETCH = enum(u32) {
++    UNDEFINED = 0,
++    NORMAL = 5,
++    _,
++};
++
++pub const DWRITE_FONT_SIMULATIONS = u32;
++pub const DWRITE_FONT_SIMULATIONS_NONE: DWRITE_FONT_SIMULATIONS = 0;
++pub const DWRITE_FONT_SIMULATIONS_BOLD: DWRITE_FONT_SIMULATIONS = 1;
++pub const DWRITE_FONT_SIMULATIONS_OBLIQUE: DWRITE_FONT_SIMULATIONS = 2;
++
++pub const DWRITE_FONT_FACE_TYPE = enum(u32) {
++    CFF = 0,
++    TRUETYPE = 1,
++    OPENTYPE_COLLECTION = 2,
++    _,
++};
++
++pub const DWRITE_MEASURING_MODE = enum(u32) {
++    NATURAL = 0,
++    GDI_CLASSIC = 1,
++    GDI_NATURAL = 2,
++};
++
++/// Design-space metrics, in font design units. Divide by `designUnitsPerEm`.
++pub const DWRITE_FONT_METRICS = extern struct {
++    designUnitsPerEm: u16,
++    ascent: u16,
++    descent: u16,
++    lineGap: i16,
++    capHeight: u16,
++    xHeight: u16,
++    underlinePosition: i16,
++    underlineThickness: u16,
++    strikethroughPosition: i16,
++    strikethroughThickness: u16,
++};
++
++pub const DWRITE_GLYPH_METRICS = extern struct {
++    leftSideBearing: i32,
++    advanceWidth: u32,
++    rightSideBearing: i32,
++    topSideBearing: i32,
++    advanceHeight: u32,
++    bottomSideBearing: i32,
++    verticalOriginY: i32,
++};
++
++/// A run of glyphs from a single face, as handed to D2D for drawing.
++pub const DWRITE_GLYPH_RUN = extern struct {
++    fontFace: *IDWriteFontFace,
++    fontEmSize: f32,
++    glyphCount: u32,
++    glyphIndices: [*]const u16,
++    glyphAdvances: ?[*]const f32,
++    glyphOffsets: ?[*]const DWRITE_GLYPH_OFFSET,
++    isSideways: i32, // BOOL
++    bidiLevel: u32,
++};
++
++pub const DWRITE_GLYPH_OFFSET = extern struct {
++    advanceOffset: f32,
++    ascenderOffset: f32,
++};
++
++// =============================================================================
++// IDWriteFontFace — count matters; we call GetMetrics(6), GetDesignGlyphMetrics(7),
++// GetGlyphIndices(8), TryGetFontTable(9), ReleaseFontTable(10)
++// =============================================================================
++pub const IDWriteFontFace = extern struct {
++    vtable: *const VTable,
++
++    pub const IID = GUID{
++        .data1 = 0x5f49804d,
++        .data2 = 0x7024,
++        .data3 = 0x4d43,
++        .data4 = .{ 0xbf, 0xa9, 0xd2, 0x59, 0x84, 0xf5, 0x38, 0x49 },
++    };
++
++    pub const VTable = extern struct {
++        // IUnknown (0-2)
++        QueryInterface: *const fn (*IDWriteFontFace, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDWriteFontFace) callconv(.winapi) u32,
++        Release: *const fn (*IDWriteFontFace) callconv(.winapi) u32,
++        // IDWriteFontFace (3-)
++        GetType: Reserved,
++        GetFiles: Reserved,
++        GetIndex: Reserved,
++        GetSimulations: Reserved,
++        IsSymbolFont: Reserved,
++        GetMetrics: *const fn (*IDWriteFontFace, *DWRITE_FONT_METRICS) callconv(.winapi) void,
++        GetGlyphCount: Reserved,
++        GetDesignGlyphMetrics: *const fn (
++            *IDWriteFontFace,
++            [*]const u16, // glyphIndices
++            u32, // glyphCount
++            [*]DWRITE_GLYPH_METRICS,
++            i32, // isSideways (BOOL)
++        ) callconv(.winapi) HRESULT,
++        GetGlyphIndices: *const fn (
++            *IDWriteFontFace,
++            [*]const u32, // codePoints
++            u32, // codePointCount
++            [*]u16, // glyphIndices out
++        ) callconv(.winapi) HRESULT,
++        TryGetFontTable: *const fn (
++            *IDWriteFontFace,
++            u32, // openTypeTableTag
++            *?*const anyopaque, // tableData
++            *u32, // tableSize
++            *?*anyopaque, // tableContext
++            *i32, // exists (BOOL)
++        ) callconv(.winapi) HRESULT,
++        ReleaseFontTable: *const fn (*IDWriteFontFace, ?*anyopaque) callconv(.winapi) void,
++    };
++
++    pub inline fn GetMetrics(self: *IDWriteFontFace) DWRITE_FONT_METRICS {
++        var m: DWRITE_FONT_METRICS = undefined;
++        self.vtable.GetMetrics(self, &m);
++        return m;
++    }
++
++    pub inline fn GetDesignGlyphMetrics(
++        self: *IDWriteFontFace,
++        indices: []const u16,
++        out: []DWRITE_GLYPH_METRICS,
++    ) HRESULT {
++        return self.vtable.GetDesignGlyphMetrics(
++            self,
++            indices.ptr,
++            @intCast(indices.len),
++            out.ptr,
++            0,
++        );
++    }
++
++    pub inline fn GetGlyphIndices(
++        self: *IDWriteFontFace,
++        codepoints: []const u32,
++        out: []u16,
++    ) HRESULT {
++        return self.vtable.GetGlyphIndices(
++            self,
++            codepoints.ptr,
++            @intCast(codepoints.len),
++            out.ptr,
++        );
++    }
++
++    pub inline fn TryGetFontTable(
++        self: *IDWriteFontFace,
++        table_tag: u32,
++        data: *?*const anyopaque,
++        size: *u32,
++        context: *?*anyopaque,
++        exists: *i32,
++    ) HRESULT {
++        return self.vtable.TryGetFontTable(self, table_tag, data, size, context, exists);
++    }
++
++    pub inline fn ReleaseFontTable(self: *IDWriteFontFace, context: ?*anyopaque) void {
++        self.vtable.ReleaseFontTable(self, context);
++    }
++
++    pub inline fn Release(self: *IDWriteFontFace) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++/// OpenType table tags are little-endian four-character codes.
++pub inline fn tag(comptime s: *const [4]u8) u32 {
++    return @as(u32, s[0]) |
++        (@as(u32, s[1]) << 8) |
++        (@as(u32, s[2]) << 16) |
++        (@as(u32, s[3]) << 24);
++}
++
++// =============================================================================
++// IDWriteFont — we call CreateFontFace(13), GetSimulations(6)
++// =============================================================================
++pub const IDWriteFont = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*IDWriteFont, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDWriteFont) callconv(.winapi) u32,
++        Release: *const fn (*IDWriteFont) callconv(.winapi) u32,
++        // IDWriteFont (3-)
++        GetFontFamily: Reserved,
++        GetWeight: Reserved,
++        GetStretch: Reserved,
++        GetStyle: Reserved,
++        IsSymbolFont: Reserved,
++        GetFaceNames: Reserved,
++        GetInformationalStrings: Reserved,
++        GetSimulations: Reserved,
++        GetMetrics: Reserved,
++        HasCharacter: *const fn (*IDWriteFont, u32, *i32) callconv(.winapi) HRESULT,
++        CreateFontFace: *const fn (*IDWriteFont, *?*IDWriteFontFace) callconv(.winapi) HRESULT,
++    };
++
++    pub inline fn CreateFontFace(self: *IDWriteFont, out: *?*IDWriteFontFace) HRESULT {
++        return self.vtable.CreateFontFace(self, out);
++    }
++
++    pub inline fn HasCharacter(self: *IDWriteFont, cp: u32, exists: *i32) HRESULT {
++        return self.vtable.HasCharacter(self, cp, exists);
++    }
++
++    pub inline fn Release(self: *IDWriteFont) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// IDWriteFontFamily — we call GetFirstMatchingFont(6)
++// =============================================================================
++pub const IDWriteFontFamily = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*IDWriteFontFamily, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDWriteFontFamily) callconv(.winapi) u32,
++        Release: *const fn (*IDWriteFontFamily) callconv(.winapi) u32,
++        // IDWriteFontList (3-5)
++        GetFontCollection: Reserved,
++        GetFontCount: Reserved,
++        GetFont: Reserved,
++        // IDWriteFontFamily (6-)
++        GetFamilyNames: Reserved,
++        GetFirstMatchingFont: *const fn (
++            *IDWriteFontFamily,
++            DWRITE_FONT_WEIGHT,
++            DWRITE_FONT_STRETCH,
++            DWRITE_FONT_STYLE,
++            *?*IDWriteFont,
++        ) callconv(.winapi) HRESULT,
++        GetMatchingFonts: Reserved,
++    };
++
++    pub inline fn GetFirstMatchingFont(
++        self: *IDWriteFontFamily,
++        weight: DWRITE_FONT_WEIGHT,
++        stretch: DWRITE_FONT_STRETCH,
++        style: DWRITE_FONT_STYLE,
++        out: *?*IDWriteFont,
++    ) HRESULT {
++        return self.vtable.GetFirstMatchingFont(self, weight, stretch, style, out);
++    }
++
++    pub inline fn Release(self: *IDWriteFontFamily) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// IDWriteFontCollection — we call FindFamilyName(4), GetFontFamily(3)
++// =============================================================================
++pub const IDWriteFontCollection = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*IDWriteFontCollection, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDWriteFontCollection) callconv(.winapi) u32,
++        Release: *const fn (*IDWriteFontCollection) callconv(.winapi) u32,
++        // IDWriteFontCollection (3-)
++        GetFontFamilyCount: *const fn (*IDWriteFontCollection) callconv(.winapi) u32,
++        GetFontFamily: *const fn (*IDWriteFontCollection, u32, *?*IDWriteFontFamily) callconv(.winapi) HRESULT,
++        FindFamilyName: *const fn (
++            *IDWriteFontCollection,
++            [*:0]const u16,
++            *u32, // index
++            *i32, // exists (BOOL)
++        ) callconv(.winapi) HRESULT,
++        GetFontFromFontFace: Reserved,
++    };
++
++    pub inline fn GetFontFamilyCount(self: *IDWriteFontCollection) u32 {
++        return self.vtable.GetFontFamilyCount(self);
++    }
++
++    pub inline fn GetFontFamily(self: *IDWriteFontCollection, index: u32, out: *?*IDWriteFontFamily) HRESULT {
++        return self.vtable.GetFontFamily(self, index, out);
++    }
++
++    pub inline fn FindFamilyName(
++        self: *IDWriteFontCollection,
++        name: [*:0]const u16,
++        index: *u32,
++        exists: *i32,
++    ) HRESULT {
++        return self.vtable.FindFamilyName(self, name, index, exists);
++    }
++
++    pub inline fn Release(self: *IDWriteFontCollection) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// IDWriteFactory — we call GetSystemFontCollection(3)
++// =============================================================================
++pub const IDWriteFactory = extern struct {
++    vtable: *const VTable,
++
++    pub const IID = GUID{
++        .data1 = 0xb859ee5a,
++        .data2 = 0xd838,
++        .data3 = 0x4b5b,
++        .data4 = .{ 0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48 },
++    };
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*IDWriteFactory, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDWriteFactory) callconv(.winapi) u32,
++        Release: *const fn (*IDWriteFactory) callconv(.winapi) u32,
++        // IDWriteFactory (3-)
++        GetSystemFontCollection: *const fn (
++            *IDWriteFactory,
++            *?*IDWriteFontCollection,
++            i32, // checkForUpdates (BOOL)
++        ) callconv(.winapi) HRESULT,
++        CreateCustomFontCollection: Reserved,
++        RegisterFontCollectionLoader: Reserved,
++        UnregisterFontCollectionLoader: Reserved,
++        CreateFontFileReference: Reserved,
++        CreateCustomFontFileReference: Reserved,
++        CreateFontFace: Reserved,
++        CreateRenderingParams: Reserved,
++        CreateMonitorRenderingParams: Reserved,
++        CreateCustomRenderingParams: Reserved,
++        RegisterFontFileLoader: Reserved,
++        UnregisterFontFileLoader: Reserved,
++        CreateTextFormat: Reserved,
++        CreateTypography: Reserved,
++        GetGdiInterop: Reserved,
++        CreateTextLayout: Reserved,
++        CreateGdiCompatibleTextLayout: Reserved,
++        CreateEllipsisTrimmingSign: Reserved,
++        CreateTextAnalyzer: Reserved,
++        CreateNumberSubstitution: Reserved,
++        CreateGlyphRunAnalysis: *const fn (
++            *IDWriteFactory,
++            *const DWRITE_GLYPH_RUN,
++            f32, // pixelsPerDip
++            ?*const DWRITE_MATRIX,
++            DWRITE_RENDERING_MODE,
++            DWRITE_MEASURING_MODE,
++            f32, // baselineOriginX
++            f32, // baselineOriginY
++            *?*IDWriteGlyphRunAnalysis,
++        ) callconv(.winapi) HRESULT,
++    };
++
++    pub inline fn GetSystemFontCollection(
++        self: *IDWriteFactory,
++        out: *?*IDWriteFontCollection,
++        check_for_updates: bool,
++    ) HRESULT {
++        return self.vtable.GetSystemFontCollection(self, out, @intFromBool(check_for_updates));
++    }
++
++    /// Rasterize a glyph run to a coverage texture.
++    ///
++    /// `pixels_per_dip` is 1.0 because we work in device pixels throughout;
++    /// the point size is already baked into `DWRITE_GLYPH_RUN.fontEmSize`.
++    pub inline fn CreateGlyphRunAnalysis(
++        self: *IDWriteFactory,
++        run: *const DWRITE_GLYPH_RUN,
++        mode: DWRITE_RENDERING_MODE,
++        baseline_x: f32,
++        baseline_y: f32,
++        out: *?*IDWriteGlyphRunAnalysis,
++    ) HRESULT {
++        return self.vtable.CreateGlyphRunAnalysis(
++            self,
++            run,
++            1.0,
++            null,
++            mode,
++            .NATURAL,
++            baseline_x,
++            baseline_y,
++            out,
++        );
++    }
++
++    pub inline fn QueryInterface(self: *IDWriteFactory, iid: *const GUID, out: *?*anyopaque) HRESULT {
++        return self.vtable.QueryInterface(self, iid, out);
++    }
++
++    pub inline fn Release(self: *IDWriteFactory) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++pub const DWRITE_RENDERING_MODE = enum(u32) {
++    DEFAULT = 0,
++    ALIASED = 1,
++    GDI_CLASSIC = 2,
++    GDI_NATURAL = 3,
++    NATURAL = 4,
++    NATURAL_SYMMETRIC = 5,
++    OUTLINE = 6,
++    _,
++};
++
++pub const DWRITE_TEXTURE_TYPE = enum(u32) {
++    /// 1 byte per pixel: exactly what a grayscale glyph atlas wants.
++    ALIASED_1x1 = 0,
++    /// 3 bytes per pixel (subpixel). Unused - ClearType is wrong over a
++    /// premultiplied composition surface.
++    CLEARTYPE_3x1 = 1,
++};
++
++pub const RECT = extern struct {
++    left: i32,
++    top: i32,
++    right: i32,
++    bottom: i32,
++};
++
++pub const DWRITE_MATRIX = extern struct {
++    m11: f32,
++    m12: f32,
++    m21: f32,
++    m22: f32,
++    dx: f32,
++    dy: f32,
++};
++
++// =============================================================================
++// IDWriteGlyphRunAnalysis — the monochrome rasterization path.
++// We call GetAlphaTextureBounds(3) and CreateAlphaTexture(4).
++//
++// This produces coverage directly into caller memory, which is what ghostty's
++// CPU-side font.Atlas wants. No D2D, no GPU surface, no readback.
++// =============================================================================
++pub const IDWriteGlyphRunAnalysis = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*IDWriteGlyphRunAnalysis, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDWriteGlyphRunAnalysis) callconv(.winapi) u32,
++        Release: *const fn (*IDWriteGlyphRunAnalysis) callconv(.winapi) u32,
++        // IDWriteGlyphRunAnalysis (3-)
++        GetAlphaTextureBounds: *const fn (
++            *IDWriteGlyphRunAnalysis,
++            DWRITE_TEXTURE_TYPE,
++            *RECT,
++        ) callconv(.winapi) HRESULT,
++        CreateAlphaTexture: *const fn (
++            *IDWriteGlyphRunAnalysis,
++            DWRITE_TEXTURE_TYPE,
++            *const RECT,
++            [*]u8, // alphaValues
++            u32, // bufferSize
++        ) callconv(.winapi) HRESULT,
++        GetAlphaBlendParams: Reserved,
++    };
++
++    pub inline fn GetAlphaTextureBounds(
++        self: *IDWriteGlyphRunAnalysis,
++        texture_type: DWRITE_TEXTURE_TYPE,
++        out: *RECT,
++    ) HRESULT {
++        return self.vtable.GetAlphaTextureBounds(self, texture_type, out);
++    }
++
++    pub inline fn CreateAlphaTexture(
++        self: *IDWriteGlyphRunAnalysis,
++        texture_type: DWRITE_TEXTURE_TYPE,
++        bounds: *const RECT,
++        buf: []u8,
++    ) HRESULT {
++        return self.vtable.CreateAlphaTexture(
++            self,
++            texture_type,
++            bounds,
++            buf.ptr,
++            @intCast(buf.len),
++        );
++    }
++
++    pub inline fn Release(self: *IDWriteGlyphRunAnalysis) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++/// Returned by TranslateColorGlyphRun when the glyph has no colour layers.
++/// Not an error - it is the "this glyph is monochrome" answer, and it is how we
++/// decide which rasterization path a glyph takes.
++pub const DWRITE_E_NOCOLOR: HRESULT = @bitCast(@as(u32, 0x88985003));
++
++pub const DWRITE_COLOR_F = extern struct { r: f32, g: f32, b: f32, a: f32 };
++
++/// One colour layer of a glyph, as produced by TranslateColorGlyphRun.
++/// `paletteIndex == 0xFFFF` means "no palette entry, draw with the caller's
++/// foreground colour" - AtlasEngine's rule, and it is load-bearing for glyphs
++/// that mix coloured and text-coloured layers.
++pub const DWRITE_COLOR_GLYPH_RUN = extern struct {
++    glyphRun: DWRITE_GLYPH_RUN,
++    glyphRunDescription: ?*anyopaque,
++    baselineOriginX: f32,
++    baselineOriginY: f32,
++    runColor: DWRITE_COLOR_F,
++    paletteIndex: u16,
++};
++
++pub const DWRITE_NO_PALETTE_INDEX: u16 = 0xFFFF;
++
++// =============================================================================
++// IDWriteColorGlyphRunEnumerator — MoveNext(3), GetCurrentRun(4)
++// =============================================================================
++pub const IDWriteColorGlyphRunEnumerator = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*IDWriteColorGlyphRunEnumerator, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDWriteColorGlyphRunEnumerator) callconv(.winapi) u32,
++        Release: *const fn (*IDWriteColorGlyphRunEnumerator) callconv(.winapi) u32,
++        MoveNext: *const fn (*IDWriteColorGlyphRunEnumerator, *i32) callconv(.winapi) HRESULT,
++        GetCurrentRun: *const fn (*IDWriteColorGlyphRunEnumerator, *?*const DWRITE_COLOR_GLYPH_RUN) callconv(.winapi) HRESULT,
++    };
++
++    pub inline fn MoveNext(self: *IDWriteColorGlyphRunEnumerator, has_run: *i32) HRESULT {
++        return self.vtable.MoveNext(self, has_run);
++    }
++
++    pub inline fn GetCurrentRun(
++        self: *IDWriteColorGlyphRunEnumerator,
++        out: *?*const DWRITE_COLOR_GLYPH_RUN,
++    ) HRESULT {
++        return self.vtable.GetCurrentRun(self, out);
++    }
++
++    pub inline fn Release(self: *IDWriteColorGlyphRunEnumerator) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// IDWriteFactory2 — inherits IDWriteFactory (24 slots) + IDWriteFactory1 (2).
++// Its own methods start at 26:
++//   26 GetSystemFontFallback
++//   27 CreateFontFallbackBuilder
++//   28 TranslateColorGlyphRun
++//   29 CreateCustomRenderingParams
++//   30 CreateGlyphRunAnalysis
++//
++// Deliberately Factory2 rather than Factory4. Factory4's TranslateColorGlyphRun
++// additionally handles SVG/PNG/bitmap glyph formats, but sits ~43 slots deep
++// through two more inheritance levels - a lot of hand-counted offsets, each of
++// which fails silently. Factory2 handles COLR, which is what Segoe UI Emoji
++// uses and exactly what AtlasEngine renders. Factory4 is a later upgrade for
++// the rarer formats.
++// =============================================================================
++pub const IDWriteFactory2 = extern struct {
++    vtable: *const VTable,
++
++    pub const IID = GUID{
++        .data1 = 0x0439fc60,
++        .data2 = 0xca44,
++        .data3 = 0x4994,
++        .data4 = .{ 0x8d, 0xee, 0x3a, 0x9a, 0xf7, 0xb7, 0x32, 0xec },
++    };
++
++    pub const VTable = extern struct {
++        // IUnknown 0-2
++        QueryInterface: *const fn (*IDWriteFactory2, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDWriteFactory2) callconv(.winapi) u32,
++        Release: *const fn (*IDWriteFactory2) callconv(.winapi) u32,
++        // IDWriteFactory 3-23 (21 methods)
++        _f0: Reserved,
++        _f1: Reserved,
++        _f2: Reserved,
++        _f3: Reserved,
++        _f4: Reserved,
++        _f5: Reserved,
++        _f6: Reserved,
++        _f7: Reserved,
++        _f8: Reserved,
++        _f9: Reserved,
++        _f10: Reserved,
++        _f11: Reserved,
++        _f12: Reserved,
++        _f13: Reserved,
++        _f14: Reserved,
++        _f15: Reserved,
++        _f16: Reserved,
++        _f17: Reserved,
++        _f18: Reserved,
++        _f19: Reserved,
++        _f20: Reserved,
++        // IDWriteFactory1 24-25 (2 methods)
++        _f1_0: Reserved,
++        _f1_1: Reserved,
++        // IDWriteFactory2 26-30
++        GetSystemFontFallback: *const fn (*IDWriteFactory2, *?*IDWriteFontFallback) callconv(.winapi) HRESULT,
++        CreateFontFallbackBuilder: Reserved,
++        TranslateColorGlyphRun: *const fn (
++            *IDWriteFactory2,
++            f32, // baselineOriginX
++            f32, // baselineOriginY
++            *const DWRITE_GLYPH_RUN,
++            ?*const anyopaque, // glyphRunDescription
++            DWRITE_MEASURING_MODE,
++            ?*const DWRITE_MATRIX,
++            u32, // colorPaletteIndex
++            *?*IDWriteColorGlyphRunEnumerator,
++        ) callconv(.winapi) HRESULT,
++        CreateCustomRenderingParams: Reserved,
++        CreateGlyphRunAnalysis: Reserved,
++    };
++
++    /// Returns null when the glyph has no colour layers (DWRITE_E_NOCOLOR).
++    /// That is the monochrome answer, not a failure.
++    pub inline fn TranslateColorGlyphRun(
++        self: *IDWriteFactory2,
++        baseline_x: f32,
++        baseline_y: f32,
++        run: *const DWRITE_GLYPH_RUN,
++        out: *?*IDWriteColorGlyphRunEnumerator,
++    ) HRESULT {
++        return self.vtable.TranslateColorGlyphRun(
++            self,
++            baseline_x,
++            baseline_y,
++            run,
++            null,
++            .NATURAL,
++            null,
++            0,
++            out,
++        );
++    }
++
++    pub inline fn GetSystemFontFallback(
++        self: *IDWriteFactory2,
++        out: *?*IDWriteFontFallback,
++    ) HRESULT {
++        return self.vtable.GetSystemFontFallback(self, out);
++    }
++
++    pub inline fn Release(self: *IDWriteFactory2) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++/// Opaque for now; `MapCharacters` is wired when discovery fallback lands.
++pub const IDWriteFontFallback = extern struct {
++    vtable: *const anyopaque,
++};
++
++pub const DWriteCreateFactory = @extern(*const fn (
++    factoryType: DWRITE_FACTORY_TYPE,
++    iid: *const GUID,
++    factory: *?*anyopaque,
++) callconv(.winapi) HRESULT, .{
++    .library_name = "dwrite",
++    .name = "DWriteCreateFactory",
++});
++
++test "vtable slot counts" {
++    // Vtable layout is ABI-critical; a wrong size means a wrong slot offset,
++    // which silently calls the wrong function rather than failing to compile.
++    // IUnknown contributes 3 slots to each.
++    try std.testing.expectEqual(
++        (3 + 21) * @sizeOf(usize), // IDWriteFactory has 21 own methods
++        @sizeOf(IDWriteFactory.VTable),
++    );
++    try std.testing.expectEqual(
++        (3 + 11) * @sizeOf(usize), // IDWriteFontFace has 11 own methods
++        @sizeOf(IDWriteFontFace.VTable),
++    );
++    try std.testing.expectEqual(
++        (3 + 5) * @sizeOf(usize), // IDWriteFactory1 adds 2, IDWriteFactory2 adds 5
++        @sizeOf(IDWriteFactory2.VTable) - (3 + 21 + 2) * @sizeOf(usize),
++    );
++    try std.testing.expectEqual(
++        (3 + 2) * @sizeOf(usize), // MoveNext, GetCurrentRun
++        @sizeOf(IDWriteColorGlyphRunEnumerator.VTable),
++    );
++}
+diff --git a/src/font/face/dwrite/d2d.zig b/src/font/face/dwrite/d2d.zig
+new file mode 100644
+index 000000000..dff858258
+--- /dev/null
++++ b/src/font/face/dwrite/d2d.zig
+@@ -0,0 +1,455 @@
++//! Direct2D and WIC bindings, enough to rasterize a glyph run into CPU memory.
++//!
++//! Why D2D rather than `IDWriteGlyphRunAnalysis`: AtlasEngine has both, and the
++//! GlyphRunAnalysis version is behind `#if 0` with the note that Direct2D is
++//! "roughly 2x faster" thanks to its staging-texture glyph uploader. More
++//! importantly for us, D2D handles monochrome *and* colour glyphs through one
++//! path - `TranslateColorGlyphRun` returning null is itself the "this glyph is
++//! monochrome" test - so there is one rasterizer instead of two plus a rule for
++//! choosing between them.
++//!
++//! We render into a WIC bitmap rather than a DXGI surface because ghostty's
++//! `font.Atlas` is CPU-side and owns its own rect packing. See the note in
++//! DESIGN.md correcting ADR 0005 on this point.
++//!
++//! Vtable slots are ABI. The slot comments are load-bearing.
++
++const std = @import("std");
++const dw = @import("api.zig");
++
++const GUID = dw.GUID;
++const HRESULT = dw.HRESULT;
++const Reserved = dw.Reserved;
++const IUnknown = dw.IUnknown;
++
++// =============================================================================
++// Shared types
++// =============================================================================
++
++pub const D2D1_COLOR_F = extern struct { r: f32, g: f32, b: f32, a: f32 };
++pub const D2D1_POINT_2F = extern struct { x: f32, y: f32 };
++pub const D2D1_RECT_F = extern struct { left: f32, top: f32, right: f32, bottom: f32 };
++pub const D2D1_SIZE_U = extern struct { width: u32, height: u32 };
++
++pub const D2D1_ALPHA_MODE = enum(u32) {
++    UNKNOWN = 0,
++    PREMULTIPLIED = 1,
++    STRAIGHT = 2,
++    IGNORE = 3,
++};
++
++pub const D2D1_PIXEL_FORMAT = extern struct {
++    format: u32, // DXGI_FORMAT
++    alphaMode: D2D1_ALPHA_MODE,
++};
++
++pub const D2D1_RENDER_TARGET_TYPE = enum(u32) { DEFAULT = 0, SOFTWARE = 1, HARDWARE = 2 };
++pub const D2D1_RENDER_TARGET_USAGE = u32;
++pub const D2D1_FEATURE_LEVEL = enum(u32) { DEFAULT = 0, _ };
++
++pub const D2D1_RENDER_TARGET_PROPERTIES = extern struct {
++    type: D2D1_RENDER_TARGET_TYPE,
++    pixelFormat: D2D1_PIXEL_FORMAT,
++    dpiX: f32,
++    dpiY: f32,
++    usage: D2D1_RENDER_TARGET_USAGE,
++    minLevel: D2D1_FEATURE_LEVEL,
++};
++
++pub const D2D1_TEXT_ANTIALIAS_MODE = enum(u32) {
++    DEFAULT = 0,
++    CLEARTYPE = 1,
++    /// The only mode we use. ClearType subpixel output is wrong over a
++    /// premultiplied-alpha composition surface, and AtlasEngine forces
++    /// grayscale for colour glyphs for the same reason.
++    GRAYSCALE = 2,
++    ALIASED = 3,
++};
++
++pub const D2D1_DRAW_TEXT_OPTIONS = u32;
++pub const D2D1_DRAW_TEXT_OPTIONS_NONE: D2D1_DRAW_TEXT_OPTIONS = 0;
++
++pub const D2D1_FACTORY_TYPE = enum(u32) { SINGLE_THREADED = 0, MULTI_THREADED = 1 };
++
++pub const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
++
++// =============================================================================
++// ID2D1Brush / ID2D1SolidColorBrush
++// =============================================================================
++pub const ID2D1SolidColorBrush = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*ID2D1SolidColorBrush, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*ID2D1SolidColorBrush) callconv(.winapi) u32,
++        Release: *const fn (*ID2D1SolidColorBrush) callconv(.winapi) u32,
++        // ID2D1Resource (3)
++        GetFactory: Reserved,
++        // ID2D1Brush (4-7)
++        SetOpacity: Reserved,
++        SetTransform: Reserved,
++        GetOpacity: Reserved,
++        GetTransform: Reserved,
++        // ID2D1SolidColorBrush (8-9)
++        SetColor: *const fn (*ID2D1SolidColorBrush, *const D2D1_COLOR_F) callconv(.winapi) void,
++        GetColor: Reserved,
++    };
++
++    pub inline fn SetColor(self: *ID2D1SolidColorBrush, c: *const D2D1_COLOR_F) void {
++        self.vtable.SetColor(self, c);
++    }
++
++    pub inline fn Release(self: *ID2D1SolidColorBrush) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// ID2D1RenderTarget
++//
++// Slot map (d2d1.h): IUnknown 0-2, ID2D1Resource::GetFactory 3, then
++// ID2D1RenderTarget from 4. We call CreateSolidColorBrush(8),
++// DrawGlyphRun(29), SetTextAntialiasMode(34), Clear(47), BeginDraw(48),
++// EndDraw(49).
++// =============================================================================
++pub const ID2D1RenderTarget = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        // IUnknown 0-2
++        QueryInterface: *const fn (*ID2D1RenderTarget, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*ID2D1RenderTarget) callconv(.winapi) u32,
++        Release: *const fn (*ID2D1RenderTarget) callconv(.winapi) u32,
++        // ID2D1Resource 3
++        GetFactory: Reserved,
++        // ID2D1RenderTarget 4-
++        CreateBitmap: Reserved, // 4
++        CreateBitmapFromWicBitmap: Reserved, // 5
++        CreateSharedBitmap: Reserved, // 6
++        CreateBitmapBrush: Reserved, // 7
++        CreateSolidColorBrush: *const fn ( // 8
++            *ID2D1RenderTarget,
++            *const D2D1_COLOR_F,
++            ?*const anyopaque, // brushProperties
++            *?*ID2D1SolidColorBrush,
++        ) callconv(.winapi) HRESULT,
++        CreateGradientStopCollection: Reserved, // 9
++        CreateLinearGradientBrush: Reserved, // 10
++        CreateRadialGradientBrush: Reserved, // 11
++        CreateCompatibleRenderTarget: Reserved, // 12
++        CreateLayer: Reserved, // 13
++        CreateMesh: Reserved, // 14
++        DrawLine: Reserved, // 15
++        DrawRectangle: Reserved, // 16
++        FillRectangle: Reserved, // 17
++        DrawRoundedRectangle: Reserved, // 18
++        FillRoundedRectangle: Reserved, // 19
++        DrawEllipse: Reserved, // 20
++        FillEllipse: Reserved, // 21
++        DrawGeometry: Reserved, // 22
++        FillGeometry: Reserved, // 23
++        FillMesh: Reserved, // 24
++        FillOpacityMask: Reserved, // 25
++        DrawBitmap: Reserved, // 26
++        DrawText: Reserved, // 27
++        DrawTextLayout: Reserved, // 28
++        DrawGlyphRun: *const fn ( // 29
++            *ID2D1RenderTarget,
++            D2D1_POINT_2F, // baselineOrigin
++            *const dw.DWRITE_GLYPH_RUN,
++            *anyopaque, // ID2D1Brush* foregroundBrush
++            dw.DWRITE_MEASURING_MODE,
++        ) callconv(.winapi) void,
++        SetTransform: Reserved, // 30
++        GetTransform: Reserved, // 31
++        SetAntialiasMode: Reserved, // 32
++        GetAntialiasMode: Reserved, // 33
++        SetTextAntialiasMode: *const fn (*ID2D1RenderTarget, D2D1_TEXT_ANTIALIAS_MODE) callconv(.winapi) void, // 34
++        GetTextAntialiasMode: Reserved, // 35
++        SetTextRenderingParams: Reserved, // 36
++        GetTextRenderingParams: Reserved, // 37
++        SetTags: Reserved, // 38
++        GetTags: Reserved, // 39
++        PushLayer: Reserved, // 40
++        PopLayer: Reserved, // 41
++        Flush: Reserved, // 42
++        SaveDrawingState: Reserved, // 43
++        RestoreDrawingState: Reserved, // 44
++        PushAxisAlignedClip: Reserved, // 45
++        PopAxisAlignedClip: Reserved, // 46
++        Clear: *const fn (*ID2D1RenderTarget, ?*const D2D1_COLOR_F) callconv(.winapi) void, // 47
++        BeginDraw: *const fn (*ID2D1RenderTarget) callconv(.winapi) void, // 48
++        EndDraw: *const fn (*ID2D1RenderTarget, ?*u64, ?*u64) callconv(.winapi) HRESULT, // 49
++    };
++
++    pub inline fn CreateSolidColorBrush(
++        self: *ID2D1RenderTarget,
++        color: *const D2D1_COLOR_F,
++        out: *?*ID2D1SolidColorBrush,
++    ) HRESULT {
++        return self.vtable.CreateSolidColorBrush(self, color, null, out);
++    }
++
++    pub inline fn DrawGlyphRun(
++        self: *ID2D1RenderTarget,
++        origin: D2D1_POINT_2F,
++        run: *const dw.DWRITE_GLYPH_RUN,
++        brush: *ID2D1SolidColorBrush,
++    ) void {
++        self.vtable.DrawGlyphRun(self, origin, run, @ptrCast(brush), .NATURAL);
++    }
++
++    pub inline fn SetTextAntialiasMode(self: *ID2D1RenderTarget, mode: D2D1_TEXT_ANTIALIAS_MODE) void {
++        self.vtable.SetTextAntialiasMode(self, mode);
++    }
++
++    pub inline fn Clear(self: *ID2D1RenderTarget, color: ?*const D2D1_COLOR_F) void {
++        self.vtable.Clear(self, color);
++    }
++
++    pub inline fn BeginDraw(self: *ID2D1RenderTarget) void {
++        self.vtable.BeginDraw(self);
++    }
++
++    pub inline fn EndDraw(self: *ID2D1RenderTarget) HRESULT {
++        return self.vtable.EndDraw(self, null, null);
++    }
++
++    pub inline fn QueryInterface(self: *ID2D1RenderTarget, iid: *const GUID, out: *?*anyopaque) HRESULT {
++        return self.vtable.QueryInterface(self, iid, out);
++    }
++
++    pub inline fn Release(self: *ID2D1RenderTarget) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// ID2D1Factory — we call CreateWicBitmapRenderTarget(13)
++// =============================================================================
++pub const ID2D1Factory = extern struct {
++    vtable: *const VTable,
++
++    pub const IID = GUID{
++        .data1 = 0x06152247,
++        .data2 = 0x6f50,
++        .data3 = 0x465a,
++        .data4 = .{ 0x92, 0x45, 0x11, 0x8b, 0xfd, 0x3b, 0x60, 0x07 },
++    };
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*ID2D1Factory, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*ID2D1Factory) callconv(.winapi) u32,
++        Release: *const fn (*ID2D1Factory) callconv(.winapi) u32,
++        // ID2D1Factory 3-
++        ReloadSystemMetrics: Reserved, // 3
++        GetDesktopDpi: Reserved, // 4
++        CreateRectangleGeometry: Reserved, // 5
++        CreateRoundedRectangleGeometry: Reserved, // 6
++        CreateEllipseGeometry: Reserved, // 7
++        CreateGeometryGroup: Reserved, // 8
++        CreateTransformedGeometry: Reserved, // 9
++        CreatePathGeometry: Reserved, // 10
++        CreateStrokeStyle: Reserved, // 11
++        CreateDrawingStateBlock: Reserved, // 12
++        CreateWicBitmapRenderTarget: *const fn ( // 13
++            *ID2D1Factory,
++            *anyopaque, // IWICBitmap*
++            *const D2D1_RENDER_TARGET_PROPERTIES,
++            *?*ID2D1RenderTarget,
++        ) callconv(.winapi) HRESULT,
++        CreateHwndRenderTarget: Reserved, // 14
++        CreateDxgiSurfaceRenderTarget: Reserved, // 15
++        CreateDCRenderTarget: Reserved, // 16
++    };
++
++    pub inline fn CreateWicBitmapRenderTarget(
++        self: *ID2D1Factory,
++        wic_bitmap: *anyopaque,
++        props: *const D2D1_RENDER_TARGET_PROPERTIES,
++        out: *?*ID2D1RenderTarget,
++    ) HRESULT {
++        return self.vtable.CreateWicBitmapRenderTarget(self, wic_bitmap, props, out);
++    }
++
++    pub inline fn Release(self: *ID2D1Factory) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++pub const D2D1CreateFactory = @extern(*const fn (
++    factoryType: D2D1_FACTORY_TYPE,
++    iid: *const GUID,
++    factoryOptions: ?*const anyopaque,
++    factory: *?*anyopaque,
++) callconv(.winapi) HRESULT, .{
++    .library_name = "d2d1",
++    .name = "D2D1CreateFactory",
++});
++
++// =============================================================================
++// WIC — the CPU-side bitmap D2D renders into, and that we read back from.
++// =============================================================================
++
++pub const CLSID_WICImagingFactory = GUID{
++    .data1 = 0xcacaf262,
++    .data2 = 0x9370,
++    .data3 = 0x4615,
++    .data4 = .{ 0xa1, 0x3b, 0x9f, 0x55, 0x39, 0xda, 0x4c, 0x0a },
++};
++
++pub const IID_IWICImagingFactory = GUID{
++    .data1 = 0xec5ec8a9,
++    .data2 = 0xc395,
++    .data3 = 0x4314,
++    .data4 = .{ 0x9c, 0x77, 0x54, 0xd7, 0xa9, 0x35, 0xff, 0x70 },
++};
++
++/// GUID_WICPixelFormat32bppPBGRA — premultiplied BGRA, which is what D2D wants
++/// for a text render target and what the colour-glyph path produces.
++pub const GUID_WICPixelFormat32bppPBGRA = GUID{
++    .data1 = 0x6fddc324,
++    .data2 = 0x4e03,
++    .data3 = 0x4bfe,
++    .data4 = .{ 0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, 0x10 },
++};
++
++pub const WICBitmapCreateCacheOption = enum(u32) {
++    NoCache = 0,
++    CacheOnDemand = 1,
++    CacheOnLoad = 2,
++};
++
++pub const WICBitmapLockFlags = u32;
++pub const WICBitmapLockRead: WICBitmapLockFlags = 1;
++pub const WICBitmapLockWrite: WICBitmapLockFlags = 2;
++
++pub const WICRect = extern struct { X: i32, Y: i32, Width: i32, Height: i32 };
++
++pub const IWICBitmapLock = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*IWICBitmapLock, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IWICBitmapLock) callconv(.winapi) u32,
++        Release: *const fn (*IWICBitmapLock) callconv(.winapi) u32,
++        // IWICBitmapLock 3-
++        GetSize: Reserved,
++        GetStride: *const fn (*IWICBitmapLock, *u32) callconv(.winapi) HRESULT,
++        GetDataPointer: *const fn (*IWICBitmapLock, *u32, *?[*]u8) callconv(.winapi) HRESULT,
++        GetPixelFormat: Reserved,
++    };
++
++    pub inline fn GetStride(self: *IWICBitmapLock, out: *u32) HRESULT {
++        return self.vtable.GetStride(self, out);
++    }
++
++    pub inline fn GetDataPointer(self: *IWICBitmapLock, size: *u32, data: *?[*]u8) HRESULT {
++        return self.vtable.GetDataPointer(self, size, data);
++    }
++
++    pub inline fn Release(self: *IWICBitmapLock) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++pub const IWICBitmap = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*IWICBitmap, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IWICBitmap) callconv(.winapi) u32,
++        Release: *const fn (*IWICBitmap) callconv(.winapi) u32,
++        // IWICBitmapSource 3-6
++        GetSize: Reserved,
++        GetPixelFormat: Reserved,
++        GetResolution: Reserved,
++        CopyPalette: Reserved,
++        CopyPixels: Reserved,
++        // IWICBitmap 8-
++        Lock: *const fn (
++            *IWICBitmap,
++            ?*const WICRect,
++            WICBitmapLockFlags,
++            *?*IWICBitmapLock,
++        ) callconv(.winapi) HRESULT,
++        SetPalette: Reserved,
++        SetResolution: Reserved,
++    };
++
++    pub inline fn Lock(
++        self: *IWICBitmap,
++        rect: ?*const WICRect,
++        flags: WICBitmapLockFlags,
++        out: *?*IWICBitmapLock,
++    ) HRESULT {
++        return self.vtable.Lock(self, rect, flags, out);
++    }
++
++    pub inline fn Release(self: *IWICBitmap) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++pub const IWICImagingFactory = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*IWICImagingFactory, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IWICImagingFactory) callconv(.winapi) u32,
++        Release: *const fn (*IWICImagingFactory) callconv(.winapi) u32,
++        // IWICImagingFactory 3-
++        CreateDecoderFromFilename: Reserved, // 3
++        CreateDecoderFromStream: Reserved, // 4
++        CreateDecoderFromFileHandle: Reserved, // 5
++        CreateComponentInfo: Reserved, // 6
++        CreateDecoder: Reserved, // 7
++        CreateEncoder: Reserved, // 8
++        CreatePalette: Reserved, // 9
++        CreateFormatConverter: Reserved, // 10
++        CreateBitmapScaler: Reserved, // 11
++        CreateBitmapClipper: Reserved, // 12
++        CreateBitmapFlipRotator: Reserved, // 13
++        CreateStream: Reserved, // 14
++        CreateColorContext: Reserved, // 15
++        CreateColorTransformer: Reserved, // 16
++        CreateBitmap: *const fn ( // 17
++            *IWICImagingFactory,
++            u32, // width
++            u32, // height
++            *const GUID, // pixelFormat
++            WICBitmapCreateCacheOption,
++            *?*IWICBitmap,
++        ) callconv(.winapi) HRESULT,
++        CreateBitmapFromSource: Reserved, // 18
++    };
++
++    pub inline fn CreateBitmap(
++        self: *IWICImagingFactory,
++        width: u32,
++        height: u32,
++        format: *const GUID,
++        cache: WICBitmapCreateCacheOption,
++        out: *?*IWICBitmap,
++    ) HRESULT {
++        return self.vtable.CreateBitmap(self, width, height, format, cache, out);
++    }
++
++    pub inline fn Release(self: *IWICImagingFactory) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// COM apartment + object creation, from ole32.
++pub const CLSCTX_INPROC_SERVER: u32 = 1;
++pub const COINIT_APARTMENTTHREADED: u32 = 2;
++pub const COINIT_MULTITHREADED: u32 = 0;
++
++pub extern "ole32" fn CoInitializeEx(pvReserved: ?*anyopaque, dwCoInit: u32) callconv(.winapi) HRESULT;
++pub extern "ole32" fn CoCreateInstance(
++    rclsid: *const GUID,
++    pUnkOuter: ?*anyopaque,
++    dwClsContext: u32,
++    riid: *const GUID,
++    ppv: *?*anyopaque,
++) callconv(.winapi) HRESULT;
