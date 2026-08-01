@@ -188,9 +188,10 @@ consumed by a XAML SwapChainPanel.
 - `d3d11-backend`: composition mode — `DCompositionCreateSurfaceHandle` +
   `CreateSwapChainForCompositionSurfaceHandle`, premultiplied `FLIP_SEQUENTIAL`;
   `ghostty_surface_get_swap_chain_handle` export.
-- `harness/xaml-host`: minimal WinUI 3 (or XAML-island) app binding the handle via
-  `ISwapChainPanelNative2::SetSwapChainHandle` (wintty's `Interop/ISwapChainPanelNative.cs`
-  is the recipe).
+- `harness/xaml-host`: minimal **system-XAML** app in **C++/WinRT**, binding the handle via
+  `ISwapChainPanelNative2::SetSwapChainHandle`. **Mirror WT's own
+  `TermControl::_AttachDxgiSwapChainToXaml`** (`TermControl.cpp:1364`), which is already
+  exactly this call — not wintty's C# WinUI 3 recipe.
 - Resize + `CompositionScale` handling; device-removed → recreate → re-attach handle.
 
 Exit criteria:
@@ -198,17 +199,44 @@ Exit criteria:
       per-monitor DPI change handled.
 - [ ] Kill the device (dxcap or TDR sim) → surface recovers without app restart.
 
-Open questions (resolve at readiness):
-- Harness UI stack: WinUI 3 or system-XAML islands? **This matters beyond the harness**:
-  Windows Terminal uses system XAML islands while wintty's interop recipe targets WinUI 3
-  — the `ISwapChainPanelNative2` interop IIDs differ between the two stacks. The harness
-  should preferably prove the *system-XAML* variant (what Phase 5 needs); confirm the
-  interop call shape for it, or decide to prove both.
-- Harness language: C# (fast, wintty recipe ports directly) vs C++/WinRT (closer to WT's
-  Phase 5 reality)? Recommendation pending Phase 1 learnings.
-- Device-lost recovery contract: after recreation, is a *new* dcomp handle mandatory
-  (re-raise attach) or can the old handle be revived? Decide the C API semantics before
-  building recovery.
+Open questions — **all resolved at the Phase 1 retro (2026-07-31); phase is ready**:
+- ~~Harness UI stack: WinUI 3 or system-XAML?~~ **System XAML.** Not a preference call —
+  WT already does this exact binding in `TermControl.cpp:1364`:
+  `SwapChainPanel().as<ISwapChainPanelNative2>()` then `SetSwapChainHandle(...)`.
+  Windows Terminal is the only target, so the harness mirrors that and nothing else.
+- ~~Harness language: C# or C++/WinRT?~~ **C++/WinRT**, matching WT. The project's aim is
+  a change Microsoft could plausibly adopt, so the harness must not introduce anything that
+  would read as unnatural upstream. wintty's C# interop is reference material only.
+- ~~Device-lost recovery contract?~~ **A new handle is expected; the embedder re-attaches.**
+  WT's `ControlCore::_renderEngineSwapChainChanged` already implements precisely this: it
+  `DuplicateHandle`s the renderer's new handle and raises `SwapChainChanged` so
+  `TermControl` re-binds. Its comment even covers the race — "even if the renderer is
+  currently in the process of discarding this value and creating a new one".
+  **Consequence for this phase:** a getter is not sufficient. libghostty needs a *change
+  notification* so Phase 5 can drive `SwapChainChanged`. Verify by forcing a TDR rather
+  than trusting the inference.
+
+Starting state (verified in Phase 1, not assumed):
+- The C API and the `Platform.Win32` union already carry `composition` as a mode;
+  `Device.init` returns `error.Unsupported` for it and
+  `ghostty_surface_get_swap_chain_handle` returns null. This phase fills those in rather
+  than reshaping anything.
+- **None of the handle-based composition path is bound yet** — `IDXGIFactoryMedia`,
+  `CreateSwapChainForCompositionSurfaceHandle`, `DCompositionCreateSurfaceHandle`,
+  `ISwapChainPanelNative2` are all absent. #11886 wired `IDXGIFactory2::
+  CreateSwapChainForComposition`, which is the *object-based* path
+  (`ISwapChainPanelNative::SetSwapChain`) and not what we use.
+- **wintty implements the handle-based path** in `src/renderer/directx12/dcomp.zig` and
+  `dxgi.zig` (MIT, harvestable). Being D3D12 barely matters: the creator takes an
+  `IUnknown*`, so only the argument differs — D3D12 passes an `ID3D12CommandQueue`, we
+  pass the `ID3D11Device`. Vtable layouts, IIDs, and the surface access mask are
+  version-independent, and those are the parts most likely to be silently wrong if
+  hand-written.
+- `syncToWindow` (the Phase 1 hwnd resize fix) **cannot work here** — there is no window to
+  query. Composition resize must be driven from the surface size the embedder sets, which
+  is the plumbing Phase 1 skipped. Once it exists, hwnd mode should probably use it too.
+- `DXGI_ALPHA_MODE.PREMULTIPLIED` is already selected for composition in `device.zig` but
+  has never been exercised; this is where blending errors would first appear.
 
 Re-evaluate: any dcomp/XAML surprise that changes the WT attach plan (Phase 5)?
 
