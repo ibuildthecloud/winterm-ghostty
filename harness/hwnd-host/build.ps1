@@ -79,10 +79,21 @@ Write-Host 'cl main.c' -ForegroundColor Cyan
 # Run from $here with plain relative names. Passing absolute /Fo and /Fd paths
 # through two layers of quoting (PowerShell then cmd) is where this previously
 # went wrong, and cl reports that as a bare exit 1 with no diagnostic.
-# /STACK:16MB - a Debug-optimized Zig libghostty has very large stack frames,
-# and ghostty_init alone overflows MSVC's default 1 MB main-thread stack
-# (STATUS_STACK_OVERFLOW, 0xC00000FD). The reserve is virtual address space,
-# not committed memory, so this costs nothing at runtime.
+# /STACK:16MB. Measured: ghostty_init overflows MSVC's default 1 MB main-thread
+# stack (STATUS_STACK_OVERFLOW, 0xC00000FD) but succeeds at 2 MB, so the real
+# requirement is only just above 1 MB - MSVC's default is marginally short
+# rather than wildly so. Two reasons to use 16 MB anyway:
+#
+#   * It is what Zig assumes. Zig-built exes get a 16 MiB stack reserve and
+#     std.Thread.default_stack_size is 16 MiB, so Zig code is written against
+#     that budget. MSVC's 1 MB is the outlier here.
+#   * 2 MB passed only the paths this harness exercises. Deeper config parsing
+#     or renderer paths could need more, and the failure mode is a silent
+#     crash with no diagnostic.
+#
+# The reserve is address space, not committed memory, so it costs nothing at
+# runtime. Note this was measured against a Debug libghostty; a Release build
+# may well fit in 1 MB (untested).
 cmd /c "`"$vcvars`" >nul 2>&1 && cd /d `"$here`" && cl /nologo /W4 /Zi /I`"$include`" /Fe:hwnd-host.exe main.c /link /STACK:16777216 ghostty.lib user32.lib shcore.lib"
 if ($LASTEXITCODE -ne 0) { throw "compile failed ($LASTEXITCODE)" }
 
