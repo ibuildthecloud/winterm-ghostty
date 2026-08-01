@@ -1,0 +1,392 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Sat, 1 Aug 2026 13:49:06 -0700
+Subject: [PATCH] font: system font fallback via
+ IDWriteFontFallback::MapCharacters
+
+First half of the discovery work in ADR 0005. Library.fallbackFace(cp) asks
+Windows which font covers a codepoint, using the locale-aware system fallback
+chain. That is the thing the font-directory scanner fundamentally cannot
+provide: walking files in directory order says nothing about which font Windows
+would actually choose.
+
+MapCharacters takes an IDWriteTextAnalysisSource, and that interface is a
+callback the caller implements - the first COM interface here that we provide
+rather than consume. TextAnalysisSource supplies a hand-built vtable over a
+single UTF-16 run, with the Zig object recovered via @fieldParentPtr. It is
+meant to live on the caller's stack for one call, so its reference counting is
+deliberately inert rather than pretending to be heap-owned.
+
+Two things that are not obvious and both bite immediately:
+
+- GetParagraphReadingDirection returns its value directly, not an HRESULT.
+  Declaring it like the neighbouring methods misreads the return register.
+
+- QueryInterface must refuse IIDs we do not implement. Returning `this` for
+  everything crashed the test runner: DirectWrite probes for interfaces beyond
+  the two we support, then calls a slot past the end of our vtable. It now
+  answers only IDWriteTextAnalysisSource and IUnknown, and E_NOINTERFACE
+  otherwise.
+
+The test asserts the returned face actually contains the glyph rather than
+checking a font name. Names vary by Windows edition and language pack, and the
+name check is also weaker - a lookup returning a plausible but wrong font would
+still pass it. U+1F978 additionally exercises the surrogate-pair encoding.
+
+  directwrite_harfbuzz : 3066 pass, 56 skip, 0 fail
+  default              : 3065 pass, 56 skip, 0 fail
+
+Not yet wired into discovery.zig: discoverFallback still walks font
+directories. Routing it through this needs the mapped face resolved to
+something loadable, since HarfBuzz needs the font bytes, plus the negative
+cache for codepoints nothing covers.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/font/face/dwrite/api.zig | 223 ++++++++++++++++++++++++++++++++++-
+ src/font/library.zig         |  86 ++++++++++++++
+ 2 files changed, 307 insertions(+), 2 deletions(-)
+
+diff --git a/src/font/face/dwrite/api.zig b/src/font/face/dwrite/api.zig
+index 2c35b84a8..437a74e7a 100644
+--- a/src/font/face/dwrite/api.zig
++++ b/src/font/face/dwrite/api.zig
+@@ -965,9 +965,228 @@ pub const IDWriteFactory2 = extern struct {
+     }
+ };
+ 
+-/// Opaque for now; `MapCharacters` is wired when discovery fallback lands.
++pub const DWRITE_READING_DIRECTION = enum(u32) {
++    LEFT_TO_RIGHT = 0,
++    RIGHT_TO_LEFT = 1,
++    TOP_TO_BOTTOM = 2,
++    BOTTOM_TO_TOP = 3,
++};
++
++/// The text source `MapCharacters` reads its input through.
++///
++/// This is the only COM interface we *implement* rather than consume, so the
++/// vtable is declared here and `TextAnalysisSource` supplies an instance.
++///
++/// `GetParagraphReadingDirection` returns its value directly rather than an
++/// HRESULT. Declaring it like the others would misread the return register and
++/// corrupt whatever DirectWrite did with the result.
++pub const IDWriteTextAnalysisSource = extern struct {
++    vtable: *const VTable,
++
++    pub const IID = GUID{
++        .data1 = 0x688e1a58,
++        .data2 = 0x5094,
++        .data3 = 0x47c8,
++        .data4 = .{ 0xad, 0xc8, 0xfb, 0xce, 0xa6, 0x0a, 0xe9, 0x2b },
++    };
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*IDWriteTextAnalysisSource, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDWriteTextAnalysisSource) callconv(.winapi) u32,
++        Release: *const fn (*IDWriteTextAnalysisSource) callconv(.winapi) u32,
++        GetTextAtPosition: *const fn (*IDWriteTextAnalysisSource, u32, *?[*]const u16, *u32) callconv(.winapi) HRESULT,
++        GetTextBeforePosition: *const fn (*IDWriteTextAnalysisSource, u32, *?[*]const u16, *u32) callconv(.winapi) HRESULT,
++        GetParagraphReadingDirection: *const fn (*IDWriteTextAnalysisSource) callconv(.winapi) DWRITE_READING_DIRECTION,
++        GetLocaleName: *const fn (*IDWriteTextAnalysisSource, u32, *u32, *?[*:0]const u16) callconv(.winapi) HRESULT,
++        GetNumberSubstitution: *const fn (*IDWriteTextAnalysisSource, u32, *u32, *?*anyopaque) callconv(.winapi) HRESULT,
++    };
++};
++
++/// A minimal `IDWriteTextAnalysisSource` over one UTF-16 run.
++///
++/// Intended to live on the caller's stack for the duration of a single
++/// `MapCharacters` call. Reference counting is deliberately inert: DirectWrite
++/// does not retain the source beyond the call, and claiming to be heap-owned
++/// would be a promise we would then have to keep.
++pub const TextAnalysisSource = extern struct {
++    /// Must be the first field. DirectWrite receives a pointer to this struct
++    /// and reads a vtable pointer from offset zero.
++    iface: IDWriteTextAnalysisSource,
++    text: [*]const u16,
++    len: u32,
++    locale: [*:0]const u16,
++
++    const vtable: IDWriteTextAnalysisSource.VTable = .{
++        .QueryInterface = queryInterface,
++        .AddRef = addRef,
++        .Release = release,
++        .GetTextAtPosition = getTextAtPosition,
++        .GetTextBeforePosition = getTextBeforePosition,
++        .GetParagraphReadingDirection = getParagraphReadingDirection,
++        .GetLocaleName = getLocaleName,
++        .GetNumberSubstitution = getNumberSubstitution,
++    };
++
++    pub fn init(text: []const u16, locale: [*:0]const u16) TextAnalysisSource {
++        return .{
++            .iface = .{ .vtable = &vtable },
++            .text = text.ptr,
++            .len = @intCast(text.len),
++            .locale = locale,
++        };
++    }
++
++    fn self(i: *IDWriteTextAnalysisSource) *TextAnalysisSource {
++        return @fieldParentPtr("iface", i);
++    }
++
++    fn queryInterface(i: *IDWriteTextAnalysisSource, iid: *const GUID, out: *?*anyopaque) callconv(.winapi) HRESULT {
++        // Must refuse anything we do not actually implement. Handing back this
++        // pointer for an unknown interface makes the caller invoke a slot past
++        // the end of our vtable, which crashes rather than failing cleanly -
++        // DirectWrite does probe for interfaces beyond the two below.
++        const iunknown: GUID = .{
++            .data1 = 0x00000000,
++            .data2 = 0x0000,
++            .data3 = 0x0000,
++            .data4 = .{ 0xC0, 0, 0, 0, 0, 0, 0, 0x46 },
++        };
++        if (std.mem.eql(u8, std.mem.asBytes(iid), std.mem.asBytes(&IDWriteTextAnalysisSource.IID)) or
++            std.mem.eql(u8, std.mem.asBytes(iid), std.mem.asBytes(&iunknown)))
++        {
++            out.* = i;
++            return S_OK;
++        }
++        out.* = null;
++        return E_NOINTERFACE;
++    }
++
++    fn addRef(_: *IDWriteTextAnalysisSource) callconv(.winapi) u32 {
++        return 1;
++    }
++
++    fn release(_: *IDWriteTextAnalysisSource) callconv(.winapi) u32 {
++        return 1;
++    }
++
++    fn getTextAtPosition(
++        i: *IDWriteTextAnalysisSource,
++        position: u32,
++        text: *?[*]const u16,
++        length: *u32,
++    ) callconv(.winapi) HRESULT {
++        const s = self(i);
++        if (position >= s.len) {
++            text.* = null;
++            length.* = 0;
++            return S_OK;
++        }
++        text.* = s.text + position;
++        length.* = s.len - position;
++        return S_OK;
++    }
++
++    fn getTextBeforePosition(
++        i: *IDWriteTextAnalysisSource,
++        position: u32,
++        text: *?[*]const u16,
++        length: *u32,
++    ) callconv(.winapi) HRESULT {
++        const s = self(i);
++        if (position == 0 or position > s.len) {
++            text.* = null;
++            length.* = 0;
++            return S_OK;
++        }
++        text.* = s.text;
++        length.* = position;
++        return S_OK;
++    }
++
++    fn getParagraphReadingDirection(_: *IDWriteTextAnalysisSource) callconv(.winapi) DWRITE_READING_DIRECTION {
++        return .LEFT_TO_RIGHT;
++    }
++
++    fn getLocaleName(
++        i: *IDWriteTextAnalysisSource,
++        _: u32,
++        length: *u32,
++        locale: *?[*:0]const u16,
++    ) callconv(.winapi) HRESULT {
++        const s = self(i);
++        locale.* = s.locale;
++        length.* = s.len;
++        return S_OK;
++    }
++
++    fn getNumberSubstitution(
++        i: *IDWriteTextAnalysisSource,
++        _: u32,
++        length: *u32,
++        sub: *?*anyopaque,
++    ) callconv(.winapi) HRESULT {
++        length.* = self(i).len;
++        sub.* = null;
++        return S_OK;
++    }
++};
++
++// =============================================================================
++// IDWriteFontFallback — inherits IUnknown only, so MapCharacters is slot 3.
++// =============================================================================
+ pub const IDWriteFontFallback = extern struct {
+-    vtable: *const anyopaque,
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*IDWriteFontFallback, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDWriteFontFallback) callconv(.winapi) u32,
++        Release: *const fn (*IDWriteFontFallback) callconv(.winapi) u32,
++        MapCharacters: *const fn (
++            *IDWriteFontFallback,
++            *IDWriteTextAnalysisSource,
++            u32, // textPosition
++            u32, // textLength
++            ?*anyopaque, // baseFontCollection
++            ?[*:0]const u16, // baseFamilyName
++            DWRITE_FONT_WEIGHT,
++            DWRITE_FONT_STYLE,
++            DWRITE_FONT_STRETCH,
++            *u32, // mappedLength
++            *?*IDWriteFont,
++            *f32, // scale
++        ) callconv(.winapi) HRESULT,
++    };
++
++    /// Succeeds with a null font when nothing covers the text. That is the
++    /// "no fallback exists" answer, not an error.
++    pub inline fn MapCharacters(
++        self: *IDWriteFontFallback,
++        source: *IDWriteTextAnalysisSource,
++        length: u32,
++        base_family: ?[*:0]const u16,
++        mapped_length: *u32,
++        out: *?*IDWriteFont,
++        scale: *f32,
++    ) HRESULT {
++        return self.vtable.MapCharacters(
++            self,
++            source,
++            0,
++            length,
++            null,
++            base_family,
++            .NORMAL,
++            .NORMAL,
++            .NORMAL,
++            mapped_length,
++            out,
++            scale,
++        );
++    }
++
++    pub inline fn Release(self: *IDWriteFontFallback) u32 {
++        return self.vtable.Release(self);
++    }
+ };
+ 
+ /// A font file, however it was referenced. Opaque to us - we only pass it to
+diff --git a/src/font/library.zig b/src/font/library.zig
+index 86ebc768e..bd4c03235 100644
+--- a/src/font/library.zig
++++ b/src/font/library.zig
+@@ -77,6 +77,7 @@ pub const NoopLibrary = struct {
+ pub const DirectWriteLibrary = struct {
+     const dw = @import("face/dwrite/api.zig");
+     const d2d = @import("face/dwrite/d2d.zig");
++    const global = @import("../global.zig");
+ 
+     /// Base factory: discovery, font faces, glyph run analysis.
+     factory: *dw.IDWriteFactory,
+@@ -192,6 +193,59 @@ pub const DirectWriteLibrary = struct {
+         };
+     }
+ 
++    /// The system fallback font face for a codepoint, or null when DirectWrite
++    /// knows of nothing covering it. The caller owns the returned face and must
++    /// Release it.
++    ///
++    /// This is the locale-aware system fallback chain, which is what the font
++    /// directory scanner fundamentally cannot provide: walking files in
++    /// directory order says nothing about which font Windows would choose.
++    pub fn fallbackFace(self: *const Library, cp: u21) !?*dw.IDWriteFontFace {
++        self.mutex.lockUncancelable(global.io());
++        defer self.mutex.unlock(global.io());
++
++        var fallback: ?*dw.IDWriteFontFallback = null;
++        if (dw.FAILED(self.factory2.GetSystemFontFallback(&fallback)) or
++            fallback == null) return error.DirectWriteUnavailable;
++        defer _ = fallback.?.Release();
++
++        // UTF-16, with a surrogate pair when the codepoint needs one.
++        var utf16: [2]u16 = undefined;
++        const utf16_len: u32 = if (cp < 0x10000) len: {
++            utf16[0] = @intCast(cp);
++            break :len 1;
++        } else len: {
++            const v = cp - 0x10000;
++            utf16[0] = @intCast(0xD800 + (v >> 10));
++            utf16[1] = @intCast(0xDC00 + (v & 0x3FF));
++            break :len 2;
++        };
++
++        var source = dw.TextAnalysisSource.init(
++            utf16[0..utf16_len],
++            std.unicode.utf8ToUtf16LeStringLiteral("en-us"),
++        );
++
++        var mapped_length: u32 = 0;
++        var mapped: ?*dw.IDWriteFont = null;
++        var scale: f32 = 1;
++        const hr = fallback.?.MapCharacters(
++            &source.iface,
++            utf16_len,
++            null,
++            &mapped_length,
++            &mapped,
++            &scale,
++        );
++        // A success code with a null font means "nothing covers this".
++        if (dw.FAILED(hr) or mapped == null) return null;
++        defer _ = mapped.?.Release();
++
++        var face: ?*dw.IDWriteFontFace = null;
++        if (dw.FAILED(mapped.?.CreateFontFace(&face)) or face == null) return null;
++        return face;
++    }
++
+     pub fn deinit(self: *Library) void {
+         self.alloc.destroy(self.mutex);
+         _ = self.wic_factory.Release();
+@@ -204,3 +258,35 @@ pub const DirectWriteLibrary = struct {
+         _ = self.factory.Release();
+     }
+ };
++
++test "system font fallback" {
++    if (comptime options.backend != .directwrite_harfbuzz) return error.SkipZigTest;
++
++    const testing = std.testing;
++    const dw = @import("face/dwrite/api.zig");
++
++    var lib = try Library.init(testing.allocator);
++    defer lib.deinit();
++
++    // Each of these exercises the IDWriteTextAnalysisSource we implement. If
++    // its vtable layout or calling convention were wrong, this would crash or
++    // return garbage rather than a usable face. U+1F978 additionally needs a
++    // surrogate pair, exercising the UTF-16 encoding.
++    for ([_]u21{ 'A', '中', '🥸' }) |cp| {
++        const face = (try lib.fallbackFace(cp)) orelse {
++            std.debug.print("no fallback for U+{X}\n", .{cp});
++            return error.TestUnexpectedResult;
++        };
++        defer _ = face.Release();
++
++        // The point of a fallback chain is that the font it names actually
++        // covers the codepoint. Asserting a font name instead would be brittle
++        // (the installed set varies by Windows edition and language pack) and
++        // weaker: a lookup returning a plausible name that lacks the glyph
++        // would still pass.
++        var cps = [_]u32{cp};
++        var idx = [_]u16{0};
++        try testing.expect(dw.SUCCEEDED(face.GetGlyphIndices(&cps, &idx)));
++        try testing.expect(idx[0] != 0); // 0 is .notdef
++    }
++}

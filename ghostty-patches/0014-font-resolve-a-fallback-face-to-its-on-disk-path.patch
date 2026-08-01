@@ -1,0 +1,265 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Sat, 1 Aug 2026 14:07:21 -0700
+Subject: [PATCH] font: resolve a fallback face to its on-disk path
+
+Completes the lookup half of ADR 0005 discovery. Library.facePath walks
+GetFiles -> IDWriteFontFile -> GetReferenceKey + GetLoader -> QI
+IDWriteLocalFontFileLoader -> GetFilePathFromKey, which is what Face.initFile
+needs. Together with fallbackFace this answers "which font covers this
+codepoint, and where is it" without scanning a single directory.
+
+GetLoader is typed as returning *IUnknown rather than the local loader, so the
+QueryInterface cannot be skipped. It actually returns the base
+IDWriteFontFileLoader, and a custom loader - such as our own in-memory one -
+has no GetFilePathFromKey at all; calling it anyway would run off the end of
+that object's vtable and crash, exactly as returning `this` from our
+TextAnalysisSource QueryInterface did earlier. That QI failing is also the
+correct answer to "is this font backed by a file", so null is an ordinary
+result rather than an error.
+
+The test asserts the returned path OPENS, not merely that a string came back.
+A wrong reference key would still yield a plausible-looking path; only opening
+it proves the key round-tripped through the loader.
+
+  directwrite_harfbuzz : 3066 pass, 56 skip, 0 fail
+  default              : 3065 pass, 56 skip, 0 fail
+
+Still to wire: discovery.zig's Windows.discoverFallback continues to walk
+directories. The recipe and the iterator states it needs are recorded in the
+task notes.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/font/face/dwrite/api.zig | 104 ++++++++++++++++++++++++++++++++++-
+ src/font/library.zig         |  66 ++++++++++++++++++++++
+ 2 files changed, 167 insertions(+), 3 deletions(-)
+
+diff --git a/src/font/face/dwrite/api.zig b/src/font/face/dwrite/api.zig
+index 437a74e7a..b7683661b 100644
+--- a/src/font/face/dwrite/api.zig
++++ b/src/font/face/dwrite/api.zig
+@@ -157,7 +157,13 @@ pub const IDWriteFontFace = extern struct {
+         Release: *const fn (*IDWriteFontFace) callconv(.winapi) u32,
+         // IDWriteFontFace (3-)
+         GetType: Reserved,
+-        GetFiles: Reserved,
++        // 4: called twice - once with a null array to learn the count, then
++        // again to fill it.
++        GetFiles: *const fn (
++            *IDWriteFontFace,
++            *u32,
++            ?[*]?*IDWriteFontFile,
++        ) callconv(.winapi) HRESULT,
+         GetIndex: Reserved,
+         GetSimulations: Reserved,
+         IsSymbolFont: Reserved,
+@@ -231,6 +237,14 @@ pub const IDWriteFontFace = extern struct {
+         return self.vtable.TryGetFontTable(self, table_tag, data, size, context, exists);
+     }
+ 
++    pub inline fn GetFiles(
++        self: *IDWriteFontFace,
++        count: *u32,
++        files: ?[*]?*IDWriteFontFile,
++    ) HRESULT {
++        return self.vtable.GetFiles(self, count, files);
++    }
++
+     pub inline fn ReleaseFontTable(self: *IDWriteFontFace, context: ?*anyopaque) void {
+         self.vtable.ReleaseFontTable(self, context);
+     }
+@@ -1189,8 +1203,68 @@ pub const IDWriteFontFallback = extern struct {
+     }
+ };
+ 
+-/// A font file, however it was referenced. Opaque to us - we only pass it to
+-/// `CreateFontFace` and release it.
++/// The loader that produced a font file, plus the path when it is a local one.
++///
++/// `GetFilePathFromKey` is on `IDWriteLocalFontFileLoader`; the QI to it fails
++/// for in-memory and other custom loaders, which is the documented way to ask
++/// "is this font backed by a file on disk?".
++pub const IDWriteLocalFontFileLoader = extern struct {
++    vtable: *const VTable,
++
++    pub const IID = GUID{
++        .data1 = 0xb2d9f3ec,
++        .data2 = 0xc9fe,
++        .data3 = 0x4a11,
++        .data4 = .{ 0xa2, 0xec, 0xd8, 0x62, 0x08, 0xf7, 0xc0, 0xa2 },
++    };
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*IDWriteLocalFontFileLoader, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDWriteLocalFontFileLoader) callconv(.winapi) u32,
++        Release: *const fn (*IDWriteLocalFontFileLoader) callconv(.winapi) u32,
++        // IDWriteFontFileLoader 3
++        CreateStreamFromKey: Reserved,
++        // IDWriteLocalFontFileLoader 4-6
++        GetFilePathLengthFromKey: *const fn (
++            *IDWriteLocalFontFileLoader,
++            *const anyopaque, // key
++            u32, // key size
++            *u32, // out length, excluding the null
++        ) callconv(.winapi) HRESULT,
++        GetFilePathFromKey: *const fn (
++            *IDWriteLocalFontFileLoader,
++            *const anyopaque, // key
++            u32, // key size
++            [*]u16, // out path
++            u32, // buffer size, INCLUDING room for the null
++        ) callconv(.winapi) HRESULT,
++        GetLastWriteTimeFromKey: Reserved,
++    };
++
++    pub inline fn GetFilePathLengthFromKey(
++        self: *IDWriteLocalFontFileLoader,
++        key: *const anyopaque,
++        key_size: u32,
++        out: *u32,
++    ) HRESULT {
++        return self.vtable.GetFilePathLengthFromKey(self, key, key_size, out);
++    }
++
++    pub inline fn GetFilePathFromKey(
++        self: *IDWriteLocalFontFileLoader,
++        key: *const anyopaque,
++        key_size: u32,
++        buf: []u16,
++    ) HRESULT {
++        return self.vtable.GetFilePathFromKey(self, key, key_size, buf.ptr, @intCast(buf.len));
++    }
++
++    pub inline fn Release(self: *IDWriteLocalFontFileLoader) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++/// A font file, however it was referenced.
+ pub const IDWriteFontFile = extern struct {
+     vtable: *const VTable,
+ 
+@@ -1198,8 +1272,32 @@ pub const IDWriteFontFile = extern struct {
+         QueryInterface: *const fn (*IDWriteFontFile, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+         AddRef: *const fn (*IDWriteFontFile) callconv(.winapi) u32,
+         Release: *const fn (*IDWriteFontFile) callconv(.winapi) u32,
++        // 3: the key is loader-defined and only meaningful back to that loader.
++        GetReferenceKey: *const fn (
++            *IDWriteFontFile,
++            *?*const anyopaque,
++            *u32,
++        ) callconv(.winapi) HRESULT,
++        // 4: returns the base IDWriteFontFileLoader. Typed as IUnknown here on
++        // purpose, so callers cannot skip the QueryInterface below - an
++        // in-memory or otherwise custom loader has no GetFilePathFromKey, and
++        // calling it anyway would run off the end of that object's vtable.
++        GetLoader: *const fn (*IDWriteFontFile, *?*IUnknown) callconv(.winapi) HRESULT,
++        Analyze: Reserved,
+     };
+ 
++    pub inline fn GetReferenceKey(
++        self: *IDWriteFontFile,
++        key: *?*const anyopaque,
++        size: *u32,
++    ) HRESULT {
++        return self.vtable.GetReferenceKey(self, key, size);
++    }
++
++    pub inline fn GetLoader(self: *IDWriteFontFile, out: *?*IUnknown) HRESULT {
++        return self.vtable.GetLoader(self, out);
++    }
++
+     pub inline fn Release(self: *IDWriteFontFile) u32 {
+         return self.vtable.Release(self);
+     }
+diff --git a/src/font/library.zig b/src/font/library.zig
+index bd4c03235..b7f1ab24b 100644
+--- a/src/font/library.zig
++++ b/src/font/library.zig
+@@ -246,6 +246,57 @@ pub const DirectWriteLibrary = struct {
+         return face;
+     }
+ 
++    /// The on-disk path of a font face, written into `buf` as UTF-8, or null
++    /// when the face is not backed by a local file.
++    ///
++    /// Null is an ordinary answer, not a failure: a face created through the
++    /// in-memory loader has no path, and asking is the documented way to find
++    /// that out.
++    pub fn facePath(self: *const Library, face: *dw.IDWriteFontFace, buf: []u8) !?[]const u8 {
++        _ = self;
++
++        // A face can span several files only for OpenType collections; the
++        // first is the one that backs it.
++        var count: u32 = 0;
++        if (dw.FAILED(face.GetFiles(&count, null)) or count == 0) return null;
++        var files: [1]?*dw.IDWriteFontFile = .{null};
++        count = 1;
++        if (dw.FAILED(face.GetFiles(&count, &files)) or files[0] == null) return null;
++        const file = files[0].?;
++        defer _ = file.Release();
++
++        var key: ?*const anyopaque = null;
++        var key_size: u32 = 0;
++        if (dw.FAILED(file.GetReferenceKey(&key, &key_size)) or key == null) return null;
++
++        var loader: ?*dw.IUnknown = null;
++        if (dw.FAILED(file.GetLoader(&loader)) or loader == null) return null;
++        defer _ = loader.?.Release();
++
++        // The QI is the test for "backed by a file at all" - it fails for the
++        // in-memory loader, which is exactly the case we want to report as null.
++        var local_o: ?*anyopaque = null;
++        if (dw.FAILED(loader.?.vtable.QueryInterface(
++            loader.?,
++            &dw.IDWriteLocalFontFileLoader.IID,
++            &local_o,
++        )) or local_o == null) return null;
++        const local: *dw.IDWriteLocalFontFileLoader = @ptrCast(@alignCast(local_o.?));
++        defer _ = local.Release();
++
++        var len: u32 = 0;
++        if (dw.FAILED(local.GetFilePathLengthFromKey(key.?, key_size, &len))) return null;
++
++        var wide: [512]u16 = undefined;
++        // The length excludes the terminator but the buffer must have room for
++        // it, so this needs len + 1 and not len.
++        if (len + 1 > wide.len) return null;
++        if (dw.FAILED(local.GetFilePathFromKey(key.?, key_size, wide[0 .. len + 1]))) return null;
++
++        const n = std.unicode.utf16LeToUtf8(buf, wide[0..len]) catch return null;
++        return buf[0..n];
++    }
++
+     pub fn deinit(self: *Library) void {
+         self.alloc.destroy(self.mutex);
+         _ = self.wic_factory.Release();
+@@ -264,6 +315,7 @@ test "system font fallback" {
+ 
+     const testing = std.testing;
+     const dw = @import("face/dwrite/api.zig");
++    const global = @import("../global.zig");
+ 
+     var lib = try Library.init(testing.allocator);
+     defer lib.deinit();
+@@ -288,5 +340,19 @@ test "system font fallback" {
+         var idx = [_]u16{0};
+         try testing.expect(dw.SUCCEEDED(face.GetGlyphIndices(&cps, &idx)));
+         try testing.expect(idx[0] != 0); // 0 is .notdef
++
++        // A system fallback font is always a file on disk, and the path is what
++        // discovery will hand to Face.initFile. Checking the file opens proves
++        // the loader key round-tripped rather than merely returning a string.
++        var buf: [512]u8 = undefined;
++        const path = (try lib.facePath(face, &buf)) orelse {
++            std.debug.print("no path for U+{X}\n", .{cp});
++            return error.TestUnexpectedResult;
++        };
++        try testing.expect(path.len > 0);
++        std.Io.Dir.accessAbsolute(global.io(), path, .{}) catch |err| {
++            std.debug.print("U+{X} -> {s}: {}\n", .{ cp, path, err });
++            return error.TestUnexpectedResult;
++        };
+     }
+ }
