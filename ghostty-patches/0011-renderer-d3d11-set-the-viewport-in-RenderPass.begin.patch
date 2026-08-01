@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Fri, 31 Jul 2026 23:43:00 -0700
+Subject: [PATCH] renderer/d3d11: set the viewport in RenderPass.begin
+
+Nothing the pipelines drew was ever visible. D3D11 starts with no viewport
+bound, and the only function that called RSSetViewports - Device.bindRenderTarget
+- had no callers at all.
+
+This failed in the most misleading way available: ClearRenderTargetView ignores
+the viewport, so the surface cleared correctly and looked healthy, while every
+draw was clipped away in its entirety. The backend submitted a full frame each
+time (bg_color, cell_bg, and cell_text with ~98 instanced glyph quads, all with
+valid shaders, buffers and atlas textures bound) and produced no pixels, with
+no D3D error anywhere, because being clipped by an empty viewport is not an
+error.
+
+The viewport now comes from the first attachment rather than the device size,
+so render passes that target an offscreen texture - the post-processing chain -
+get the texture's dimensions instead of the swapchain's.
+
+Verified by making bg_color output magenta and capturing the window: the client
+area went fully magenta with the cmd.exe banner, prompt and cursor drawn over
+it in JetBrains Mono. Reverted, the same window renders the shell on the normal
+dark background.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/renderer/directx11/RenderPass.zig | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/src/renderer/directx11/RenderPass.zig b/src/renderer/directx11/RenderPass.zig
+index 35098262d..23083c379 100644
+--- a/src/renderer/directx11/RenderPass.zig
++++ b/src/renderer/directx11/RenderPass.zig
+@@ -122,6 +122,30 @@ pub fn begin(opts: Options) Self {
+ 
+     ctx.OMSetRenderTargets(rtvs[0..count], null);
+ 
++    // Set the viewport to match the first attachment.
++    //
++    // This is not optional and its absence is not obvious: D3D11 starts with
++    // no viewport bound, and `ClearRenderTargetView` ignores the viewport
++    // while every draw is clipped entirely by it. A missing viewport
++    // therefore looks exactly like a correctly cleared surface that refuses
++    // to draw anything - which is precisely what it did, with the pipelines
++    // submitting geometry every frame and nothing appearing.
++    if (opts.attachments.len > 0) {
++        const dims: struct { w: usize, h: usize } = switch (opts.attachments[0].target) {
++            .target => |t| .{ .w = t.width, .h = t.height },
++            .texture => |t| .{ .w = t.width, .h = t.height },
++        };
++        const viewport: d3d11.D3D11_VIEWPORT = .{
++            .TopLeftX = 0,
++            .TopLeftY = 0,
++            .Width = @floatFromInt(dims.w),
++            .Height = @floatFromInt(dims.h),
++            .MinDepth = 0,
++            .MaxDepth = 1,
++        };
++        ctx.RSSetViewports(&.{viewport});
++    }
++
+     return .{ .api = opts.api, .attachments = opts.attachments };
+ }
+ 

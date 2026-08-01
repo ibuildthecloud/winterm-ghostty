@@ -1,0 +1,306 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Fri, 31 Jul 2026 22:33:18 -0700
+Subject: [PATCH] renderer/d3d11: structured buffers for the cell data the
+ shaders index
+
+Groundwork for the cell pipelines. The cell shaders need random access to
+their data, not vertex attributes: cell_bg looks up an arbitrary cell from the
+fragment's grid position, and cell_text indexes by instance ID. Both generate
+their vertices from SV_VertexID, so there is no vertex buffer and no input
+layout to build. On D3D11 that means a shader resource view over a structured
+buffer, which is what the GLSL backend spells as an std430 readonly buffer.
+
+Buffers therefore carry a Binding (buffer + optional SRV) rather than a bare
+ID3D11Buffer, so the view cannot drift from the buffer when growth reallocates
+it. That is a real hazard here: sync() and syncFromArrayLists() both replace
+the buffer when the grid grows, and a stale SRV would keep rendering the old
+contents rather than fail. releaseBinding drops the view before the buffer,
+since the view holds a reference to it.
+
+Step now takes Binding for uniforms and buffers. The field names generic.zig
+reaches for are unchanged, so no shared code moved.
+
+Adds D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_BUFFER_SRV, D3D11_SRV_DIMENSION
+and D3D11_RESOURCE_MISC_BUFFER_STRUCTURED. A structured buffer view must use
+DXGI_FORMAT_UNKNOWN and take its element size from StructureByteStride;
+supplying a real format silently produces a typed buffer view instead.
+
+Builds clean and the directx11 tests pass (72). Nothing draws yet - Pipeline
+is still empty and RenderPass.step is still a no-op, so the phase1_skeleton
+markers stay until the HLSL and pipeline objects land.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/renderer/D3D11.zig                |  9 ++-
+ src/renderer/directx11/RenderPass.zig |  5 +-
+ src/renderer/directx11/buffer.zig     | 81 +++++++++++++++++++++++----
+ src/renderer/directx11/d3d11.zig      | 28 +++++++++
+ 4 files changed, 108 insertions(+), 15 deletions(-)
+
+diff --git a/src/renderer/D3D11.zig b/src/renderer/D3D11.zig
+index b6ed97cb1..97e27f81f 100644
+--- a/src/renderer/D3D11.zig
++++ b/src/renderer/D3D11.zig
+@@ -335,11 +335,18 @@ pub fn resize(self: *D3D11, width: u32, height: u32) !void {
+ }
+ 
+ /// Returns the options to use when constructing buffers.
++/// Per-instance and per-cell data the shaders index directly.
++///
++/// These are structured buffers rather than vertex buffers because the cell
++/// shaders need random access: `cell_bg` looks up an arbitrary cell from the
++/// fragment's grid position, and `cell_text` indexes by instance ID rather
++/// than receiving attributes. Both draw calls generate their own vertices
++/// from `SV_VertexID`, so there is no vertex buffer and no input layout.
+ pub inline fn bufferOptions(self: D3D11) bufferpkg.Options {
+     return .{
+         .device = self.device.device,
+         .context = self.device.context,
+-        .bind = .vertex,
++        .bind = .structured,
+     };
+ }
+ 
+diff --git a/src/renderer/directx11/RenderPass.zig b/src/renderer/directx11/RenderPass.zig
+index d70356af9..91f9c417f 100644
+--- a/src/renderer/directx11/RenderPass.zig
++++ b/src/renderer/directx11/RenderPass.zig
+@@ -19,6 +19,7 @@ const Texture = @import("Texture.zig");
+ const shaders = @import("shaders.zig");
+ const Pipeline = shaders.Pipeline;
+ const Buffer = @import("buffer.zig").Buffer;
++const Binding = @import("buffer.zig").Binding;
+ 
+ const log = std.log.scoped(.directx11);
+ 
+@@ -49,8 +50,8 @@ pub const Options = struct {
+ /// `step`'s body without reshaping callers in `generic.zig`.
+ pub const Step = struct {
+     pipeline: Pipeline,
+-    uniforms: ?*d3d11.ID3D11Buffer = null,
+-    buffers: []const ?*d3d11.ID3D11Buffer = &.{},
++    uniforms: ?Binding = null,
++    buffers: []const ?Binding = &.{},
+     textures: []const ?Texture = &.{},
+     samplers: []const ?Sampler = &.{},
+     draw: Draw,
+diff --git a/src/renderer/directx11/buffer.zig b/src/renderer/directx11/buffer.zig
+index 07650bb8a..beb1d170f 100644
+--- a/src/renderer/directx11/buffer.zig
++++ b/src/renderer/directx11/buffer.zig
+@@ -25,16 +25,35 @@ pub const Options = struct {
+     pub const Bind = enum {
+         vertex,
+         constant,
++        /// A `StructuredBuffer<T>` the shaders index directly.
++        ///
++        /// The cell shaders do not read their data as vertex attributes: the
++        /// background shader looks up an arbitrary cell from the fragment's
++        /// grid position, and the text shader indexes by instance. Both need
++        /// random access, which on D3D11 means a shader resource view over a
++        /// structured buffer. This is what the GLSL backend expresses as an
++        /// std430 readonly buffer.
++        structured,
+ 
+         fn flag(self: Bind) u32 {
+             return switch (self) {
+                 .vertex => d3d11.D3D11_BIND_VERTEX_BUFFER,
+                 .constant => d3d11.D3D11_BIND_CONSTANT_BUFFER,
++                .structured => d3d11.D3D11_BIND_SHADER_RESOURCE,
+             };
+         }
+     };
+ };
+ 
++/// What a render pass binds. Carries the view alongside the buffer because
++/// D3D11 binds structured buffers through an SRV, not the buffer itself, and
++/// the two must not drift apart when a buffer is reallocated on growth.
++pub const Binding = struct {
++    buf: *d3d11.ID3D11Buffer,
++    /// Non-null only for `.structured` buffers.
++    srv: ?*d3d11.ID3D11ShaderResourceView = null,
++};
++
+ pub const Error = error{
+     BufferCreationFailed,
+     MapFailed,
+@@ -44,7 +63,7 @@ pub fn Buffer(comptime T: type) type {
+     return struct {
+         const Self = @This();
+ 
+-        buffer: *d3d11.ID3D11Buffer,
++        buffer: Binding,
+         opts: Options,
+ 
+         /// Current allocated length of the data store, in units of `T`.
+@@ -60,11 +79,19 @@ pub fn Buffer(comptime T: type) type {
+             return .{ .buffer = buffer, .opts = opts, .len = data.len };
+         }
+ 
++        /// Release a binding's COM objects. The SRV must go first: it holds a
++        /// reference to the buffer, so releasing in the other order leaves the
++        /// buffer alive until the view is dropped.
++        fn releaseBinding(b: Binding) void {
++            if (b.srv) |srv| _ = srv.Release();
++            _ = b.buf.Release();
++        }
++
+         fn create(
+             opts: Options,
+             len: usize,
+             data: ?[]const T,
+-        ) Error!*d3d11.ID3D11Buffer {
++        ) Error!Binding {
+             // A zero-byte buffer is invalid in D3D11, and the renderer does
+             // ask for empty buffers before it knows the grid size.
+             const count = @max(len, 1);
+@@ -75,13 +102,19 @@ pub fn Buffer(comptime T: type) type {
+                 byte_width = std.mem.alignForward(u32, byte_width, 16);
+             }
+ 
++            const structured = opts.bind == .structured;
+             const desc: d3d11.D3D11_BUFFER_DESC = .{
+                 .ByteWidth = byte_width,
+                 .Usage = .DYNAMIC,
+                 .BindFlags = opts.bind.flag(),
+                 .CPUAccessFlags = d3d11.D3D11_CPU_ACCESS_WRITE,
+-                .MiscFlags = 0,
+-                .StructureByteStride = 0,
++                .MiscFlags = if (structured)
++                    d3d11.D3D11_RESOURCE_MISC_BUFFER_STRUCTURED
++                else
++                    0,
++                // Required to be the element size for structured buffers, and
++                // required to be zero for everything else.
++                .StructureByteStride = if (structured) @sizeOf(T) else 0,
+             };
+ 
+             var initial: d3d11.D3D11_SUBRESOURCE_DATA = undefined;
+@@ -102,11 +135,35 @@ pub fn Buffer(comptime T: type) type {
+                 log.err("failed to create {d}-byte buffer", .{byte_width});
+                 return Error.BufferCreationFailed;
+             }
+-            return buffer.?;
++            errdefer _ = buffer.?.Release();
++
++            if (!structured) return .{ .buf = buffer.? };
++
++            const srv_desc: d3d11.D3D11_SHADER_RESOURCE_VIEW_DESC = .{
++                // A structured buffer's view is typeless; the element count and
++                // the stride in the buffer desc describe it.
++                .Format = .UNKNOWN,
++                .ViewDimension = .BUFFER,
++                .u = .{ .Buffer = .{
++                    .FirstElement = 0,
++                    .NumElements = @intCast(count),
++                } },
++            };
++            var srv: ?*d3d11.ID3D11ShaderResourceView = null;
++            if (com.FAILED(opts.device.CreateShaderResourceView(
++                @ptrCast(buffer.?),
++                &srv_desc,
++                &srv,
++            )) or srv == null) {
++                log.err("failed to create SRV for {d}-element buffer", .{count});
++                return Error.BufferCreationFailed;
++            }
++
++            return .{ .buf = buffer.?, .srv = srv };
+         }
+ 
+         pub fn deinit(self: Self) void {
+-            _ = self.buffer.Release();
++            releaseBinding(self.buffer);
+         }
+ 
+         /// Sync new contents to the buffer. The data is expected to be the
+@@ -117,7 +174,7 @@ pub fn Buffer(comptime T: type) type {
+                 // a steadily growing grid does not reallocate every frame.
+                 const new_len = data.len * 2;
+                 const new_buffer = try create(self.opts, new_len, null);
+-                _ = self.buffer.Release();
++                releaseBinding(self.buffer);
+                 self.buffer = new_buffer;
+                 self.len = new_len;
+             }
+@@ -136,7 +193,7 @@ pub fn Buffer(comptime T: type) type {
+             if (total > self.len) {
+                 const new_len = total * 2;
+                 const new_buffer = try create(self.opts, new_len, null);
+-                _ = self.buffer.Release();
++                releaseBinding(self.buffer);
+                 self.buffer = new_buffer;
+                 self.len = new_len;
+             }
+@@ -146,13 +203,13 @@ pub fn Buffer(comptime T: type) type {
+             // WRITE_DISCARD.
+             var mapped: d3d11.D3D11_MAPPED_SUBRESOURCE = undefined;
+             if (com.FAILED(self.opts.context.Map(
+-                @ptrCast(self.buffer),
++                @ptrCast(self.buffer.buf),
+                 0,
+                 .WRITE_DISCARD,
+                 0,
+                 &mapped,
+             ))) return Error.MapFailed;
+-            defer self.opts.context.Unmap(@ptrCast(self.buffer), 0);
++            defer self.opts.context.Unmap(@ptrCast(self.buffer.buf), 0);
+ 
+             const dst: [*]T = @ptrCast(@alignCast(mapped.pData));
+             var i: usize = 0;
+@@ -169,13 +226,13 @@ pub fn Buffer(comptime T: type) type {
+ 
+             var mapped: d3d11.D3D11_MAPPED_SUBRESOURCE = undefined;
+             if (com.FAILED(self.opts.context.Map(
+-                @ptrCast(self.buffer),
++                @ptrCast(self.buffer.buf),
+                 0,
+                 .WRITE_DISCARD,
+                 0,
+                 &mapped,
+             ))) return Error.MapFailed;
+-            defer self.opts.context.Unmap(@ptrCast(self.buffer), 0);
++            defer self.opts.context.Unmap(@ptrCast(self.buffer.buf), 0);
+ 
+             const dst: [*]T = @ptrCast(@alignCast(mapped.pData));
+             @memcpy(dst[offset .. offset + data.len], data);
+diff --git a/src/renderer/directx11/d3d11.zig b/src/renderer/directx11/d3d11.zig
+index b72215851..7a4636304 100644
+--- a/src/renderer/directx11/d3d11.zig
++++ b/src/renderer/directx11/d3d11.zig
+@@ -56,6 +56,34 @@ pub const D3D11_BIND_CONSTANT_BUFFER: D3D11_BIND_FLAG = 0x4;
+ pub const D3D11_BIND_SHADER_RESOURCE: D3D11_BIND_FLAG = 0x8;
+ pub const D3D11_BIND_RENDER_TARGET: D3D11_BIND_FLAG = 0x20;
+ 
++pub const D3D11_RESOURCE_MISC_BUFFER_STRUCTURED: u32 = 0x40;
++
++/// Subset of D3D11_SRV_DIMENSION. Only the cases we create views for.
++pub const D3D11_SRV_DIMENSION = enum(u32) {
++    UNKNOWN = 0,
++    BUFFER = 1,
++    TEXTURE2D = 4,
++};
++
++pub const D3D11_BUFFER_SRV = extern struct {
++    FirstElement: u32 = 0,
++    NumElements: u32 = 0,
++};
++
++/// A structured buffer's view. `Format` must be UNKNOWN and the element size
++/// comes from the buffer's `StructureByteStride`; giving a real format here is
++/// how you accidentally get a typed buffer view instead.
++pub const D3D11_SHADER_RESOURCE_VIEW_DESC = extern struct {
++    Format: dxgi.DXGI_FORMAT,
++    ViewDimension: D3D11_SRV_DIMENSION,
++    /// The union from the C header. Buffer views use the first two fields;
++    /// it is sized to the largest member (four UINTs, e.g. TEX2D_ARRAY).
++    u: extern union {
++        Buffer: D3D11_BUFFER_SRV,
++        _pad: [4]u32,
++    },
++};
++
+ pub const D3D11_CPU_ACCESS_FLAG = u32;
+ pub const D3D11_CPU_ACCESS_WRITE: D3D11_CPU_ACCESS_FLAG = 0x10000;
+ pub const D3D11_CPU_ACCESS_READ: D3D11_CPU_ACCESS_FLAG = 0x20000;

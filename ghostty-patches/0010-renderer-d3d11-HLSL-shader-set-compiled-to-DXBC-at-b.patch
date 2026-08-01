@@ -1,0 +1,1100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Fri, 31 Jul 2026 23:00:54 -0700
+Subject: [PATCH] renderer/d3d11: HLSL shader set, compiled to DXBC at build
+ time
+
+Adds the bg_color, cell_bg and cell_text shaders, an FxcStep that compiles
+them, real Pipeline objects, and a RenderPass.step that actually issues draws.
+
+Compiled at build time rather than runtime so there is no dependency on the
+d3dcompiler redistributable, mirroring how the Metal backend ships a prebuilt
+metallib. fxc rather than dxc because D3D11 loads DXBC and dxc only emits
+DXIL, which is D3D12-only (DESIGN.md). FxcStep locates fxc by scanning the
+SDK's versioned bin directories, since it is not on PATH outside a developer
+command prompt; FXC overrides.
+
+Layout, verified rather than assumed
+------------------------------------
+GenericRenderer writes one byte layout for every backend, so a mismatch
+between the Globals cbuffer and Uniforms is a wrong-field read, not a compile
+error. Every field carries an explicit packoffset, and the compiled reflection
+was checked against the Zig struct field by field: projection_matrix 0,
+screen_size 64, cell_size 72, grid_size 80, grid_padding 96, padding_extend
+112, min_contrast 116, cursor_pos 120, cursor_color 124, bg_color 128, bools
+132. CellText reflects at stride 32 with members at 0/8/16/20/24/28, matching
+@sizeOf(CellText) and the buffer's StructureByteStride.
+
+Two things that differ from the GLSL and would have been silent if copied:
+
+- `bools` is four separate BYTES here, not a bitmask. Porting the GLSL's
+  `bools & USE_LINEAR_BLENDING` test verbatim would read the wrong flag.
+- `Mat` stores columns, which matches HLSL's default column_major cbuffer
+  packing, so mul(M, v) is the right order.
+
+Guarding pow
+------------
+fxc /WX rejected pow() on a possibly-negative base in linearize/unlinearize.
+That is a real defect and not just a pedantic warning: HLSL's lerp evaluates
+both branches, so a NaN from the branch the cutoff does not select still
+propagates rather than being discarded. The premultiplied paths divide by
+alpha before calling these, so a zero-alpha pixel can reach them. Inputs are
+now clamped non-negative.
+
+Also binds Draw, PSSetConstantBuffers, VSSetShaderResources, CreateBlendState
+and OMSetBlendState, which were all Reserved vtable stubs, plus ID3D11BlendState
+and the blend descriptors. Blending is premultiplied-alpha (ONE / INV_SRC_ALPHA)
+because every shader outputs premultiplied color.
+
+Register assignment is by fixed convention - t0/t1 buffers, t2/t3 atlases,
+b0 uniforms - so HLSL register numbers do not shift with how many bindings a
+step happens to pass. A step whose pipeline has no shaders is skipped, which
+is how the not-yet-ported image and bg_image pipelines stay harmless.
+
+Status: builds, all six shaders compile, directx11 tests pass (72). It does
+NOT yet put glyphs on screen - the hwnd-host harness still renders a uniform
+background. Cause not yet identified; Shaders.init succeeds and logs no error,
+and a viewport is set. The phase1_skeleton markers therefore stay, since
+removing them would claim a working draw path that is not proven.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/build/FxcStep.zig                    | 103 ++++++++++++++
+ src/build/SharedDeps.zig                 |  41 ++++++
+ src/renderer/D3D11.zig                   |   2 +-
+ src/renderer/directx11/RenderPass.zig    |  67 ++++++++-
+ src/renderer/directx11/d3d11.zig         | 117 ++++++++++++++-
+ src/renderer/directx11/shaders.zig       | 101 ++++++++++++-
+ src/renderer/shaders/hlsl/bg_color.hlsl  |  14 ++
+ src/renderer/shaders/hlsl/cell_bg.hlsl   |  59 ++++++++
+ src/renderer/shaders/hlsl/cell_text.hlsl | 160 +++++++++++++++++++++
+ src/renderer/shaders/hlsl/common.hlsli   | 174 +++++++++++++++++++++++
+ 10 files changed, 822 insertions(+), 16 deletions(-)
+ create mode 100644 src/build/FxcStep.zig
+ create mode 100644 src/renderer/shaders/hlsl/bg_color.hlsl
+ create mode 100644 src/renderer/shaders/hlsl/cell_bg.hlsl
+ create mode 100644 src/renderer/shaders/hlsl/cell_text.hlsl
+ create mode 100644 src/renderer/shaders/hlsl/common.hlsli
+
+diff --git a/src/build/FxcStep.zig b/src/build/FxcStep.zig
+new file mode 100644
+index 000000000..cac520b06
+--- /dev/null
++++ b/src/build/FxcStep.zig
+@@ -0,0 +1,103 @@
++/// A zig build step that compiles one HLSL entry point into a DXBC blob with
++/// `fxc` from the Windows SDK.
++///
++/// D3D11 consumes DXBC and only DXBC. `dxc` emits DXIL, which is D3D12-only, so
++/// this deliberately uses the older compiler rather than the newer one.
++///
++/// One step per entry point, because `fxc` compiles a single entry point and
++/// profile per invocation. This is the D3D11 counterpart of `MetallibStep`.
++const FxcStep = @This();
++
++const std = @import("std");
++const Step = std.Build.Step;
++const RunStep = std.Build.Step.Run;
++const LazyPath = std.Build.LazyPath;
++
++pub const Options = struct {
++    /// Name for the output blob, used for the step name too.
++    name: []const u8,
++
++    /// The .hlsl source file.
++    source: LazyPath,
++
++    /// Entry point function, e.g. "vs_main".
++    entry: []const u8,
++
++    /// Shader profile, e.g. "vs_5_0". Must be a Shader Model 5 profile: that
++    /// is the highest DXBC supports, and D3D11 cannot load anything newer.
++    profile: []const u8,
++
++    /// Directory searched for `#include`. `fxc` already resolves quoted
++    /// includes relative to the including file, but the sources are reached
++    /// through a LazyPath, so this is passed explicitly.
++    include: ?LazyPath = null,
++};
++
++step: *Step,
++output: LazyPath,
++
++pub fn create(b: *std.Build, opts: Options) *FxcStep {
++    const self = b.allocator.create(FxcStep) catch @panic("OOM");
++
++    const run = RunStep.create(b, b.fmt("fxc {s}", .{opts.name}));
++    run.addArg(findFxc(b));
++    run.addArgs(&.{
++        "/nologo",
++        // Warnings are errors here for the same reason they are in the Zig
++        // code: an implicit truncation in a shader is a silently wrong pixel.
++        "/WX",
++        "/T",
++        opts.profile,
++        "/E",
++        opts.entry,
++    });
++    if (opts.include) |inc| {
++        run.addArg("/I");
++        run.addDirectoryArg(inc);
++    }
++    run.addArg("/Fo");
++    const output = run.addOutputFileArg(b.fmt("{s}.cso", .{opts.name}));
++    run.addFileArg(opts.source);
++
++    self.* = .{ .step = &run.step, .output = output };
++    return self;
++}
++
++/// Locate `fxc.exe`.
++///
++/// It ships in the Windows SDK and is not on PATH outside a developer command
++/// prompt, so fall back to scanning the SDK's versioned bin directories and
++/// take the newest. `FXC` overrides for unusual setups.
++fn findFxc(b: *std.Build) []const u8 {
++    if (b.graph.environ_map.get("FXC")) |p| return b.dupe(p);
++
++    const roots = [_][]const u8{
++        "C:\\Program Files (x86)\\Windows Kits\\10\\bin",
++        "C:\\Program Files\\Windows Kits\\10\\bin",
++    };
++    const io = b.graph.io;
++    var best: ?[]const u8 = null;
++    var best_name: []const u8 = "";
++    for (roots) |root| {
++        var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch continue;
++        defer dir.close(io);
++        var it = dir.iterate();
++        while (it.next(io) catch null) |entry| {
++            if (entry.kind != .directory) continue;
++            // Versioned SDK directories only, e.g. "10.0.26100.0".
++            if (!std.mem.startsWith(u8, entry.name, "10.")) continue;
++            const candidate = b.fmt("{s}\\{s}\\x64\\fxc.exe", .{ root, entry.name });
++            std.Io.Dir.accessAbsolute(io, candidate, .{}) catch continue;
++            // Lexicographic ordering is good enough to pick the newest here:
++            // the components are zero-padded in practice.
++            if (best == null or std.mem.order(u8, entry.name, best_name) == .gt) {
++                best = candidate;
++                best_name = b.dupe(entry.name);
++            }
++        }
++    }
++
++    // Falling back to a bare name lets a developer command prompt work, and
++    // produces a clear "not found" from the run step otherwise.
++    return best orelse "fxc.exe";
++}
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index 86cfecc05..a25f90cf8 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -6,6 +6,24 @@ const builtin = @import("builtin");
+ const Config = @import("Config.zig");
+ const HelpStrings = @import("HelpStrings.zig");
+ const MetallibStep = @import("MetallibStep.zig");
++const FxcStep = @import("FxcStep.zig");
++
++/// The D3D11 shader set. `import` is the name the renderer `@embedFile`s.
++const HlslShader = struct {
++    import: []const u8,
++    file: []const u8,
++    entry: []const u8,
++    profile: []const u8,
++};
++
++const hlsl_shaders = [_]HlslShader{
++    .{ .import = "ghostty_hlsl_bg_color_vs", .file = "bg_color", .entry = "vs_main", .profile = "vs_5_0" },
++    .{ .import = "ghostty_hlsl_bg_color_ps", .file = "bg_color", .entry = "ps_main", .profile = "ps_5_0" },
++    .{ .import = "ghostty_hlsl_cell_bg_vs", .file = "cell_bg", .entry = "vs_main", .profile = "vs_5_0" },
++    .{ .import = "ghostty_hlsl_cell_bg_ps", .file = "cell_bg", .entry = "ps_main", .profile = "ps_5_0" },
++    .{ .import = "ghostty_hlsl_cell_text_vs", .file = "cell_text", .entry = "vs_main", .profile = "vs_5_0" },
++    .{ .import = "ghostty_hlsl_cell_text_ps", .file = "cell_text", .entry = "ps_main", .profile = "ps_5_0" },
++};
+ const UnicodeTables = @import("UnicodeTables.zig");
+ const GhosttyFrameData = @import("GhosttyFrameData.zig");
+ const DistResource = @import("GhosttyDist.zig").Resource;
+@@ -505,6 +523,29 @@ pub fn add(
+         });
+     }
+ 
++    // D3D11 shaders. Compiled here rather than at runtime so there is no
++    // dependency on the d3dcompiler redistributable, matching how the Metal
++    // backend ships a prebuilt metallib.
++    if (step.rootModuleTarget().os.tag == .windows) {
++        const hlsl_dir = b.path("src/renderer/shaders/hlsl");
++        for (hlsl_shaders) |shader| {
++            const fxc = FxcStep.create(b, .{
++                .name = shader.import,
++                .source = b.path(b.fmt(
++                    "src/renderer/shaders/hlsl/{s}.hlsl",
++                    .{shader.file},
++                )),
++                .entry = shader.entry,
++                .profile = shader.profile,
++                .include = hlsl_dir,
++            });
++            fxc.output.addStepDependencies(&step.step);
++            step.root_module.addAnonymousImport(shader.import, .{
++                .root_source_file = fxc.output,
++            });
++        }
++    }
++
+     // Other dependencies, mostly pure Zig
+     if (b.lazyDependency("opengl", .{})) |dep| {
+         step.root_module.addImport("opengl", dep.module("opengl"));
+diff --git a/src/renderer/D3D11.zig b/src/renderer/D3D11.zig
+index 97e27f81f..40da6a978 100644
+--- a/src/renderer/D3D11.zig
++++ b/src/renderer/D3D11.zig
+@@ -242,7 +242,7 @@ pub fn initShaders(
+     custom_shaders: []const [:0]const u8,
+ ) !shaders.Shaders {
+     _ = alloc;
+-    return try shaders.Shaders.init(self.alloc, custom_shaders);
++    return try shaders.Shaders.init(self.alloc, self.device.device, custom_shaders);
+ }
+ 
+ /// Get the current size of the runtime surface.
+diff --git a/src/renderer/directx11/RenderPass.zig b/src/renderer/directx11/RenderPass.zig
+index 91f9c417f..35098262d 100644
+--- a/src/renderer/directx11/RenderPass.zig
++++ b/src/renderer/directx11/RenderPass.zig
+@@ -127,13 +127,70 @@ pub fn begin(opts: Options) Self {
+ 
+ /// Add a step to this render pass.
+ ///
+-/// phase1_skeleton: no-op. Issuing a draw needs a compiled pipeline, an input
+-/// layout, and a bound glyph atlas, none of which exist before Phase 3.
+-/// Silently ignoring steps is what lets `GenericRenderer.drawFrame` run
+-/// end-to-end and produce a correctly cleared, correctly sized surface now.
++/// Shader resource registers are assigned by a fixed convention rather than by
++/// packing the two lists end to end, so that the HLSL register numbers stay
++/// the same no matter how many bindings a given step happens to supply:
++///
++///   t0, t1  `buffers[0]`, `buffers[1]`   (structured buffers)
++///   t2, t3  `textures[0]`, `textures[1]` (grayscale atlas, color atlas)
++///   b0      `uniforms`
++///   s0..    `samplers`
++///
++/// A step whose pipeline has no shaders is skipped. That is how the not-yet
++/// ported `image` and `bg_image` pipelines stay harmless instead of drawing
++/// with whatever was bound last.
+ pub fn step(self: *Self, s: Step) void {
+-    _ = s;
+     self.step_number += 1;
++
++    const vs = s.pipeline.vs orelse return;
++    const ps = s.pipeline.ps orelse return;
++    const ctx = self.api.device.context;
++
++    ctx.VSSetShader(vs);
++    ctx.PSSetShader(ps);
++    ctx.IASetPrimitiveTopology(s.draw.type.topology());
++
++    if (s.uniforms) |u| {
++        const cbs = [_]?*d3d11.ID3D11Buffer{u.buf};
++        ctx.VSSetConstantBuffers(0, &cbs);
++        ctx.PSSetConstantBuffers(0, &cbs);
++    }
++
++    // Both stages get the same table: the text vertex shader reads the cell
++    // and background buffers, and its pixel shader reads the atlases.
++    var srvs: [4]?*d3d11.ID3D11ShaderResourceView = @splat(null);
++    for (s.buffers, 0..) |maybe, i| {
++        if (i >= 2) break;
++        if (maybe) |b| srvs[i] = b.srv;
++    }
++    for (s.textures, 0..) |maybe, i| {
++        if (i >= 2) break;
++        if (maybe) |t| srvs[2 + i] = t.srv;
++    }
++    ctx.VSSetShaderResources(0, &srvs);
++    ctx.PSSetShaderResources(0, &srvs);
++
++    if (s.samplers.len > 0) {
++        var samplers: [4]?*d3d11.ID3D11SamplerState = @splat(null);
++        for (s.samplers, 0..) |maybe, i| {
++            if (i >= samplers.len) break;
++            if (maybe) |sm| samplers[i] = sm.sampler;
++        }
++        ctx.PSSetSamplers(0, samplers[0..@min(s.samplers.len, samplers.len)]);
++    }
++
++    ctx.OMSetBlendState(s.pipeline.blend);
++
++    if (s.draw.instance_count == 1) {
++        ctx.Draw(@intCast(s.draw.vertex_count), 0);
++    } else {
++        ctx.DrawInstanced(
++            @intCast(s.draw.vertex_count),
++            @intCast(s.draw.instance_count),
++            0,
++            0,
++        );
++    }
+ }
+ 
+ pub fn complete(self: *const Self) void {
+diff --git a/src/renderer/directx11/d3d11.zig b/src/renderer/directx11/d3d11.zig
+index 7a4636304..95afbc84d 100644
+--- a/src/renderer/directx11/d3d11.zig
++++ b/src/renderer/directx11/d3d11.zig
+@@ -436,6 +436,60 @@ pub const ID3D11InputLayout = extern struct {
+     }
+ };
+ 
++pub const D3D11_BLEND = enum(u32) {
++    ZERO = 1,
++    ONE = 2,
++    SRC_COLOR = 3,
++    INV_SRC_COLOR = 4,
++    SRC_ALPHA = 5,
++    INV_SRC_ALPHA = 6,
++    DEST_ALPHA = 7,
++    INV_DEST_ALPHA = 8,
++    DEST_COLOR = 9,
++    INV_DEST_COLOR = 10,
++};
++
++pub const D3D11_BLEND_OP = enum(u32) {
++    ADD = 1,
++    SUBTRACT = 2,
++    REV_SUBTRACT = 3,
++    MIN = 4,
++    MAX = 5,
++};
++
++pub const D3D11_COLOR_WRITE_ENABLE_ALL: u8 = 0x0F;
++
++pub const D3D11_RENDER_TARGET_BLEND_DESC = extern struct {
++    BlendEnable: i32 = 0,
++    SrcBlend: D3D11_BLEND = .ONE,
++    DestBlend: D3D11_BLEND = .ZERO,
++    BlendOp: D3D11_BLEND_OP = .ADD,
++    SrcBlendAlpha: D3D11_BLEND = .ONE,
++    DestBlendAlpha: D3D11_BLEND = .ZERO,
++    BlendOpAlpha: D3D11_BLEND_OP = .ADD,
++    RenderTargetWriteMask: u8 = D3D11_COLOR_WRITE_ENABLE_ALL,
++};
++
++pub const D3D11_BLEND_DESC = extern struct {
++    AlphaToCoverageEnable: i32 = 0,
++    IndependentBlendEnable: i32 = 0,
++    RenderTarget: [8]D3D11_RENDER_TARGET_BLEND_DESC = @splat(.{}),
++};
++
++pub const ID3D11BlendState = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*ID3D11BlendState, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*ID3D11BlendState) callconv(.winapi) u32,
++        Release: *const fn (*ID3D11BlendState) callconv(.winapi) u32,
++    };
++
++    pub inline fn Release(self: *ID3D11BlendState) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
+ pub const ID3D11SamplerState = extern struct {
+     vtable: *const VTable,
+ 
+@@ -603,7 +657,12 @@ pub const ID3D11Device = extern struct {
+         // slot 19
+         CreateClassLinkage: Reserved,
+         // slots 20-22
+-        CreateBlendState: Reserved,
++        // slot 20: CreateBlendState
++        CreateBlendState: *const fn (
++            *ID3D11Device,
++            *const D3D11_BLEND_DESC,
++            *?*ID3D11BlendState,
++        ) callconv(.winapi) HRESULT,
+         CreateDepthStencilState: Reserved,
+         CreateRasterizerState: Reserved,
+         // slot 23
+@@ -678,6 +737,14 @@ pub const ID3D11Device = extern struct {
+         return self.vtable.CreateSamplerState(self, desc, sampler);
+     }
+ 
++    pub inline fn CreateBlendState(
++        self: *ID3D11Device,
++        desc: *const D3D11_BLEND_DESC,
++        state: *?*ID3D11BlendState,
++    ) HRESULT {
++        return self.vtable.CreateBlendState(self, desc, state);
++    }
++
+     pub inline fn CreateRenderTargetView(
+         self: *ID3D11Device,
+         resource: *ID3D11Resource,
+@@ -845,7 +912,11 @@ pub const ID3D11DeviceContext = extern struct {
+         // slot 12: DrawIndexed
+         DrawIndexed: Reserved,
+         // slot 13: Draw
+-        Draw: Reserved,
++        Draw: *const fn (
++            *ID3D11DeviceContext,
++            u32, // VertexCount
++            u32, // StartVertexLocation
++        ) callconv(.winapi) void,
+         // slot 14: Map
+         Map: *const fn (
+             *ID3D11DeviceContext,
+@@ -862,7 +933,12 @@ pub const ID3D11DeviceContext = extern struct {
+             u32, // Subresource
+         ) callconv(.winapi) void,
+         // slot 16: PSSetConstantBuffers
+-        _reserved16: Reserved,
++        PSSetConstantBuffers: *const fn (
++            *ID3D11DeviceContext,
++            u32, // StartSlot
++            u32, // NumBuffers
++            [*]const ?*ID3D11Buffer,
++        ) callconv(.winapi) void,
+         // slot 17: IASetInputLayout
+         IASetInputLayout: *const fn (
+             *ID3D11DeviceContext,
+@@ -899,7 +975,12 @@ pub const ID3D11DeviceContext = extern struct {
+             D3D_PRIMITIVE_TOPOLOGY,
+         ) callconv(.winapi) void,
+         // slot 25: VSSetShaderResources
+-        _reserved25: Reserved,
++        VSSetShaderResources: *const fn (
++            *ID3D11DeviceContext,
++            u32, // StartSlot
++            u32, // NumViews
++            [*]const ?*ID3D11ShaderResourceView,
++        ) callconv(.winapi) void,
+         // slot 26: VSSetSamplers
+         _reserved26: Reserved,
+         // slot 27: Begin
+@@ -924,7 +1005,12 @@ pub const ID3D11DeviceContext = extern struct {
+         // slot 34: OMSetRenderTargetsAndUnorderedAccessViews
+         _reserved34: Reserved,
+         // slot 35: OMSetBlendState
+-        _reserved35: Reserved,
++        OMSetBlendState: *const fn (
++            *ID3D11DeviceContext,
++            ?*ID3D11BlendState,
++            ?*const [4]f32, // blend factor
++            u32, // sample mask
++        ) callconv(.winapi) void,
+         // slot 36: OMSetDepthStencilState
+         _reserved36: Reserved,
+         // slot 37: SOSetTargets
+@@ -1125,6 +1211,18 @@ pub const ID3D11DeviceContext = extern struct {
+         self.vtable.VSSetShader(self, shader, null, 0);
+     }
+ 
++    pub inline fn PSSetConstantBuffers(self: *ID3D11DeviceContext, start_slot: u32, buffers: []const ?*ID3D11Buffer) void {
++        self.vtable.PSSetConstantBuffers(self, start_slot, @intCast(buffers.len), buffers.ptr);
++    }
++
++    pub inline fn VSSetShaderResources(self: *ID3D11DeviceContext, start_slot: u32, views: []const ?*ID3D11ShaderResourceView) void {
++        self.vtable.VSSetShaderResources(self, start_slot, @intCast(views.len), views.ptr);
++    }
++
++    pub inline fn Draw(self: *ID3D11DeviceContext, vertex_count: u32, start_vertex: u32) void {
++        self.vtable.Draw(self, vertex_count, start_vertex);
++    }
++
+     pub inline fn Map(
+         self: *ID3D11DeviceContext,
+         resource: *ID3D11Resource,
+@@ -1176,6 +1274,15 @@ pub const ID3D11DeviceContext = extern struct {
+         self.vtable.OMSetRenderTargets(self, @intCast(rtvs.len), rtvs.ptr, dsv);
+     }
+ 
++    /// Bind a blend state. A null state restores the default (no blending).
++    /// The sample mask must be all-ones or nothing renders.
++    pub inline fn OMSetBlendState(
++        self: *ID3D11DeviceContext,
++        state: ?*ID3D11BlendState,
++    ) void {
++        self.vtable.OMSetBlendState(self, state, null, 0xFFFFFFFF);
++    }
++
+     pub inline fn RSSetViewports(self: *ID3D11DeviceContext, viewports: []const D3D11_VIEWPORT) void {
+         self.vtable.RSSetViewports(self, @intCast(viewports.len), viewports.ptr);
+     }
+diff --git a/src/renderer/directx11/shaders.zig b/src/renderer/directx11/shaders.zig
+index b9f1c8d7d..92665a62c 100644
+--- a/src/renderer/directx11/shaders.zig
++++ b/src/renderer/directx11/shaders.zig
+@@ -15,16 +15,54 @@
+ const std = @import("std");
+ const Allocator = std.mem.Allocator;
+ const math = @import("../../math.zig");
++const com = @import("com.zig");
++const d3d11 = @import("d3d11.zig");
+ 
+ const log = std.log.scoped(.directx11);
+ 
+-/// A single render pipeline (vertex + fragment program pair).
++/// A single render pipeline (vertex + pixel program pair).
+ ///
+-/// Phase 1: an empty placeholder so the `GraphicsAPI` contract compiles. Phase
+-/// 3 replaces this with compiled DXBC shader objects and input layouts.
++/// There is no input layout: every pipeline generates its vertices from
++/// `SV_VertexID` and reads per-cell data out of structured buffers, so nothing
++/// is fed through the input assembler.
+ pub const Pipeline = struct {
++    vs: ?*d3d11.ID3D11VertexShader = null,
++    ps: ?*d3d11.ID3D11PixelShader = null,
++
++    /// Premultiplied-alpha blending, shared between pipelines and owned by
++    /// `Shaders`, so this is borrowed and not released here.
++    blend: ?*d3d11.ID3D11BlendState = null,
++
++    pub fn init(
++        device: *d3d11.ID3D11Device,
++        vs_bytecode: []const u8,
++        ps_bytecode: []const u8,
++        blend: ?*d3d11.ID3D11BlendState,
++    ) !Pipeline {
++        var vs: ?*d3d11.ID3D11VertexShader = null;
++        if (com.FAILED(device.CreateVertexShader(
++            vs_bytecode.ptr,
++            vs_bytecode.len,
++            null,
++            &vs,
++        )) or vs == null) return error.ShaderCreationFailed;
++        errdefer _ = vs.?.Release();
++
++        var ps: ?*d3d11.ID3D11PixelShader = null;
++        if (com.FAILED(device.CreatePixelShader(
++            ps_bytecode.ptr,
++            ps_bytecode.len,
++            null,
++            &ps,
++        )) or ps == null) return error.ShaderCreationFailed;
++
++        return .{ .vs = vs, .ps = ps, .blend = blend };
++    }
++
+     pub fn deinit(self: *Pipeline) void {
+-        _ = self;
++        if (self.ps) |ps| _ = ps.Release();
++        if (self.vs) |vs| _ = vs.Release();
++        self.* = .{};
+     }
+ };
+ 
+@@ -58,8 +96,12 @@ pub const Shaders = struct {
+     /// double-free, matching the OpenGL and Metal implementations.
+     defunct: bool = false,
+ 
++    /// Shared by every pipeline; the individual pipelines borrow it.
++    blend: ?*d3d11.ID3D11BlendState = null,
++
+     pub fn init(
+         alloc: Allocator,
++        device: *d3d11.ID3D11Device,
+         post_shaders: []const [:0]const u8,
+     ) !Shaders {
+         _ = alloc;
+@@ -74,19 +116,68 @@ pub const Shaders = struct {
+             );
+         }
+ 
++        // Every shader outputs premultiplied alpha, so the source is added
++        // whole rather than scaled by its own alpha again. Getting this wrong
++        // shows up as dark fringing around glyph edges rather than as an error.
++        var blend_desc: d3d11.D3D11_BLEND_DESC = .{};
++        blend_desc.RenderTarget[0] = .{
++            .BlendEnable = 1,
++            .SrcBlend = .ONE,
++            .DestBlend = .INV_SRC_ALPHA,
++            .BlendOp = .ADD,
++            .SrcBlendAlpha = .ONE,
++            .DestBlendAlpha = .INV_SRC_ALPHA,
++            .BlendOpAlpha = .ADD,
++            .RenderTargetWriteMask = d3d11.D3D11_COLOR_WRITE_ENABLE_ALL,
++        };
++        var blend: ?*d3d11.ID3D11BlendState = null;
++        if (com.FAILED(device.CreateBlendState(&blend_desc, &blend)) or blend == null) {
++            return error.BlendStateCreationFailed;
++        }
++        errdefer _ = blend.?.Release();
++
++        var pipelines: PipelineCollection = .{};
++        errdefer {
++            inline for (@typeInfo(PipelineCollection).@"struct".fields) |f| {
++                @field(pipelines, f.name).deinit();
++            }
++        }
++
++        pipelines.bg_color = try .init(device, bg_color_vs, bg_color_ps, blend);
++        pipelines.cell_bg = try .init(device, cell_bg_vs, cell_bg_ps, blend);
++        pipelines.cell_text = try .init(device, cell_text_vs, cell_text_ps, blend);
++
++        // image and bg_image still have no HLSL, so they stay empty and their
++        // steps are skipped rather than drawing garbage.
++
+         return .{
+-            .pipelines = .{},
++            .pipelines = pipelines,
+             .post_pipelines = &.{},
++            .blend = blend,
+         };
+     }
+ 
+     pub fn deinit(self: *Shaders, alloc: Allocator) void {
+         if (self.defunct) return;
+         _ = alloc;
++        inline for (@typeInfo(PipelineCollection).@"struct".fields) |f| {
++            @field(self.pipelines, f.name).deinit();
++        }
++        if (self.blend) |b| _ = b.Release();
++        self.blend = null;
+         self.defunct = true;
+     }
+ };
+ 
++// Compiled by `FxcStep` at build time into DXBC. D3D11 loads DXBC only, so
++// these are SM 5.0; see `src/build/FxcStep.zig`.
++const bg_color_vs = @embedFile("ghostty_hlsl_bg_color_vs");
++const bg_color_ps = @embedFile("ghostty_hlsl_bg_color_ps");
++const cell_bg_vs = @embedFile("ghostty_hlsl_cell_bg_vs");
++const cell_bg_ps = @embedFile("ghostty_hlsl_cell_bg_ps");
++const cell_text_vs = @embedFile("ghostty_hlsl_cell_text_vs");
++const cell_text_ps = @embedFile("ghostty_hlsl_cell_text_ps");
++
+ pub const Uniforms = extern struct {
+     // Note: all of the explicit alignments are copied from the Metal
+     // implementation, which copied them from the MSL developer reference.
+diff --git a/src/renderer/shaders/hlsl/bg_color.hlsl b/src/renderer/shaders/hlsl/bg_color.hlsl
+new file mode 100644
+index 000000000..8bd86c012
+--- /dev/null
++++ b/src/renderer/shaders/hlsl/bg_color.hlsl
+@@ -0,0 +1,14 @@
++// Fills the whole surface with the terminal background color.
++// Ported from `glsl/bg_color.f.glsl`.
++#include "common.hlsli"
++
++FullScreenOut vs_main(uint vid : SV_VertexID) {
++    return full_screen_vs(vid);
++}
++
++float4 ps_main(FullScreenOut input) : SV_Target {
++    return load_color(
++        unpack4u8(bg_color_packed),
++        get_bool(BOOL_USE_LINEAR_BLENDING)
++    );
++}
+diff --git a/src/renderer/shaders/hlsl/cell_bg.hlsl b/src/renderer/shaders/hlsl/cell_bg.hlsl
+new file mode 100644
+index 000000000..d64a4d2e5
+--- /dev/null
++++ b/src/renderer/shaders/hlsl/cell_bg.hlsl
+@@ -0,0 +1,59 @@
++// Draws the per-cell background colors.
++// Ported from `glsl/cell_bg.f.glsl`.
++//
++// This runs as a full screen pass that maps each fragment back to a grid cell,
++// which is why the cell colors are a StructuredBuffer rather than vertex data:
++// the lookup index is computed per fragment.
++#include "common.hlsli"
++
++StructuredBuffer<uint> bg_cells : register(t1);
++
++FullScreenOut vs_main(uint vid : SV_VertexID) {
++    return full_screen_vs(vid);
++}
++
++float4 ps_main(FullScreenOut input) : SV_Target {
++    uint2 grid_size = unpack2u16(grid_size_packed);
++    uint extend = padding_extend();
++
++    // `grid_padding` is ordered top, right, bottom, left, so .wx is (left, top).
++    // SV_Position is already upper-left origin in D3D, matching the
++    // `origin_upper_left` layout qualifier the GLSL version has to ask for.
++    int2 grid_pos = int2(floor((input.pos.xy - float2(grid_padding.w, grid_padding.x)) / cell_size));
++
++    float4 transparent = float4(0.0, 0.0, 0.0, 0.0);
++
++    // Clamp x, extending edge colors into the padding when asked.
++    if (grid_pos.x < 0) {
++        if ((extend & EXTEND_LEFT) != 0u) {
++            grid_pos.x = 0;
++        } else {
++            return transparent;
++        }
++    } else if (grid_pos.x > int(grid_size.x) - 1) {
++        if ((extend & EXTEND_RIGHT) != 0u) {
++            grid_pos.x = int(grid_size.x) - 1;
++        } else {
++            return transparent;
++        }
++    }
++
++    if (grid_pos.y < 0) {
++        if ((extend & EXTEND_UP) != 0u) {
++            grid_pos.y = 0;
++        } else {
++            return transparent;
++        }
++    } else if (grid_pos.y > int(grid_size.y) - 1) {
++        if ((extend & EXTEND_DOWN) != 0u) {
++            grid_pos.y = int(grid_size.y) - 1;
++        } else {
++            return transparent;
++        }
++    }
++
++    return load_color(
++        unpack4u8(bg_cells[grid_pos.y * int(grid_size.x) + grid_pos.x]),
++        get_bool(BOOL_USE_LINEAR_BLENDING)
++    );
++}
+diff --git a/src/renderer/shaders/hlsl/cell_text.hlsl b/src/renderer/shaders/hlsl/cell_text.hlsl
+new file mode 100644
+index 000000000..3d2c6b675
+--- /dev/null
++++ b/src/renderer/shaders/hlsl/cell_text.hlsl
+@@ -0,0 +1,160 @@
++// Draws glyphs from the atlas, one instanced quad per glyph.
++// Ported from `glsl/cell_text.v.glsl` and `glsl/cell_text.f.glsl`.
++//
++// The GLSL backend feeds the per-glyph data in as instanced vertex attributes.
++// Here it is a StructuredBuffer indexed by SV_InstanceID instead, which is what
++// the Metal backend does and what lets this draw with no vertex buffer and no
++// input layout.
++#include "common.hlsli"
++
++// Must match `CellText` in `directx11/shaders.zig`, which is asserted to be 32
++// bytes and to match Metal. HLSL packs structured buffer members tightly on
++// 4-byte boundaries (the float4-straddling rule applies to cbuffers, not to
++// these), which gives 8+8+4+4+4+4 = 32 and matches the StructureByteStride the
++// buffer is created with.
++struct CellText {
++    uint2 glyph_pos;       //  0  texture position, pixels
++    uint2 glyph_size;      //  8  texture size, pixels
++    int   bearings_packed; // 16  2 x i16
++    uint  grid_pos_packed; // 20  2 x u16
++    uint  color_packed;    // 24  4 x u8
++    uint  atlas_bools;     // 28  atlas in byte 0, bools in byte 1
++};
++
++StructuredBuffer<CellText> cells    : register(t0);
++StructuredBuffer<uint>     bg_cells : register(t1);
++
++Texture2D<float4> atlas_grayscale : register(t2);
++Texture2D<float4> atlas_color     : register(t3);
++
++// Values the `atlas` byte can take.
++static const uint ATLAS_GRAYSCALE = 0u;
++static const uint ATLAS_COLOR     = 1u;
++
++// Masks for the `bools` byte.
++static const uint NO_MIN_CONTRAST = 1u;
++static const uint IS_CURSOR_GLYPH = 2u;
++
++struct VSOut {
++    float4 pos                        : SV_Position;
++    nointerpolation uint   atlas      : ATLAS;
++    nointerpolation float4 color      : COLOR0;
++    nointerpolation float4 bg_color   : COLOR1;
++    float2                 tex_coord  : TEXCOORD0;
++};
++
++VSOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
++    CellText cell = cells[iid];
++
++    uint2 grid_size  = unpack2u16(grid_size_packed);
++    uint2 cursor_pos = unpack2u16(cursor_pos_packed);
++    uint2 grid_pos   = unpack2u16(cell.grid_pos_packed);
++    int2  bearings   = unpack2i16(cell.bearings_packed);
++    uint  atlas      = cell.atlas_bools & 0xFFu;
++    uint  glyph_bools = (cell.atlas_bools >> 8u) & 0xFFu;
++
++    bool cursor_wide         = get_bool(BOOL_CURSOR_WIDE);
++    bool use_linear_blending = get_bool(BOOL_USE_LINEAR_BLENDING);
++
++    // A 4-vertex triangle strip makes each quad:
++    //   0 --> 1
++    //   |   .'|
++    //   |  /  |
++    //   | L   |
++    //   2 --> 3
++    float2 corner;
++    corner.x = (vid == 1u || vid == 3u) ? 1.0 : 0.0;
++    corner.y = (vid == 2u || vid == 3u) ? 1.0 : 0.0;
++
++    // The Y bearing is measured from the bottom of the cell up to the top of
++    // the glyph, so it becomes a downward offset by subtracting from the cell
++    // height. The X bearing is already a left offset.
++    float2 size   = float2(cell.glyph_size);
++    float2 offset = float2(bearings);
++    offset.y = cell_size.y - offset.y;
++
++    float2 cell_pos = cell_size * float2(grid_pos) + size * corner + offset;
++
++    VSOut o;
++    // `Mat` stores columns, so this matches the GLSL `projection_matrix * v`.
++    o.pos = mul(projection_matrix, float4(cell_pos.x, cell_pos.y, 0.0, 1.0));
++    o.atlas = atlas;
++
++    // Unnormalized, in pixels: the atlas is read with Load rather than sampled.
++    o.tex_coord = float2(cell.glyph_pos) + float2(cell.glyph_size) * corner;
++
++    // Always fetch linearized, so the contrast math below is well defined.
++    o.color = load_color(unpack4u8(cell.color_packed), true);
++    o.bg_color = load_color(
++        unpack4u8(bg_cells[grid_pos.y * grid_size.x + grid_pos.x]),
++        true
++    );
++
++    // Blend the cell background over the global background.
++    float4 global_bg = load_color(unpack4u8(bg_color_packed), true);
++    o.bg_color += global_bg * (1.0 - o.bg_color.a);
++
++    if (min_contrast > 1.0 && (glyph_bools & NO_MIN_CONTRAST) == 0u) {
++        o.color = contrasted_color(min_contrast, o.color, o.bg_color);
++    }
++
++    // Cells under the cursor take the cursor color, unless this *is* the
++    // cursor glyph being drawn.
++    bool is_cursor_pos =
++        ((grid_pos.x == cursor_pos.x) ||
++         (cursor_wide && (grid_pos.x == cursor_pos.x + 1u))) &&
++        (grid_pos.y == cursor_pos.y);
++    if ((glyph_bools & IS_CURSOR_GLYPH) == 0u && is_cursor_pos) {
++        o.color = load_color(unpack4u8(cursor_color_packed), use_linear_blending);
++    }
++
++    return o;
++}
++
++float4 ps_main(VSOut input) : SV_Target {
++    bool use_linear_blending   = get_bool(BOOL_USE_LINEAR_BLENDING);
++    bool use_linear_correction = get_bool(BOOL_USE_LINEAR_CORRECTION);
++
++    // Pixel centres land on glyph_pos + k + 0.5 for k in [0, size), so
++    // truncating stays inside the glyph's rect in the atlas.
++    int3 texel = int3(int2(input.tex_coord), 0);
++
++    if (input.atlas == ATLAS_COLOR) {
++        // Color glyphs are already premultiplied linear.
++        float4 color = atlas_color.Load(texel);
++        if (use_linear_blending) return color;
++
++        // Undo the premultiply before re-encoding, then redo it.
++        color.rgb /= color.a;
++        color = unlinearize(color);
++        color.rgb *= color.a;
++        return color;
++    }
++
++    // Grayscale: the input color is linear, the texture is a coverage mask.
++    float4 color = input.color;
++    if (!use_linear_blending) {
++        color.rgb /= color.a;
++        color = unlinearize(color);
++        color.rgb *= color.a;
++    }
++
++    float a = atlas_grayscale.Load(texel).r;
++
++    // Correct the alpha so linear blending has the apparent weight that
++    // gamma-incorrect blending would have produced.
++    if (use_linear_correction) {
++        float fg_l = luminance(color.rgb);
++        float bg_l = luminance(input.bg_color.rgb);
++        // Skip when the luminances are too close, to avoid dividing by ~0.
++        if (abs(fg_l - bg_l) > 0.001) {
++            float blend_l = linearize_f(
++                unlinearize_f(fg_l) * a + unlinearize_f(bg_l) * (1.0 - a)
++            );
++            a = clamp((blend_l - bg_l) / (fg_l - bg_l), 0.0, 1.0);
++        }
++    }
++
++    // Premultiplied alpha, so scaling the whole color applies the mask.
++    return color * a;
++}
+diff --git a/src/renderer/shaders/hlsl/common.hlsli b/src/renderer/shaders/hlsl/common.hlsli
+new file mode 100644
+index 000000000..3c75c811e
+--- /dev/null
++++ b/src/renderer/shaders/hlsl/common.hlsli
+@@ -0,0 +1,174 @@
++// Common definitions shared by the D3D11 shaders. This is the HLSL counterpart
++// of `glsl/common.glsl`, and the function bodies are ported from it directly so
++// that the two backends produce the same pixels.
++//
++// ===========================================================================
++// The `Globals` layout is load-bearing and is NOT free to be tidied.
++// ===========================================================================
++//
++// `GenericRenderer` writes one byte layout for every backend, so this cbuffer
++// must match `directx11/shaders.zig`'s `Uniforms` exactly. Every field carries
++// an explicit `packoffset` rather than relying on HLSL's packing rules, because
++// a mismatch here is not a compile error - it silently reads the wrong field.
++// The offsets below were derived from the Zig struct's explicit alignments:
++//
++//   projection_matrix   0    (64 bytes, c0-c3)
++//   screen_size        64    (c4.xy)
++//   cell_size          72    (c4.zw)
++//   grid_size          80    (c5.x)     -- 2 x u16 packed
++//   <4 bytes padding to the 16-byte alignment of grid_padding>
++//   grid_padding       96    (c6)
++//   padding_extend    112    (c7.x)     -- u8 bitfield, low byte
++//   min_contrast      116    (c7.y)
++//   cursor_pos        120    (c7.z)     -- 2 x u16 packed
++//   cursor_color      124    (c7.w)     -- 4 x u8 packed
++//   bg_color          128    (c8.x)     -- 4 x u8 packed
++//   bools             132    (c8.y)     -- 4 separate bytes, see below
++//                     136 -> 144 with trailing alignment
++cbuffer Globals : register(b0) {
++    float4x4 projection_matrix     : packoffset(c0);
++    float2   screen_size           : packoffset(c4.x);
++    float2   cell_size             : packoffset(c4.z);
++    uint     grid_size_packed      : packoffset(c5.x);
++    float4   grid_padding          : packoffset(c6);
++    uint     padding_extend_packed : packoffset(c7.x);
++    float    min_contrast          : packoffset(c7.y);
++    uint     cursor_pos_packed     : packoffset(c7.z);
++    uint     cursor_color_packed   : packoffset(c7.w);
++    uint     bg_color_packed       : packoffset(c8.x);
++    uint     bools_packed          : packoffset(c8.y);
++};
++
++// `bools` is four `bool align(1)` fields - one whole BYTE each, not a bitmask.
++// The GLSL backend packs the same information into bit flags, so porting its
++// `bools & USE_LINEAR_BLENDING` test verbatim would be wrong here.
++#define BOOL_CURSOR_WIDE           0
++#define BOOL_USE_DISPLAY_P3        1
++#define BOOL_USE_LINEAR_BLENDING   2
++#define BOOL_USE_LINEAR_CORRECTION 3
++
++bool get_bool(uint index) {
++    return ((bools_packed >> (index * 8u)) & 0xFFu) != 0u;
++}
++
++// `padding_extend` is a packed u8 bitfield, so it does read as flags.
++static const uint EXTEND_LEFT  = 1u;
++static const uint EXTEND_RIGHT = 2u;
++static const uint EXTEND_UP    = 4u;
++static const uint EXTEND_DOWN  = 8u;
++
++uint padding_extend() {
++    return padding_extend_packed & 0xFFu;
++}
++
++//---------------------------------------------------------------------------//
++// Unpacking
++//---------------------------------------------------------------------------//
++// These assume little-endian, as the GLSL versions do.
++
++uint4 unpack4u8(uint v) {
++    return uint4(
++        (v >>  0u) & 0xFFu,
++        (v >>  8u) & 0xFFu,
++        (v >> 16u) & 0xFFu,
++        (v >> 24u) & 0xFFu
++    );
++}
++
++uint2 unpack2u16(uint v) {
++    return uint2(v & 0xFFFFu, (v >> 16u) & 0xFFFFu);
++}
++
++// x is the low half and y the high half, both sign extended. HLSL's `>>` on a
++// signed int is an arithmetic shift, which is what does the sign extension.
++int2 unpack2i16(int v) {
++    return int2((v << 16) >> 16, v >> 16);
++}
++
++//---------------------------------------------------------------------------//
++// Color
++//---------------------------------------------------------------------------//
++
++// Takes colors in linear RGB space.
++float luminance(float3 color) {
++    return dot(color, float3(0.2126, 0.7152, 0.0722));
++}
++
++// https://www.w3.org/TR/2008/REC-WCAG20-20081211/#contrast-ratiodef
++float contrast_ratio(float3 color1, float3 color2) {
++    float luminance1 = luminance(color1) + 0.05;
++    float luminance2 = luminance(color2) + 0.05;
++    return max(luminance1, luminance2) / min(luminance1, luminance2);
++}
++
++// Return fg if it already meets the ratio, otherwise whichever of white or
++// black has the most contrast with bg.
++float4 contrasted_color(float min_ratio, float4 fg, float4 bg) {
++    float ratio = contrast_ratio(fg.rgb, bg.rgb);
++    if (ratio < min_ratio) {
++        float white_ratio = contrast_ratio(float3(1.0, 1.0, 1.0), bg.rgb);
++        float black_ratio = contrast_ratio(float3(0.0, 0.0, 0.0), bg.rgb);
++        if (white_ratio > black_ratio) {
++            return float4(1.0, 1.0, 1.0, 1.0);
++        } else {
++            return float4(0.0, 0.0, 0.0, 1.0);
++        }
++    }
++    return fg;
++}
++
++// The `pow` inputs below are clamped to be non-negative, which the GLSL
++// versions do not bother with. It is not defensive noise here: HLSL's `lerp`
++// evaluates both branches, so a NaN produced by the branch the cutoff does not
++// select still propagates (`NaN + 1*(b - NaN)` is NaN) instead of being
++// discarded. The premultiplied color paths divide by alpha before calling
++// these, so a zero-alpha pixel really can reach them with a negative or
++// non-finite value. `fxc /WX` refuses to compile the unguarded form.
++
++float4 linearize(float4 srgb) {
++    bool3  cutoff = srgb.rgb <= 0.04045;
++    float3 higher = pow(max((srgb.rgb + 0.055) / 1.055, 0.0), 2.4);
++    float3 lower  = srgb.rgb / 12.92;
++    return float4(lerp(higher, lower, (float3)cutoff), srgb.a);
++}
++
++float linearize_f(float v) {
++    return v <= 0.04045 ? v / 12.92 : pow(max((v + 0.055) / 1.055, 0.0), 2.4);
++}
++
++float4 unlinearize(float4 lin) {
++    bool3  cutoff = lin.rgb <= 0.0031308;
++    float3 higher = pow(max(lin.rgb, 0.0), 1.0 / 2.4) * 1.055 - 0.055;
++    float3 lower  = lin.rgb * 12.92;
++    return float4(lerp(higher, lower, (float3)cutoff), lin.a);
++}
++
++float unlinearize_f(float v) {
++    return v <= 0.0031308 ? v * 12.92 : pow(max(v, 0.0), 1.0 / 2.4) * 1.055 - 0.055;
++}
++
++// Load a 4 byte RGBA non-premultiplied color, linearizing if asked, and
++// premultiply it. `linear` is an HLSL interpolation modifier, hence the name.
++float4 load_color(uint4 in_color, bool want_linear) {
++    float4 color = float4(in_color) / 255.0;
++    if (want_linear) color = linearize(color);
++    color.rgb *= color.a;
++    return color;
++}
++
++//---------------------------------------------------------------------------//
++// Full screen triangle
++//---------------------------------------------------------------------------//
++// Three vertices covering the whole target, so the background passes need no
++// vertex buffer. D3D's clip space is y-up and its viewport origin is top-left.
++
++struct FullScreenOut {
++    float4 pos : SV_Position;
++};
++
++FullScreenOut full_screen_vs(uint vid) {
++    float2 uv = float2((vid << 1u) & 2u, vid & 2u);
++    FullScreenOut o;
++    o.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
++    return o;
++}
