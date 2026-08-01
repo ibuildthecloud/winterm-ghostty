@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Application manifest for the XAML Islands harness.
+
+  Without the <maxversiontested> element below, WindowsXamlManager
+  ::InitializeForCurrentThread() fails with E_UNEXPECTED (0x8000FFFF) and the
+  message:
+
+    "WindowsXamlManager and DesktopWindowXamlSource are supported for apps
+     targeting Windows version 10.0.18226.0 and later."
+
+  System XAML gates island hosting on the app declaring which Windows version
+  it was tested against. Windows Terminal gets this from its *package* manifest;
+  an unpackaged host like this one has to declare it here.
+-->
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <assemblyIdentity
+      type="win32"
+      name="Ghostty.XamlHost"
+      version="1.0.0.0"/>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- The gate that XAML Islands actually checks. -->
+      <maxversiontested Id="10.0.22621.0"/>
+
+      <!-- Windows 10 and 11. Without a supportedOS entry Windows applies
+           compatibility shims and reports a legacy version. -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <!-- Also set programmatically via SetProcessDpiAwarenessContext, but
+           declaring it here means it applies before any window exists. -->
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>

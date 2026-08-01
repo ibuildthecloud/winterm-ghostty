@@ -43,3 +43,10 @@ harness/hwnd-host/*.dll
 harness/hwnd-host/*.exp
 harness/hwnd-host/*.txt
 
+harness/xaml-host/*.exe
+harness/xaml-host/*.obj
+harness/xaml-host/*.pdb
+harness/xaml-host/*.ilk
+harness/xaml-host/*.dll
+harness/xaml-host/*.txt
+

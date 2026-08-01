@@ -138,7 +138,7 @@ behavior; this change is upstreamable on its own.
 | IControlCore area | Implementation over libghostty |
 |---|---|
 | Initialize / SizeOrScaleChanged | `ghostty_surface_new` (composition mode) → `_set_size`/`_set_content_scale`; cell metrics drive `Connection.Resize` |
-| SwapChainHandle / SwapChainChanged | `ghostty_surface_get_swap_chain_handle()` → existing `_AttachDxgiSwapChainToXaml` path, unchanged |
+| SwapChainHandle / SwapChainChanged | `ghostty_surface_get_swap_chain_handle()` → existing `_AttachDxgiSwapChainToXaml` path, unchanged. **Proven in Phase 2.** WT's attach path already takes a `HANDLE`, so this supplies a handle from a different producer rather than adding plumbing. The `swap_chain_changed` action must be wired to `SwapChainChanged`: device loss yields a *new* handle (measured, `0x179C`→`0x21D0`), and an embedder that assumes stability shows a frozen pane. `ResizeBuffers` does **not** change the handle, so resizes need no re-attach. |
 | Key/char/mouse input | `ghostty_surface_key`/`_text`/`_mouse_*` (pairing handled in-DLL) |
 | Scroll state + UserScrollViewport | `SCROLLBAR` action ↔ viewport scroll calls |
 | Title/TabColor/Taskbar/CWD events | `SET_TITLE`, `COLOR_CHANGE`, `PROGRESS_REPORT`, `PWD` actions |

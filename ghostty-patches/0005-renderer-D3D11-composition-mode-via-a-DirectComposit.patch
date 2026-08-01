@@ -1,0 +1,681 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Fri, 31 Jul 2026 18:22:53 -0700
+Subject: [PATCH] renderer: D3D11 composition mode via a DirectComposition
+ surface handle
+
+Lets an embedder bind libghostty's output into its own compositor. The
+renderer creates a DirectComposition surface handle, builds the swap chain
+against it, and exposes the handle through
+ghostty_surface_get_swap_chain_handle. A XAML SwapChainPanel consumes that
+with ISwapChainPanelNative2::SetSwapChainHandle - which is exactly what
+Windows Terminal already does in TermControl::_AttachDxgiSwapChainToXaml.
+
+Verified end to end against harness/xaml-host, a system-XAML island host:
+the panel displays libghostty's configured background (#282C34), resizes
+cleanly from 540x430 to 1400x900 with no stale regions, and reports
+CompositionScale 1.50.
+
+The handle-based path is a different interface from the object-based one
+------------------------------------------------------------------------
+IDXGIFactory2::CreateSwapChainForComposition pairs with
+ISwapChainPanelNative::SetSwapChain and takes a swap chain *object*. What WT
+uses is IDXGIFactoryMedia::CreateSwapChainForCompositionSurfaceHandle paired
+with ISwapChainPanelNative2::SetSwapChainHandle, which takes a HANDLE. Only
+the object-based half was bound previously (it came with PR #11886, whose
+demo used it), so IDXGIFactoryMedia and DCompositionCreateSurfaceHandle are
+added here, harvested from deblasis/wintty (MIT) and attributed in-file.
+
+The indirection is the point: the panel references the handle, not the swap
+chain, so ResizeBuffers leaves the binding intact and a resize needs no
+re-attach.
+
+Resize has a different authority per mode
+-----------------------------------------
+hwnd mode reads the window's client rect. A composition surface has no window
+to measure, so it is driven by whatever size the embedder set on the surface -
+the plumbing the hwnd path had previously sidestepped. drawFrameStart now
+picks the right authority for the mode.
+
+Device loss needs a notification, not just a getter
+---------------------------------------------------
+Losing the device means a new swap chain and therefore a *new* composition
+handle; an embedder still bound to the old one shows a frozen last frame,
+which looks like a hang rather than a failure. A getter cannot express that,
+because the embedder has no way to know it happened.
+
+So this adds a swap_chain_changed apprt action, following the documented
+procedure in action.zig - appended to the end of the Key enum for ABI
+compatibility, mirrored into ghostty.h, and covered by the existing
+checkGhosttyHEnum test. It travels from the renderer thread through the
+surface mailbox, since action delivery belongs to the app thread.
+
+Windows Terminal already models precisely this shape:
+ControlCore::_renderEngineSwapChainChanged duplicates the renderer's new
+handle and raises SwapChainChanged so TermControl re-binds.
+
+Measured rather than assumed: forcing a rebuild produced handle 0x179C ->
+0x21D0, so a new handle really is required. Device.recreate also re-walks the
+full hardware->WARP ladder rather than pinning the previous rasterizer,
+because a device can be lost precisely because the hardware went away.
+
+GHOSTTY_D3D11_SIMULATE_DEVICE_LOSS=<n> forces the recovery path after n
+frames. D3D11 has no equivalent of ID3D12Device::RemoveDevice and provoking a
+real TDR means hanging the GPU, so this simulates the trigger. It exercises
+our recovery, not the driver's - a real TDR also invalidates driver state, and
+this hook would not catch a divergence there.
+
+zig build -Dapp-runtime=none -> imports dcomp.dll alongside d3d11.dll
+zig build test                -> 3065 passed, 55 skipped, 0 failed
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ include/ghostty.h                 |   8 +++
+ src/Surface.zig                   |   6 ++
+ src/apprt/action.zig              |  22 ++++++
+ src/apprt/embedded.zig            |  18 +++--
+ src/apprt/surface.zig             |   6 ++
+ src/renderer/D3D11.zig            | 112 +++++++++++++++++++++++++++---
+ src/renderer/directx11/dcomp.zig  |  45 ++++++++++++
+ src/renderer/directx11/device.zig | 106 +++++++++++++++++++++++++++-
+ src/renderer/directx11/dxgi.zig   |  64 +++++++++++++++++
+ 9 files changed, 371 insertions(+), 16 deletions(-)
+ create mode 100644 src/renderer/directx11/dcomp.zig
+
+diff --git a/include/ghostty.h b/include/ghostty.h
+index bf4441d93..5019cc2a2 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -977,6 +977,14 @@ typedef enum {
+   GHOSTTY_ACTION_SEARCH_SELECTED,
+   GHOSTTY_ACTION_READONLY,
+   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
++  // The surface's swap chain was replaced; any handle you hold is stale.
++  // Re-read ghostty_surface_get_swap_chain_handle() and re-bind it.
++  //
++  // Only fires for renderers presenting through an embedder-bound handle -
++  // today the D3D11 backend in composition mode. Resizing does NOT fire this;
++  // the panel references the handle, not the swap chain, so ResizeBuffers
++  // leaves the binding intact. Losing the device does.
++  GHOSTTY_ACTION_SWAP_CHAIN_CHANGED,
+ } ghostty_action_tag_e;
+ 
+ typedef union {
+diff --git a/src/Surface.zig b/src/Surface.zig
+index f494f6c82..8c676b5f0 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -1096,6 +1096,12 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
+ 
+         .renderer_health => |health| self.updateRendererHealth(health),
+ 
++        .swap_chain_changed => _ = try self.rt_app.performAction(
++            .{ .surface = self },
++            .swap_chain_changed,
++            {},
++        ),
++
+         .scrollbar => |scrollbar| self.updateScrollbar(scrollbar),
+ 
+         .present_surface => try self.presentSurface(),
+diff --git a/src/apprt/action.zig b/src/apprt/action.zig
+index 23bff13d7..2d9b23199 100644
+--- a/src/apprt/action.zig
++++ b/src/apprt/action.zig
+@@ -348,6 +348,25 @@ pub const Action = union(Key) {
+     /// otherwise the terminal-set title.
+     copy_title_to_clipboard,
+ 
++    /// The surface's swap chain was replaced and any handle the embedder is
++    /// holding is now stale. Re-read `ghostty_surface_get_swap_chain_handle`
++    /// and re-bind it.
++    ///
++    /// Only fires for renderers that present through a handle the embedder
++    /// binds itself - today that is the D3D11 backend in composition mode,
++    /// where a XAML SwapChainPanel holds the DirectComposition surface handle.
++    ///
++    /// A resize does *not* trigger this: the panel references the handle
++    /// rather than the swap chain, so `ResizeBuffers` leaves the binding
++    /// intact. Losing the device does, because the replacement swap chain must
++    /// be created against a fresh handle.
++    ///
++    /// This exists because a getter alone cannot support recovery - the
++    /// embedder has no way to know the handle changed. Windows Terminal's
++    /// `ControlCore` already models exactly this, duplicating the new handle
++    /// and raising `SwapChainChanged` so `TermControl` re-attaches.
++    swap_chain_changed,
++
+     /// Sync with: ghostty_action_tag_e
+     pub const Key = enum(c_int) {
+         quit,
+@@ -416,6 +435,9 @@ pub const Action = union(Key) {
+         search_selected,
+         readonly,
+         copy_title_to_clipboard,
++        // Appended, never inserted: this enum maps positionally onto the
++        // libghostty C enum.
++        swap_chain_changed,
+ 
+         test "ghostty.h Action.Key" {
+             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index 2d1e9d9a8..dd504a5d1 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -1622,10 +1622,20 @@ pub const CAPI = struct {
+     /// target. Callers must re-read this after a device-lost event, because
+     /// recreating the device produces a new handle.
+     ///
+-    /// The handle remains owned by libghostty; do not close it.
+-    export fn ghostty_surface_get_swap_chain_handle(_: *Surface) ?*anyopaque {
+-        // Provided by the D3D11 backend once composition mode exists.
+-        return null;
++    /// The handle remains owned by libghostty; do not close it. Embedders that
++    /// need to outlive our copy should `DuplicateHandle` it, which is what
++    /// Windows Terminal's `ControlCore` does.
++    export fn ghostty_surface_get_swap_chain_handle(surface: *Surface) ?*anyopaque {
++        const Api = @TypeOf(surface.core_surface.renderer.api);
++        if (!@hasField(Api, "device")) return null;
++
++        // The renderer thread owns the device. Creation and device-lost
++        // recreation both happen under this lock, so a caller can never observe
++        // a half-replaced handle - it gets the old one or the new one.
++        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
++        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
++
++        return surface.core_surface.renderer.api.device.surface_handle;
+     }
+ 
+     /// The `IDXGISwapChain1*` backing this surface, for embedders that bind the
+diff --git a/src/apprt/surface.zig b/src/apprt/surface.zig
+index 3cb0016fa..e98130d9c 100644
+--- a/src/apprt/surface.zig
++++ b/src/apprt/surface.zig
+@@ -28,6 +28,12 @@ pub const Message = union(enum) {
+     /// Set the mouse shape.
+     set_mouse_shape: terminal.MouseShape,
+ 
++    /// The renderer replaced its swap chain, so any handle the embedder holds
++    /// is stale. Raised by backends that present through an embedder-bound
++    /// handle (D3D11 composition mode) after a device-lost rebuild. Forwarded
++    /// to the apprt as the `swap_chain_changed` action.
++    swap_chain_changed,
++
+     /// Read the clipboard and write to the pty.
+     clipboard_read: apprt.Clipboard,
+ 
+diff --git a/src/renderer/D3D11.zig b/src/renderer/D3D11.zig
+index efc5ddf24..b6ed97cb1 100644
+--- a/src/renderer/D3D11.zig
++++ b/src/renderer/D3D11.zig
+@@ -75,6 +75,14 @@ blending: configpkg.Config.AlphaBlending,
+ /// The D3D11 device, swap chain, and back-buffer view.
+ device: Device,
+ 
++/// The apprt surface. In composition mode there is no window to query for the
++/// size, so this is the authority instead - see `drawFrameStart`.
++rt_surface: *apprt.Surface,
++
++/// For telling the surface its swap chain handle went stale. We are on the
++/// renderer thread, so this has to be a message rather than a direct call.
++surface_mailbox: apprt.surface.Mailbox,
++
+ /// The most recently presented target, in case we need to present it again.
+ last_target: ?Target = null,
+ 
+@@ -96,9 +104,9 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
+         .win32 => |v| if (v.hwnd) |hwnd|
+             .{ .hwnd = hwnd }
+         else if (v.composition)
+-            // Phase 2. Fail loudly rather than silently presenting nowhere.
+-            return Error.UnsupportedSurface
++            .composition
+         else
++            // shared_texture mode is not implemented.
+             return Error.UnsupportedSurface,
+ 
+         else => return Error.UnsupportedSurface,
+@@ -116,6 +124,8 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
+         .alloc = alloc,
+         .blending = opts.config.blending,
+         .device = device,
++        .rt_surface = opts.rt_surface,
++        .surface_mailbox = opts.surface_mailbox,
+     };
+ }
+ 
+@@ -140,6 +150,22 @@ fn eqlIgnoreCaseUtf16(value: []const u16, comptime expect: []const u8) bool {
+     return true;
+ }
+ 
++/// Frames to present before simulating a lost device, from
++/// `GHOSTTY_D3D11_SIMULATE_DEVICE_LOSS`. Zero disables it.
++///
++/// D3D11 offers no way to remove a device on demand (D3D12 has
++/// `ID3D12Device::RemoveDevice`; there is no D3D11 equivalent), and provoking a
++/// real TDR means hanging the GPU, which is neither reliable nor kind to the
++/// rest of the desktop. What actually needs testing is *our* recovery - rebuild
++/// the device, produce a new composition handle, tell the embedder, let it
++/// re-attach - so this forces that path once, deterministically.
++///
++/// It simulates the trigger, not the hardware event. A real TDR additionally
++/// invalidates the driver state underneath us; if that ever diverges, this hook
++/// will not catch it.
++var simulate_loss_after: u32 = 0;
++var frames_presented: u32 = 0;
++
+ /// Read the driver override once at startup. Called by `surfaceInit`.
+ fn readDriverOverride() void {
+     const value = global.environ().getWindows(
+@@ -157,6 +183,24 @@ fn readDriverOverride() void {
+     }
+ }
+ 
++/// Read the device-loss simulation setting once at startup.
++fn readSimulateLoss() void {
++    const value = global.environ().getWindows(
++        utf16("GHOSTTY_D3D11_SIMULATE_DEVICE_LOSS"),
++    ) orelse return;
++
++    // Small ASCII decimal only; anything else is ignored rather than guessed at.
++    var n: u32 = 0;
++    for (value) |c| {
++        if (c < '0' or c > '9') return;
++        n = n *| 10 +| @as(u32, @intCast(c - '0'));
++    }
++    if (n == 0) return;
++
++    simulate_loss_after = n;
++    log.info("will simulate device loss after {d} frames", .{n});
++}
++
+ pub fn deinit(self: *D3D11) void {
+     if (self.last_target) |*t| t.deinit();
+     self.device.deinit();
+@@ -167,14 +211,25 @@ pub fn deinit(self: *D3D11) void {
+ pub fn surfaceInit(surface: *apprt.Surface) !void {
+     _ = surface;
+     readDriverOverride();
++    readSimulateLoss();
+ }
+ 
+ pub fn drawFrameStart(self: *D3D11) void {
+-    // Pick up window resizes before `surfaceSize()` is consulted. drawFrame
+-    // calls this first and then compares surfaceSize() against its own state
+-    // to decide whether to rebuild targets, so doing it here is what makes a
+-    // resized window actually reach the renderer.
+-    self.device.syncToWindow();
++    // Pick up resizes before `surfaceSize()` is consulted. drawFrame calls this
++    // first and then compares surfaceSize() against its own state to decide
++    // whether to rebuild targets, so doing it here is what makes a resize
++    // actually reach the renderer.
++    //
++    // The two modes have different authorities: a window knows its own size,
++    // whereas a composition surface only exists as whatever the embedder says
++    // it is.
++    switch (self.device.target) {
++        .hwnd => self.device.syncToWindow(),
++        .composition => {
++            const size = self.rt_surface.size;
++            self.device.syncToSize(size.width, size.height);
++        },
++    }
+ }
+ 
+ pub fn drawFrameEnd(self: *D3D11) void {
+@@ -224,12 +279,51 @@ pub fn present(self: *D3D11, target: Target) !void {
+         self.device.context.CopyResource(@ptrCast(back), @ptrCast(target.texture));
+     }
+ 
+-    const lost = self.device.present(true);
+-    if (lost) return error.DeviceLost;
++    frames_presented +|= 1;
++    const simulated = simulate_loss_after > 0 and
++        frames_presented == simulate_loss_after;
++    if (simulated) log.warn("simulating device loss (frame {d})", .{frames_presented});
++
++    if (self.device.present(true) or simulated) {
++        // Step 3 of ADR 0002's degradation ladder. Rebuild in place, then tell
++        // the embedder its handle is stale - in composition mode the new swap
++        // chain has a new DirectComposition surface, and a XAML panel still
++        // bound to the old one would show a frozen last frame rather than
++        // anything obviously broken.
++        self.device.recreate(forced_driver) catch |err| {
++            log.err("failed to rebuild device after loss: {}", .{err});
++            return error.DeviceLost;
++        };
++
++        // The old target came from the dead device and cannot be presented.
++        // GenericRenderer rebuilds targets when it next sees a size change or
++        // is asked to redraw; dropping it here just avoids reusing dead memory.
++        self.last_target = null;
++        self.notifySwapChainChanged();
++        return;
++    }
+ 
+     self.last_target = target;
+ }
+ 
++/// Tell the embedder the swap chain handle it holds is stale.
++///
++/// Only meaningful in composition mode - an hwnd swap chain is bound to the
++/// window, not to a handle the embedder passes around, so there is nothing for
++/// it to re-attach.
++///
++/// This goes through the surface mailbox rather than dispatching the apprt
++/// action directly, because we are on the renderer thread and action delivery
++/// belongs to the app thread.
++fn notifySwapChainChanged(self: *D3D11) void {
++    if (self.device.target != .composition) return;
++
++    _ = self.surface_mailbox.push(
++        .{ .swap_chain_changed = {} },
++        .{ .forever = {} },
++    );
++}
++
+ /// Present the last presented target again.
+ pub fn presentLastTarget(self: *D3D11) !void {
+     if (self.last_target) |target| try self.present(target);
+diff --git a/src/renderer/directx11/dcomp.zig b/src/renderer/directx11/dcomp.zig
+new file mode 100644
+index 000000000..c48a64f12
+--- /dev/null
++++ b/src/renderer/directx11/dcomp.zig
+@@ -0,0 +1,45 @@
++//! DirectComposition surface handles.
++//!
++//! Harvested from deblasis/wintty (MIT). wintty's copy lives under its D3D12
++//! renderer, but nothing here is D3D-version specific - the handle is a
++//! composition primitive, and the swap-chain creator that consumes it takes an
++//! `IUnknown*`.
++//!
++//! This is the primitive the whole Windows Terminal integration rests on. A
++//! swap chain created against one of these handles (via
++//! `IDXGIFactoryMedia.CreateSwapChainForCompositionSurfaceHandle`) can be bound
++//! to a XAML `SwapChainPanel` with `ISwapChainPanelNative2::SetSwapChainHandle`
++//! - which is exactly what WT already does in
++//! `TermControl::_AttachDxgiSwapChainToXaml`.
++//!
++//! The indirection matters: **the panel references the handle, not the swap
++//! chain object.** So a resize (`ResizeBuffers`) leaves the binding intact and
++//! the embedder does not need to re-attach. Only losing the device forces a new
++//! handle, because the new swap chain must be created against a new one.
++//!
++//! Note we deliberately do *not* create a DirectComposition device. XAML owns
++//! the composition tree; we only supply the surface it points at.
++
++const std = @import("std");
++
++const com = @import("com.zig");
++
++const HRESULT = com.HRESULT;
++const HANDLE = std.os.windows.HANDLE;
++
++/// Access mask for `DCompositionCreateSurfaceHandle`. This value is not
++/// exposed by any public header; DirectComposition's own samples and Windows
++/// Terminal both use it to request full access to the surface handle.
++pub const COMPOSITIONOBJECT_ALL_ACCESS: u32 = 0x0003;
++
++/// Create a standalone DirectComposition surface handle.
++///
++/// The caller owns the returned handle and must `CloseHandle` it. Note that an
++/// embedder binding it into XAML will typically `DuplicateHandle` first - WT
++/// does exactly that in `ControlCore::_renderEngineSwapChainChanged` - so
++/// closing ours does not pull the surface out from under the panel.
++pub extern "dcomp" fn DCompositionCreateSurfaceHandle(
++    desiredAccess: u32,
++    securityAttributes: ?*anyopaque,
++    surfaceHandle: *HANDLE,
++) callconv(.winapi) HRESULT;
+diff --git a/src/renderer/directx11/device.zig b/src/renderer/directx11/device.zig
+index c9d0d32c4..92ce6f843 100644
+--- a/src/renderer/directx11/device.zig
++++ b/src/renderer/directx11/device.zig
+@@ -21,6 +21,7 @@ const builtin = @import("builtin");
+ const com = @import("com.zig");
+ const d3d11 = @import("d3d11.zig");
+ const dxgi = @import("dxgi.zig");
++const dcomp = @import("dcomp.zig");
+ 
+ const log = std.log.scoped(.directx11);
+ 
+@@ -62,6 +63,7 @@ pub const Error = error{
+     BackBufferFailed,
+     RenderTargetViewFailed,
+     ResizeFailed,
++    CompositionSurfaceFailed,
+     Unsupported,
+ };
+ 
+@@ -87,6 +89,17 @@ pub const Device = struct {
+     /// its size; see `syncToWindow`.
+     target: Target,
+ 
++    /// DirectComposition surface handle, in composition mode only.
++    ///
++    /// This is what an embedder binds into a XAML SwapChainPanel. We own it and
++    /// close it on deinit; embedders are expected to duplicate it rather than
++    /// take ownership (WT does exactly that).
++    ///
++    /// It survives `ResizeBuffers` - the panel references the handle, not the
++    /// swap chain - so resizing needs no re-attach. Losing the device does,
++    /// because the replacement swap chain needs a fresh handle.
++    surface_handle: ?std.os.windows.HANDLE,
++
+     driver: DriverKind,
+     feature_level: d3d11.D3D_FEATURE_LEVEL,
+     width: u32,
+@@ -179,6 +192,9 @@ pub const Device = struct {
+         };
+ 
+         var swap_chain: ?*dxgi.IDXGISwapChain1 = null;
++        var surface_handle: ?std.os.windows.HANDLE = null;
++        errdefer if (surface_handle) |h| std.os.windows.CloseHandle(h);
++
+         const hr = switch (target) {
+             .hwnd => |hwnd| factory.CreateSwapChainForHwnd(
+                 @ptrCast(dev),
+@@ -188,7 +204,35 @@ pub const Device = struct {
+                 null,
+                 &swap_chain,
+             ),
+-            .composition => return Error.Unsupported, // Phase 2
++
++            .composition => comp: {
++                // The composition path goes through IDXGIFactoryMedia, a
++                // different interface from the IDXGIFactory2 used above.
++                const media = try getFactoryMedia(factory);
++                defer _ = media.Release();
++
++                var handle: std.os.windows.HANDLE = undefined;
++                const chr = dcomp.DCompositionCreateSurfaceHandle(
++                    dcomp.COMPOSITIONOBJECT_ALL_ACCESS,
++                    null,
++                    &handle,
++                );
++                if (com.FAILED(chr)) {
++                    log.err("DCompositionCreateSurfaceHandle failed: hr=0x{x}", .{
++                        @as(u32, @bitCast(chr)),
++                    });
++                    return Error.CompositionSurfaceFailed;
++                }
++                surface_handle = handle;
++
++                break :comp media.CreateSwapChainForCompositionSurfaceHandle(
++                    @ptrCast(dev),
++                    handle,
++                    &desc,
++                    null,
++                    &swap_chain,
++                );
++            },
+         };
+         if (com.FAILED(hr) or swap_chain == null) {
+             log.err("swap chain creation failed: hr=0x{x}", .{@as(u32, @bitCast(hr))});
+@@ -202,6 +246,7 @@ pub const Device = struct {
+             .swap_chain = swap_chain.?,
+             .rtv = null,
+             .target = target,
++            .surface_handle = surface_handle,
+             .driver = chosen,
+             .feature_level = level,
+             .width = width,
+@@ -220,9 +265,27 @@ pub const Device = struct {
+         _ = self.swap_chain.Release();
+         _ = self.context.Release();
+         _ = self.device.Release();
++        // Close after the swap chain, which holds its own reference to the
++        // composition surface.
++        if (self.surface_handle) |h| std.os.windows.CloseHandle(h);
+         self.* = undefined;
+     }
+ 
++    /// Walk the factory we already have to IDXGIFactoryMedia, which owns the
++    /// handle-based composition entry point.
++    fn getFactoryMedia(factory: *dxgi.IDXGIFactory2) Error!*dxgi.IDXGIFactoryMedia {
++        var media: ?*anyopaque = null;
++        if (com.FAILED(factory.vtable.QueryInterface(
++            factory,
++            &dxgi.IDXGIFactoryMedia.IID,
++            &media,
++        )) or media == null) {
++            log.err("QueryInterface for IDXGIFactoryMedia failed", .{});
++            return Error.QueryInterfaceFailed;
++        }
++        return @ptrCast(@alignCast(media.?));
++    }
++
+     /// Walk device -> IDXGIDevice -> adapter -> factory. Using the factory that
+     /// owns our device (rather than a fresh CreateDXGIFactory) is required: a
+     /// swap chain must come from the same factory as its device, and it also
+@@ -319,8 +382,8 @@ pub const Device = struct {
+     /// window never reaches the renderer: it keeps drawing at the old size and
+     /// the newly exposed region stays blank.
+     ///
+-    /// Composition mode has no window to ask, so it is driven by the
+-    /// embedder's explicit resize call instead (Phase 2).
++    /// Composition mode has no window to ask; `syncToSize` is used instead,
++    /// driven by the size the embedder set on the surface.
+     pub fn syncToWindow(self: *Device) void {
+         const hwnd = switch (self.target) {
+             .hwnd => |h| h,
+@@ -340,6 +403,43 @@ pub const Device = struct {
+         };
+     }
+ 
++    /// Rebuild after the device was lost (TDR, driver update, GPU reset).
++    ///
++    /// Everything created from the old device is dead, so this constructs a
++    /// whole new `Device` in place, preserving the presentation target and
++    /// size. In composition mode that yields a **new** surface handle, which is
++    /// why the embedder has to be told - see the `swap_chain_changed` action.
++    ///
++    /// Deliberately re-walks the full driver ladder rather than pinning the
++    /// previous rasterizer: a device can be lost precisely because the hardware
++    /// went away (an eGPU unplugged, a driver uninstalled), and in that case
++    /// falling to WARP is the correct outcome rather than failing repeatedly.
++    pub fn recreate(self: *Device, force_driver: ?DriverKind) Error!void {
++        const target = self.target;
++        const width = self.width;
++        const height = self.height;
++
++        log.info("rebuilding device after loss ({d}x{d})", .{ width, height });
++        self.deinit();
++
++        self.* = try Device.init(target, width, height, force_driver);
++        log.info("device rebuilt: driver={t}", .{self.driver});
++    }
++
++    /// Re-sync the swap chain to a size the embedder supplied.
++    ///
++    /// The composition counterpart to `syncToWindow`: there is no window to
++    /// query, so the apprt surface's size is the authority. Resizing does *not*
++    /// invalidate the composition surface handle, so the embedder's XAML
++    /// binding survives this untouched.
++    pub fn syncToSize(self: *Device, width: u32, height: u32) void {
++        if (width == 0 or height == 0) return;
++        if (width == self.width and height == self.height) return;
++        self.resize(width, height) catch |err| {
++            log.warn("failed to resize swap chain to {d}x{d}: {}", .{ width, height, err });
++        };
++    }
++
+     /// Borrow the swap chain's back buffer texture. The caller must Release
+     /// it. Returns null if the buffer could not be obtained, which callers
+     /// treat as "skip this frame" rather than a fatal error.
+diff --git a/src/renderer/directx11/dxgi.zig b/src/renderer/directx11/dxgi.zig
+index b485dc85f..bd8cb6365 100644
+--- a/src/renderer/directx11/dxgi.zig
++++ b/src/renderer/directx11/dxgi.zig
+@@ -557,6 +557,70 @@ pub const IDXGIFactory2 = extern struct {
+     }
+ };
+ 
++// =============================================================================
++// IDXGIFactoryMedia — 5 methods total (3 IUnknown + 2 own)
++// Slot we call: CreateSwapChainForCompositionSurfaceHandle (slot 3)
++//
++// This is the *handle-based* composition path, and it is a different interface
++// from IDXGIFactory2 above. IDXGIFactory2::CreateSwapChainForComposition pairs
++// with ISwapChainPanelNative::SetSwapChain (an object), whereas this pairs with
++// ISwapChainPanelNative2::SetSwapChainHandle (a HANDLE). Windows Terminal uses
++// the handle form, so we do too.
++//
++// Harvested from deblasis/wintty (MIT).
++// =============================================================================
++pub const IDXGIFactoryMedia = extern struct {
++    vtable: *const VTable,
++
++    pub const IID = GUID{
++        .data1 = 0x41e7d1f2,
++        .data2 = 0xa591,
++        .data3 = 0x4f7b,
++        .data4 = .{ 0xa2, 0xe5, 0xfa, 0x9c, 0x84, 0x3e, 0x1c, 0x12 },
++    };
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: *const fn (*IDXGIFactoryMedia, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDXGIFactoryMedia) callconv(.winapi) u32,
++        Release: *const fn (*IDXGIFactoryMedia) callconv(.winapi) u32,
++        // IDXGIFactoryMedia (slots 3-4)
++        CreateSwapChainForCompositionSurfaceHandle: *const fn (
++            self: *IDXGIFactoryMedia,
++            // ID3D11Device for us; D3D12 embedders pass an ID3D12CommandQueue.
++            // Typed IUnknown precisely so the interface is version-neutral.
++            pDevice: *IUnknown,
++            hSurface: *anyopaque,
++            pDesc: *const DXGI_SWAP_CHAIN_DESC1,
++            pRestrictToOutput: ?*anyopaque, // IDXGIOutput, nullable
++            ppSwapChain: *?*IDXGISwapChain1,
++        ) callconv(.winapi) HRESULT,
++        CreateDecodeSwapChainForCompositionSurfaceHandle: Reserved,
++    };
++
++    pub inline fn CreateSwapChainForCompositionSurfaceHandle(
++        self: *IDXGIFactoryMedia,
++        device: *IUnknown,
++        surface: *anyopaque,
++        desc: *const DXGI_SWAP_CHAIN_DESC1,
++        restrict_to_output: ?*anyopaque,
++        swap_chain: *?*IDXGISwapChain1,
++    ) HRESULT {
++        return self.vtable.CreateSwapChainForCompositionSurfaceHandle(
++            self,
++            device,
++            surface,
++            desc,
++            restrict_to_output,
++            swap_chain,
++        );
++    }
++
++    pub inline fn Release(self: *IDXGIFactoryMedia) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
+ // =============================================================================
+ // ISwapChainPanelNative — 4 methods total (3 IUnknown + 1 own)
+ // Slot we call: SetSwapChain (slot 3)
