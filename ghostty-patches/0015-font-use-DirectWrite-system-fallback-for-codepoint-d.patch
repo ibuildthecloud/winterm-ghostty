@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Sat, 1 Aug 2026 15:30:23 -0700
+Subject: [PATCH] font: use DirectWrite system fallback for codepoint discovery
+
+Windows.discoverFallback now asks DirectWrite which font covers the codepoint
+before opening any directory, instead of walking the system and per-user font
+directories and opening every candidate to probe its CMap.
+
+The fallback is a new first iterator state rather than a replacement path, and
+it always advances to .system afterwards, so any failure - no mapped font, a
+face with no local file, initFile refusing it - degrades to exactly the old
+directory scan. That keeps a bad fallback slow rather than fatal.
+
+Only the fallback query pays for it: discover() still starts at .system, so a
+plain family lookup does not make a MapCharacters call it cannot use.
+
+Guarded at comptime on the backend. Both Windows backends share this iterator
+but only DirectWrite has a system fallback to consult, and without the guard
+the default build fails to compile - FreetypeLibrary has no fallbackFace. That
+was caught by running the default suite, not by inspection.
+
+Adding the .fallback variant made Zig reject three switches on State, which is
+the useful outcome: each got an explicit unreachable or early return at the
+point that assumes .fallback never opens a directory, so a later change to the
+state machine fails loudly instead of silently taking a wrong branch.
+
+The test uses U+4E2D and U+1F978 specifically because neither lives in a Latin
+text font, so a result can only have come from the fallback chain rather than
+from whichever file the directory walk reached first.
+
+  directwrite_harfbuzz : 3067 pass, 56 skip, 0 fail
+  default              : 3065 pass, 57 skip, 0 fail
+
+No negative cache. It was in the plan when a miss meant walking every font
+file; MapCharacters is the same call Windows uses for its own fallback, so the
+cost it was meant to avoid is largely gone. Adding one now would mean mutable
+state on a *const shared interface for an unmeasured gain - left to the
+benchmark work instead.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/font/discovery.zig | 106 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 104 insertions(+), 2 deletions(-)
+
+diff --git a/src/font/discovery.zig b/src/font/discovery.zig
+index b5443aea5..fb87c088e 100644
+--- a/src/font/discovery.zig
++++ b/src/font/discovery.zig
+@@ -940,7 +940,11 @@ pub const Windows = struct {
+         desc: Descriptor,
+     ) !DiscoverIterator {
+         _ = collection;
+-        return self.discover(alloc, desc);
++        var it = try self.discover(alloc, desc);
++        // Only fallback queries consult DirectWrite; a plain family lookup
++        // should not pay for a MapCharacters call it cannot use.
++        it.state = .fallback;
++        return it;
+     }
+ 
+     pub const DiscoverIterator = struct {
+@@ -954,7 +958,12 @@ pub const Windows = struct {
+         system_path: ?[:0]const u8,
+         user_path: ?[:0]const u8,
+ 
+-        const State = enum { system, user, done };
++        /// `fallback` runs first and only for codepoint queries: it asks
++        /// DirectWrite which font covers the codepoint instead of opening
++        /// every font on the system to probe its CMap. It always falls through
++        /// to the directory scan afterwards, so a miss degrades to the old
++        /// behaviour rather than losing the font.
++        const State = enum { fallback, system, user, done };
+ 
+         pub fn deinit(self: *DiscoverIterator) void {
+             if (self.dir) |*d| d.close(global.io());
+@@ -963,11 +972,70 @@ pub const Windows = struct {
+             self.* = undefined;
+         }
+ 
++        /// Ask DirectWrite which font covers `desc.codepoint`.
++        ///
++        /// Returns null for every failure rather than propagating: the caller
++        /// then falls through to the directory scan, so a fallback that cannot
++        /// be resolved is slower but never fatal.
++        fn fallbackDeferred(self: *DiscoverIterator) ?DeferredFace {
++            // Both Windows backends share this iterator, but only the
++            // DirectWrite one has a system fallback to consult. FreeType keeps
++            // the directory scan, which is what it has always done.
++            if (comptime options.backend != .directwrite_harfbuzz) return null;
++
++            const cp = std.math.cast(u21, self.desc.codepoint) orelse return null;
++
++            const dw_face = (self.lib.fallbackFace(cp) catch return null) orelse return null;
++            defer _ = dw_face.Release();
++
++            // No allocation needed: facePath writes into this buffer and
++            // makeDeferred dupes whatever it is handed, so a stack copy with
++            // room for the sentinel is enough.
++            var buf: [512]u8 = undefined;
++            const path = (self.lib.facePath(dw_face, buf[0 .. buf.len - 1]) catch
++                return null) orelse return null;
++            buf[path.len] = 0;
++            const path_z = buf[0..path.len :0];
++
++            var face = Face.initFile(
++                self.lib,
++                path_z,
++                0,
++                .{ .size = .{ .points = 12 } },
++            ) catch return null;
++
++            // DirectWrite already decided this font covers the codepoint, so
++            // there is nothing to match against - but a face that cannot
++            // actually map it would be worse than falling through.
++            if (face.glyphIndex(cp) == null) {
++                face.deinit();
++                return null;
++            }
++
++            return self.makeDeferred(face, path, 0) catch {
++                face.deinit();
++                return null;
++            };
++        }
++
+         pub fn next(self: *DiscoverIterator) !?DeferredFace {
+             while (true) {
++                // The DirectWrite fallback is consulted once, before any
++                // directory is opened.
++                if (self.state == .fallback) {
++                    self.state = .system;
++                    if (self.desc.codepoint > 0) {
++                        if (self.fallbackDeferred()) |deferred| return deferred;
++                    }
++                    continue;
++                }
++
+                 // Ensure we have a directory iterator for the current state.
+                 if (self.iter == null) {
+                     switch (self.state) {
++                        // Handled above, which always leaves .fallback.
++                        .fallback => unreachable,
++
+                         .system => {
+                             const path = self.systemFontsPath() orelse {
+                                 self.state = .user;
+@@ -1010,6 +1078,8 @@ pub const Windows = struct {
+                     self.dir = null;
+                     self.iter = null;
+                     self.state = switch (self.state) {
++                        // Cannot be reached: .fallback never opens a directory.
++                        .fallback => unreachable,
+                         .system => .user,
+                         .user => .done,
+                         .done => .done,
+@@ -1061,6 +1131,8 @@ pub const Windows = struct {
+             name: []const u8,
+         ) !?DeferredFace {
+             const dir_path = switch (self.state) {
++                // Cannot be reached: .fallback never reaches a directory match.
++                .fallback => return null,
+                 .system => self.system_path.?,
+                 .user => self.user_path.?,
+                 .done => return null,
+@@ -1361,3 +1433,33 @@ test "windows" {
+     defer face.deinit();
+     try testing.expect(face.hasCodepoint('A', null));
+ }
++
++test "windows fallback" {
++    if (options.backend != .directwrite_harfbuzz) return error.SkipZigTest;
++
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var lib = try Library.init(alloc);
++    defer lib.deinit();
++
++    var win = Windows.init(lib);
++    defer win.deinit();
++
++    // Neither codepoint is in a Latin text font, so anything returned here had
++    // to come from the system fallback chain rather than from whichever font
++    // the directory walk happened to reach first. U+1F978 also needs a
++    // surrogate pair on the way through MapCharacters.
++    for ([_]u32{ '中', '🥸' }) |cp| {
++        // `collection` is unused by this backend's discoverFallback.
++        var it = try win.discoverFallback(alloc, undefined, .{
++            .codepoint = cp,
++            .size = 12,
++        });
++        defer it.deinit();
++
++        var face = (try it.next()) orelse return error.TestFontNotFound;
++        defer face.deinit();
++        try testing.expect(face.hasCodepoint(cp, null));
++    }
++}
