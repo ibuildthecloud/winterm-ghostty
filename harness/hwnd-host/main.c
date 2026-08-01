@@ -42,6 +42,7 @@
 #include <stdio.h>
 
 #include "ghostty.h"
+#include "winkeys.h"
 
 // Posted by wakeup_cb, which may be called from ghostty's own threads. All we
 // may do off-thread is PostMessage; ghostty_app_tick must run on the thread
@@ -151,6 +152,35 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         EndPaint(hwnd, &ps);
         return 0;
     }
+
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+    case WM_KEYUP:
+    case WM_SYSKEYUP: {
+        if (!g_state.surface) break;
+
+        ghostty_input_key_s ev;
+        char text[8];
+        if (winkeys_translate(msg, wp, lp, &ev, text)) {
+            ghostty_surface_key(g_state.surface, ev);
+            // The shell's response arrives on the IO thread, so ask for a
+            // repaint rather than assuming this frame already reflects it.
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+
+        // WM_SYSKEYDOWN must still reach DefWindowProc for Alt+F4 and the
+        // window menu; swallowing it entirely makes the window unclosable by
+        // keyboard. Alt-modified keys the terminal wants are already handled
+        // above, and passing this along additionally is harmless.
+        if (msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) break;
+        return 0;
+    }
+
+    // Text is derived from the key event via ToUnicode, so WM_CHAR would be a
+    // duplicate. Swallow it, but let WM_SYSCHAR through so the window menu
+    // still works.
+    case WM_CHAR:
+        return 0;
 
     // The swap chain owns the pixels; letting GDI erase first causes a visible
     // flash on resize.

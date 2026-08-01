@@ -94,7 +94,7 @@ Write-Host 'cl main.c' -ForegroundColor Cyan
 # The reserve is address space, not committed memory, so it costs nothing at
 # runtime. Note this was measured against a Debug libghostty; a Release build
 # may well fit in 1 MB (untested).
-cmd /c "`"$vcvars`" >nul 2>&1 && cd /d `"$here`" && cl /nologo /W4 /Zi /I`"$include`" /Fe:hwnd-host.exe main.c /link /STACK:16777216 ghostty.lib user32.lib shcore.lib"
+cmd /c "`"$vcvars`" >nul 2>&1 && cd /d `"$here`" && cl /nologo /W4 /Zi /I`"$include`" /Fe:hwnd-host.exe main.c winkeys.c /link /STACK:16777216 ghostty.lib user32.lib shcore.lib"
 if ($LASTEXITCODE -ne 0) { throw "compile failed ($LASTEXITCODE)" }
 
 # The DLL has to sit next to the exe (or on PATH) at load time.
