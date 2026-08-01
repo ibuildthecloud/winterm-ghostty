@@ -115,10 +115,14 @@ combination — platform-native discovery and rasterization, HarfBuzz shaping:
 - **Rasterization**: into ghostty's existing CPU-side `font.Atlas`, **not** D2D-direct into
   the GPU texture. **Grayscale AA only** — ClearType subpixel is wrong over a
   premultiplied-alpha composition surface, which is AtlasEngine's own conclusion.
-  - monochrome glyphs: `IDWriteGlyphRunAnalysis::CreateAlphaTexture`, which writes
-    coverage straight to CPU memory — no D2D involved.
-  - colour glyphs: D2D over a WIC bitmap, read back (AtlasEngine ships `wic.cpp` for the
-    same reason).
+  - One D2D-over-WIC path for **both** monochrome and colour glyphs, read back into the
+    atlas (AtlasEngine ships `wic.cpp` for the same reason). Monochrome takes the alpha
+    channel, since we draw with a white brush; colour takes BGRA, already premultiplied.
+  - `IDWriteGlyphRunAnalysis::CreateAlphaTexture` was the earlier plan for the monochrome
+    half, but AtlasEngine's own `GlyphRunAnalysis` path sits behind `#if 0` with the note
+    that Direct2D is roughly 2x faster, and `ALIASED_1x1` returns empty bounds outside
+    aliased mode. One path also means `DWRITE_E_NOCOLOR` is the *only* thing deciding
+    which branch a glyph takes, so `isColorGlyph` and `renderGlyph` cannot disagree.
 
   > **Corrects ADR 0005.** That ADR's Consequences claim the atlas becomes a D2D-rendered
   > DXGI surface via `CreateDxgiSurfaceRenderTarget`, obsoleting
