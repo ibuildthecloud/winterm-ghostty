@@ -183,9 +183,30 @@ working `win32_uia/` implementation (MIT). Ship gate for parity; flagged-off bef
 
 ### Packaging constraints
 
-Engine DLL: self-contained CRT, MSVC ABI, x64 + ARM64. D3D11/DXGI/DComp/ConPTY/font-file
-access are appcontainer-compatible API sets; MSIX API-set validation is a Phase-1 exit
-criterion, with "engine DLL hosted outside the packaged component" as the recorded fallback.
+Engine DLL: self-contained CRT, MSVC ABI, x64 + ARM64.
+
+**Appcontainer question, answered in Phase 1: it does not apply, and the DLL ships
+in-package.** Windows Terminal's own `Package.appxmanifest` declares
+`<rescap:Capability Name="runFullTrust"/>` and an
+`EntryPoint="Windows.FullTrustApplication"` execution alias, so WT's MSIX runs **full
+trust rather than in an appcontainer**. The restricted Store API set is therefore not
+enforced against anything loaded into it.
+
+That matters because libghostty would *not* pass appcontainer API-set validation as built.
+Its import table (measured, not assumed) is:
+
+```
+KERNEL32  ntdll  WS2_32  MSWSOCK  USER32  d3d11  SHELL32  IMM32
+```
+
+`ntdll.dll` is imported **directly** — `LdrLoadDll`, `NtCreateFile`, `NtCreateThreadEx`,
+`NtAllocateVirtualMemory` and ~40 more — because Zig's standard library targets the native
+API rather than going through kernel32. `SHELL32!ShellExecuteW` is likewise outside the
+Store API set. Neither is fixable at our layer without patching Zig's stdlib.
+
+So the recorded fallback ("engine DLL hosted outside the packaged component") is **not
+needed**, but it stays on the shelf: it becomes relevant again only if WT ever drops
+`runFullTrust`, which would break far more than this engine.
 
 ## Source material (harvest map)
 
