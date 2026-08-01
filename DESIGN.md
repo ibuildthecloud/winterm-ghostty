@@ -239,7 +239,7 @@ The research that produced this document was conducted against the same ghostty 
 
 | Tool | Version | Notes |
 |---|---|---|
-| Zig | **0.16.0** | pinned by ghostty `build.zig.zon` (`.minimum_zig_version`) and `flake.nix`; local copy under `tools/`, installed by `scripts/zigenv.ps1` |
+| Zig | **0.16.0** | pinned by ghostty `build.zig.zon` (`.minimum_zig_version`) and `flake.nix`; local copy under `tools/`, installed by `scripts/zigenv.ps1`. **Cannot target `aarch64-windows-msvc`** — its own stdlib fails at `std/debug/SelfInfo/Windows.zig:670` (`@ptrCast` increases pointer alignment; aarch64 function pointers need 4-byte alignment, x86_64 needs 1). ARM64 is deferred until a Zig release fixes this; re-test at every pin bump. |
 | Visual Studio | Community **2026** 18.8.12023.21 | MSVC **v145** (14.51.36231). WT's `src/common.build.pre.props` selects v145 when `VisualStudioVersion >= 18.0`, and WT's README ships a winget config for VS 2026 — VS 2022/v143 is *not* required. |
 | Windows SDK | 10.0.**26100.8249** | meets WT's `>= 10.0.26100.8249` floor |
 | Shader compilers | `fxc` + `dxc` from the SDK | D3D11 needs **`fxc` / SM 5.0 DXBC**; `dxc`/SM 6 DXIL is D3D12-only (see `docs/research/pr-11886-assets/README.md`) |

@@ -138,10 +138,18 @@ Escalation triggers (stop the item, report DECISION-NEEDED, per PROCESS.md):
   holds. Re-run the probe over RDP before Phase 7's remote-session work.
 
 Exit criteria:
-- [ ] Harness shows a libghostty-cleared, resizable, DPI-correct surface (hardware AND
-      forced-WARP), on x64; ARM64 cross-build compiles.
-- [ ] Each patch builds + `zig build test` passes independently.
-- [ ] Appcontainer/MSIX answer recorded.
+- [x] Harness shows a libghostty-cleared, resizable, DPI-correct surface (hardware AND
+      forced-WARP), on x64.
+- [~] ~~ARM64 cross-build compiles.~~ **DEFERRED at the Phase 1 retro (2026-07-31).**
+      Blocked outside this project: Zig 0.16.0's own stdlib fails to target
+      `aarch64-windows-msvc` (`std/debug/SelfInfo/Windows.zig:670`, `@ptrCast` increases
+      pointer alignment — function pointers need 4-byte alignment on aarch64, 1 on x86_64).
+      A trivial Zig program cross-compiles fine, so it is the `std.debug` self-info path,
+      not a blanket toolchain failure. Nothing before Phase 8 needs ARM64.
+      **Re-test at the next Zig pin bump**; carrying a local stdlib patch was rejected
+      because it would be invisible to `ghostty-patches/` and rot silently.
+- [x] Each patch builds + `zig build test` passes independently.
+- [x] Appcontainer/MSIX answer recorded.
 
 Open questions — **all resolved at the Phase 0 retro (2026-07-31); phase is ready**:
 - ~~ADRs 0002 and 0004 flipped to `Accepted`?~~ **Both Accepted.** 0004 additionally
@@ -373,7 +381,15 @@ Goal: shippable.
 
 - UIA `ITextProvider`/`ITextRangeProvider` over read-back (harvest winghostty
   `win32_uia/` semantics); Narrator + NVDA smoke tests.
-- MSIX packaged build with the engine DLL (per Phase-1 answer); ARM64 end-to-end.
+- MSIX packaged build with the engine DLL. **Phase 1 answered this: WT's package declares
+  `runFullTrust`, so it is not appcontainer-restricted and the DLL ships in-package** —
+  which matters because libghostty imports ntdll directly via Zig's stdlib and would fail
+  Store API-set validation. See DESIGN.md → Packaging constraints.
+- ARM64 end-to-end. **Carries a deferred blocker from Phase 1:** Zig 0.16.0 cannot target
+  `aarch64-windows-msvc` at all (stdlib bug, see Phase 1's exit criteria). This phase
+  cannot start its ARM64 work until a Zig release fixes it. **Check this at Phase 8
+  readiness, not during the phase** — if it is still broken, ARM64 is a ship-gate
+  discussion, not an implementation task.
 - Settings-UI affordance for the `engine` field; docs.
 
 Open questions (resolve at readiness):
