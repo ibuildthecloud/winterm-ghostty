@@ -107,11 +107,31 @@ ConPTY, defterm handoff, and the Azure connection untouched.
 
 ### Fonts (ADR 0005, `dwrite-discovery` patch)
 
-`directwrite_freetype` backend: DirectWrite discovery with
-`IDWriteFontFallback::MapCharacters` + negative cache; FreeType grayscale rasterization;
-HarfBuzz shaping. Named gap: COLRv1 emoji (FreeType has the API; the glyph pipeline must
-call it). DWrite rasterization deliberately deferred — AtlasEngine's
-`DWriteTextAnalysis.cpp`/`dwrite_helpers.*` are the reference if revisited.
+`directwrite_harfbuzz` backend, mirroring ghostty's existing `coretext_harfbuzz`
+combination — platform-native discovery and rasterization, HarfBuzz shaping:
+
+- **Discovery**: DirectWrite with `IDWriteFontFallback::MapCharacters` (the locale-aware
+  system fallback chain) plus a negative cache for unfallbackable codepoints.
+- **Rasterization**: Direct2D drawing into the glyph atlas via
+  `CreateDxgiSurfaceRenderTarget`, so glyphs land in the D3D11 atlas texture with no CPU
+  round-trip (AtlasEngine's `BackendD3D` is the reference). **Grayscale AA only** —
+  ClearType subpixel is wrong over a premultiplied-alpha composition surface, which is
+  AtlasEngine's own conclusion.
+- **Colour glyphs**: `IDWriteFactory4::TranslateColorGlyphRun`, dispatching per
+  `glyphImageFormat` to `DrawColorBitmapGlyphRun` / `DrawSvgGlyphRun` / `DrawGlyphRun`;
+  `paletteIndex == 0xffff` means use the foreground brush. Gets COLR v0/v1, SVG, PNG, sbix
+  and CBDT from the platform.
+- **Shaping**: HarfBuzz, unchanged from every other ghostty platform.
+
+Text therefore matches other Windows applications, and colour emoji is not a tracked gap.
+Segoe UI Emoji is COLR v1 carrying a full v0 layer set; both we and AtlasEngine render the
+v0 layers, so emoji are on par with Windows Terminal. Requesting
+`DWRITE_GLYPH_IMAGE_FORMATS_COLR_PAINT_TREE` via `IDWriteFactory8` would render v1
+gradients and put us ahead of WT — a separable later upgrade.
+
+Consequence for the renderer: the atlas is a D2D-rendered DXGI surface, **not** a
+CPU-uploaded texture, so `Texture.replaceRegion`/`UpdateSubresource` (written in Phase 1,
+never executed) is obsolete.
 
 ### IO hardening (`iocp-fixes` patch)
 

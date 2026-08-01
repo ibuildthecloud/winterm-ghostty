@@ -247,10 +247,13 @@ ever sees it.
 
 - Complete `d3d11-backend`: gpu_data byte-parity with Metal, glyph atlas textures,
   all cell pipelines (bg/fg/color/cursor/images), HLSL for the shared shader set.
-- `dwrite-discovery` patch (ADR 0005): DirectWrite discovery + `MapCharacters` fallback +
-  negative cache; FreeType raster; verify CJK + emoji fallback (note CBDT-vs-COLRv1 gaps).
-- `winkeys` patch: key/char pairing; wire harness keyboard input → interactive shell
-  (ghostty exec/ConPTY path is fine here — `termio-external` comes with WT integration).
+- `dwrite-discovery` patch (ADR 0005, **rewritten and Accepted 2026-07-31**): a
+  `directwrite_harfbuzz` backend — DirectWrite discovery with `MapCharacters` + negative
+  cache, **DirectWrite/D2D rasterization** into the atlas via
+  `CreateDxgiSurfaceRenderTarget`, HarfBuzz shaping. Colour glyphs via
+  `TranslateColorGlyphRun`. Verify CJK + emoji fallback.
+- `winkeys` patch: key/char pairing; wire harness keyboard input → interactive shell.
+  **The ConPTY path is unproven** — see the escalation triggers below.
 - Validate: vttest sweep, `zig build test` per patch, side-by-side against wintty for
   visual/behavioral drift; measure `cat`-a-large-file throughput vs wintty and WT.
 
@@ -260,17 +263,44 @@ Exit criteria:
 - [ ] vttest results recorded; no regressions vs wintty on the same scenarios.
 - [ ] Works under forced WARP.
 
-Open questions (resolve at readiness):
-- ADR 0005 flipped to `Accepted`?
-- ~~**Shader toolchain for D3D11**~~ — **ANSWERED in Phase 0.** #11886 hand-wrote HLSL and
-  compiled it with `fxc /T vs_5_0` / `ps_5_0`, embedding the resulting `.cso` via
-  `@embedFile`. That is SM 5.0 DXBC, confirming the suspicion that `dxc`/SM 6 DXIL is a
-  D3D12-ism we cannot copy from wintty. Both `fxc` and `dxc` ship in SDK 26100.8249 on the
-  dev box. The blobs and the exact commands are in
-  `docs/research/pr-11886-assets/README.md`.
-  Remaining sub-question for this phase: hand-port the full shader set to SM 5.0 (what
-  #11886 did, for one pipeline), or route ghostty's glslang→SPIRV-Cross pipeline to HLSL
-  output and compile that with `fxc`? Decide once the Phase 3 shader inventory is known.
+Open questions — **all resolved at the Phase 2→3 readiness step (2026-07-31)**:
+- ~~ADR 0005 flipped to `Accepted`?~~ **Accepted, after being rewritten.** The draft chose
+  FreeType rasterization; evidence reversed it. `Backend.default()` shows Windows' FreeType
+  default is a stopgap ("A future DirectWrite backend can replace this if needed") while
+  macOS already renders with CoreText — so "stay on FreeType for cross-platform
+  consistency" described a consistency that does not exist. And Segoe UI Emoji is COLR v1
+  with **no CBDT/sbix font anywhere on Windows**, so FreeType meant building colour-glyph
+  support ourselves, permanently, for one platform.
+- ~~**Shader toolchain**~~ — **`fxc` / SM 5.0 DXBC** (Phase 0), and the sub-question is now
+  settled: **hand-author `shaders.hlsl`**. Every backend authors its own shader source —
+  Metal has `shaders.metal`, OpenGL has a `glsl/` directory — and SPIRV-Cross is used only
+  for *custom* shadertoy shaders. Routing the main set through glslang→SPIRV-Cross would
+  invent a pattern no backend uses, which is bad for upstreaming.
+- ~~**Emoji exit bar**: is CBDT-only acceptable with COLRv1 as a tracked gap?~~ **Moot.**
+  ADR 0005's rewrite makes DirectWrite render colour glyphs, so COLR v0/v1, SVG, PNG, sbix
+  and CBDT all come from the platform. Measured: Segoe UI Emoji is COLR v1 carrying a full
+  v0 layer set (3,372 base glyphs), and **AtlasEngine renders the v0 layers** — it requests
+  `DWRITE_GLYPH_IMAGE_FORMATS_COLR` on an `IDWriteFactory4` and never asks for paint trees.
+  So emoji land on par with Windows Terminal. `COLR_PAINT_TREE` via `IDWriteFactory8` is a
+  separable later upgrade that would put us ahead.
+- ~~**Benchmark methodology**~~ — **purpose-built corpus benchmark**, `scripts/bench-throughput.ps1`
+  plus a fixed corpus committed to this repo (ASCII, CJK, SGR-heavy, scroll-heavy), timed
+  identically across our harness, wintty and WT. Rejected vtebench (Rust; toolchain
+  friction on Windows) and `ghostty-bench +terminal-stream` as the primary (engine-internal,
+  cannot compare terminals) — the latter is still recorded per-run for regression tracking.
+  **Phase 7 must reuse the identical script and corpus** or its targets are not comparable.
+
+Escalation triggers (stop the item, report DECISION-NEEDED, per PROCESS.md):
+- **The ConPTY/exec path has never executed.** `pty.zig` has a `WindowsPty` with
+  `CreatePseudoConsole`, and `Exec.zig` has a `threadMainWindows`, but upstream could not
+  link on Windows at all before patch 0, so none of it has run. wintty documented a
+  concrete defect: under ConPTY the child is already in ConPTY's job object before ghostty
+  sees it, so `xev.Process` silently no-ops and **process exit is never detected** — they
+  replaced it with a dedicated `WaitForSingleObject` thread. Investigate and fix; if the
+  fix turns out to need the `iocp-fixes` patch (ADR 0004 patch 6) pulled forward, that is a
+  patch-order change and needs reporting rather than deciding.
+- D2D/D3D11 interop on the shared atlas surface behaving differently under WARP than
+  hardware (the composition path has only ever been exercised on hardware).
 - Exit bar for emoji: is CBDT-only (no COLRv1 Segoe glyphs) acceptable for this phase's
   exit, with COLRv1 as a tracked gap re-evaluated at Phase 6?
 - Benchmark methodology: pick the throughput/latency harness now (vtebench? plain

@@ -21,6 +21,6 @@ decisions explored during the initial feasibility investigation; review and flip
 - [0002](0002-d3d11-renderer-backend.md) — D3D11 as the ghostty GPU backend on Windows
 - [0003](0003-full-engine-not-vt-hybrid.md) — Embed the full libghostty engine, not a libghostty-vt hybrid
 - [0004](0004-ghostty-fork-as-patch-series.md) — Maintain the ghostty fork as an upstream-shaped patch series
-- [0005](0005-directwrite-discovery-freetype-raster.md) — DirectWrite discovery/fallback with FreeType rasterization
+- [0005](0005-directwrite-discovery-freetype-raster.md) — DirectWrite discovery and rasterization, HarfBuzz shaping *(rewritten before acceptance; the filename retains the original slug)*
 - [0006](0006-wt-owns-conpty.md) — Windows Terminal keeps ConPTY; ghostty gets an external-stream termio backend
 - [0007](0007-per-profile-engine-setting.md) — Per-profile `engine` setting; cascadia stays the default

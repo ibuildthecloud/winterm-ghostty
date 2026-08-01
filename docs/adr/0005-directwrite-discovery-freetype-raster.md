@@ -1,54 +1,147 @@
-# 0005 — DirectWrite discovery/fallback with FreeType rasterization
+# 0005 — DirectWrite discovery and rasterization, HarfBuzz shaping
 
-Status: Proposed (2026-07-31)
+Status: **Accepted** (2026-07-31, at the Phase 2→3 readiness step)
+
+> Rewritten before acceptance. An earlier draft of this ADR chose *DirectWrite discovery
+> with FreeType rasterization*. It was never accepted, and evidence gathered at the Phase 3
+> readiness step reversed it. The reversal is recorded in "What changed and why" below,
+> because the reasoning is the part worth keeping.
 
 ## Context
 
-ghostty's font stack is pluggable via `src/font/backend.zig` (discovery/rasterization
-split; HarfBuzz shaping throughout). Upstream's Windows default is `freetype_windows`, a
-hand-rolled `C:\Windows\Fonts` directory scanner with no system fallback chain, carrying
-upstream's own note: "A future DirectWrite backend can replace this if needed."
+ghostty's font stack is pluggable at three independent layers — discovery, rasterization,
+and shaping — selected by `src/font/backend.zig`:
 
-Prior art:
+```
+coretext            CoreText for discovery, rendering, and shaping (macOS)
+coretext_harfbuzz   CoreText for discovery and rendering, HarfBuzz for shaping
+coretext_freetype   CoreText discovery, FreeType rendering, HarfBuzz shaping
+fontconfig_freetype Fontconfig discovery, FreeType rendering (Linux default)
+freetype_windows    FreeType rendering + a Windows font-directory scanner
+```
 
-- **wintty** ships a `directwrite_freetype` backend: DirectWrite COM discovery (886 LOC),
-  FreeType rasterization, HarfBuzz shaping. Fallback via collection walk.
-- **phantty** does DirectWrite discovery + per-codepoint fallback with a negative cache,
-  via manual `IDWriteFont::HasCharacter` walks.
-- **Windows Terminal's AtlasEngine** is a full DWrite pipeline (analysis, ClearType-tuned
-  gamma, dual-source blending) — and notably falls back to grayscale AA when rendering
-  over transparent/composed surfaces, because ClearType subpixel blending is wrong over
-  premultiplied alpha.
-- Segoe UI Emoji is COLRv1 today; ghostty's FreeType glyph path renders CBDT bitmap emoji
-  but not COLRv1.
+Two facts from that enum drive this decision:
+
+1. **ghostty already uses a platform-native rasterizer where one exists.** macOS defaults to
+   `coretext` — CoreText for rendering, not FreeType. There is no sacred cross-platform
+   FreeType path; FreeType is what platforms get when they have nothing better.
+2. **Windows' current default is explicitly a placeholder.** `Backend.default()` returns
+   `freetype_windows` with upstream's own comment: *"A future DirectWrite backend can
+   replace this if needed."* Its discovery is a `C:\Windows\Fonts` directory scan with no
+   system fallback chain.
+
+### Colour emoji is a hard requirement, and it decides the rasterizer
+
+Measured on the Phase 0/1/2 dev box (Windows 11 26200):
+
+- `seguiemj.ttf` has a **COLR table, version 1**, ~7 MB, containing *both* a v1 paint tree
+  (`baseGlyphListOffset` non-zero) and a complete **v0** layer set (3,372 base glyph
+  records, 53,071 layer records).
+- **No font shipped with Windows has a `CBDT` or `sbix` table** — checked across
+  `C:\Windows\Fonts`. There is no bitmap colour emoji font on the platform.
+- ghostty's FreeType binding does not expose `ftcolor` at all, so *no* COLR support exists
+  in the current Zig glyph path.
+
+FreeType can rasterize COLR v0 layers via `FT_Get_Color_Glyph_Layer`, but COLR v1 paint
+trees (gradients, transforms, composites) would have to be rendered by hand. DirectWrite
+implements all of it already.
+
+### What AtlasEngine does
+
+Windows Terminal's own renderer is the closest prior art, and its D3D11 backend is
+architecturally what we are building:
+
+- **Shaping**: `IDWriteTextAnalyzer1` — `AnalyzeScript`, `GetGlyphs`, `GetGlyphPlacements`.
+- **Rasterization**: `CreateDxgiSurfaceRenderTarget` over the glyph atlas texture, so **D2D
+  draws glyphs directly into the D3D11 atlas** with no CPU round-trip.
+- **Colour glyphs**: `IDWriteFactory4::TranslateColorGlyphRun`, dispatching per
+  `glyphImageFormat` to `DrawColorBitmapGlyphRun` / `DrawSvgGlyphRun` / `DrawGlyphRun`, with
+  `paletteIndex == 0xffff` meaning "use the foreground brush".
+- **Antialiasing**: configurable ClearType or grayscale, and it **forces grayscale for
+  colour glyphs**. Its ClearType path uses `IDWriteGlyphRunAnalysis::CreateAlphaTexture`
+  with dual-source blending.
+
+Notably, AtlasEngine requests `DWRITE_GLYPH_IMAGE_FORMATS_COLR` on an `IDWriteFactory4` — it
+never asks for COLR v1 paint trees. **Windows Terminal renders the v0 layers.**
 
 ## Decision
 
-Base the Windows font backend on wintty's `directwrite_freetype` shape:
+A **`directwrite_harfbuzz`** backend: DirectWrite for discovery *and* rasterization,
+HarfBuzz for shaping. This mirrors the existing `coretext_harfbuzz` combination rather than
+inventing a shape.
 
-- **Discovery + fallback**: DirectWrite, upgraded to `IDWriteFontFallback::MapCharacters`
-  (the real locale-aware system fallback chain) with phantty's negative-cache idea so
-  unfallbackable codepoints don't rescan.
-- **Rasterization**: FreeType, grayscale AA with gamma-correct blending.
-- **Shaping**: HarfBuzz (unchanged; ligatures work).
+- **Discovery + fallback**: DirectWrite, using `IDWriteFontFallback::MapCharacters` (the
+  real locale-aware system fallback chain) with a negative cache so unfallbackable
+  codepoints are not rescanned.
+- **Rasterization**: DirectWrite/Direct2D, drawing into the glyph atlas via
+  `CreateDxgiSurfaceRenderTarget` as AtlasEngine does. **Grayscale AA only.**
+- **Colour glyphs**: `TranslateColorGlyphRun` with AtlasEngine's format dispatch and
+  palette-index rule. This yields COLR v0, COLR v1, SVG, PNG and bitmap emoji from the
+  platform implementation, with no glyph-format work of our own.
+- **Shaping**: HarfBuzz, unchanged from every other ghostty platform.
 
 ## Alternatives rejected
 
+- **FreeType rasterization** (this ADR's earlier draft). Its two arguments do not survive
+  scrutiny. It claimed DWrite raster would "fork the glyph pipeline away from ghostty's
+  cross-platform FreeType path" — but macOS already renders with CoreText, so a native
+  Windows rasterizer *follows* the architecture rather than forking it. It also claimed
+  ClearType subpixel is wrong over a premultiplied-alpha composition surface, which is
+  true but is an argument against *subpixel AA*, not against DirectWrite: D2D renders
+  grayscale perfectly well, and AtlasEngine itself falls back to grayscale when composing.
+  Keeping FreeType would additionally leave colour emoji as permanent bespoke work.
+- **COLR v0 layers in FreeType** (expose `ftcolor`, composite layers with palette colours).
+  Genuinely viable and more upstreamable — it would render Segoe UI Emoji on par with
+  AtlasEngine, since both would use the v0 data. Rejected because it solves only one glyph
+  format: SVG-in-OpenType and COLR v1 gradients would remain gaps, and text would still not
+  match the platform. It is the better option *only* if DirectWrite rasterization proves
+  unworkable, and is recorded here as the fallback.
+- **DirectWrite shaping** (following AtlasEngine all the way). AtlasEngine shapes with
+  DWrite because it has no alternative. ghostty has HarfBuzz working on every platform and
+  a named backend for native-render-plus-HarfBuzz. Adopting DWrite shaping would be a much
+  larger change with real risk of ligature/cluster divergence from ghostty elsewhere.
+- **ClearType via `CreateAlphaTexture` + dual-source blending** (AtlasEngine's other path).
+  Wrong over our premultiplied composition surface, and it would constrain the renderer's
+  blend state for a benefit we cannot use.
+- **Bundling a CBDT colour emoji font** (e.g. Noto). Works with the existing bitmap path
+  and no new code, but Windows ships no CBDT font, so it means overriding the system emoji
+  font — users would get Android-style emoji in a Windows terminal.
 - **Font-directory scanner** (upstream `freetype_windows`, winghostty): no system fallback
-  chain — CJK/emoji "just working" is table stakes for a Windows Terminal engine.
-- **DWrite rasterization now**: ClearType subpixel is actively wrong over the
-  premultiplied-alpha composition surface (AtlasEngine's own lesson); it would also fork
-  the glyph pipeline away from ghostty's cross-platform FreeType path, hurting
-  upstream-mergeability. Deferred, not refused — AtlasEngine's `DWriteTextAnalysis.cpp` /
-  `dwrite_helpers.*` are the reference if a `directwrite` raster backend is built later.
-- **Manual HasCharacter collection walks** (phantty/wintty): reimplements what
-  `IDWriteFontFallback` already does, worse and slower.
+  chain. CJK and emoji "just working" is table stakes for a Windows Terminal engine.
 
 ## Consequences
 
-- Text is FreeType-rendered: subtly different hinting/gamma from DWrite-rendered Windows
-  apps. Accepted for now; revisit condition is user-visible complaints after Phase 6.
-- **COLRv1 emoji is a named work item** (FreeType has COLRv1 APIs; ghostty's rasterizer
-  needs to call them) — without it, Segoe UI Emoji renders via fallback paths poorly.
-- The discovery backend is a self-contained upstream patch (`dwrite-discovery` in
-  ADR 0004's series), independent of the renderer.
+- **Text will match other Windows applications**, which the FreeType draft explicitly gave
+  up. This removes the "revisit if users complain about hinting/gamma" clause entirely.
+- **Colour emoji stops being a tracked gap.** On par with AtlasEngine for Segoe UI Emoji
+  (both render v0 layers), and ahead of it for SVG glyph formats. Neither renders COLR v1
+  gradients today; requesting `DWRITE_GLYPH_IMAGE_FORMATS_COLR_PAINT_TREE` via
+  `IDWriteFactory8` is a separable later upgrade that would put us *ahead* of WT.
+- **The glyph atlas becomes a D2D-rendered DXGI surface**, not a CPU-uploaded texture. This
+  obsoletes the `Texture.replaceRegion`/`UpdateSubresource` path written in Phase 1, which
+  has never executed — cheap to change now, since nothing depends on it.
+- **D2D/D3D11 interop is new machinery**: a `ID2D1Factory`, a device context over the atlas
+  surface, and correct BeginDraw/EndDraw sequencing against a texture the D3D11 renderer
+  also samples. AtlasEngine's `BackendD3D` is the reference.
+- **Less upstreamable than a FreeType COLR implementation.** A DirectWrite face benefits
+  only Windows, whereas COLR-in-FreeType would benefit every ghostty platform. Accepted
+  deliberately: the project's target is Windows Terminal, and upstream's own comment invites
+  a DirectWrite backend.
+- **More new code than the FreeType draft** — glyph metrics, rasterization, and the atlas
+  path all become DirectWrite-shaped. This is a schedule cost paid in Phase 3.
+- The backend remains a self-contained upstream patch (`dwrite-discovery` in ADR 0004's
+  series), independent of the renderer patches.
+
+## What changed and why
+
+The earlier draft optimized for reaching a working Windows font stack quickly, and FreeType
+does that. Three pieces of evidence, gathered while deciding the colour-emoji approach,
+inverted the trade:
+
+1. **`Backend.default()` shows Windows' FreeType default is a stopgap** and macOS already
+   uses a native rasterizer — so "stay on FreeType for consistency" described a consistency
+   that does not exist.
+2. **Segoe UI Emoji is COLR v1 and Windows ships no bitmap emoji font**, so FreeType meant
+   building colour-glyph support ourselves, permanently, for one platform.
+3. **AtlasEngine demonstrates the whole pipeline** — including the DXGI-surface atlas trick
+   — so the DirectWrite path is a port of proven code rather than new design.
