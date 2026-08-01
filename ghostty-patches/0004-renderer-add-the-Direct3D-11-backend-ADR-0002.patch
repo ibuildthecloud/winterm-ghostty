@@ -1,0 +1,4051 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Fri, 31 Jul 2026 17:04:53 -0700
+Subject: [PATCH] renderer: add the Direct3D 11 backend (ADR 0002)
+
+Adds `directx11` to the Backend enum, defaulted on Windows, and implements
+the GraphicsAPI contract from renderer/generic.zig in src/renderer/D3D11.zig
+plus src/renderer/directx11/.
+
+Windows had no usable GPU backend: Metal is Darwin-only and the OpenGL
+backend is a compile-only stub for the embedded apprt that needs desktop
+GL 4.3. The DLL now imports d3d11.dll and GenericRenderer(D3D11) compiles,
+so the renderer runs end to end on Windows for the first time.
+
+Verified against harness/hwnd-host: the surface clears to the terminal's
+configured background (#282C34 by default, #FF0000 with --background=ff0000),
+survives repeated resizes between 520x420 and 1400x900, and renders
+identically on hardware and on forced WARP, both at feature level 11_1.
+
+What is real
+------------
+Device creation walking ADR 0002's degradation ladder (hardware -> WARP),
+the hwnd-mode swap chain, render targets, textures, samplers, dynamic
+buffers, resize, device-lost detection on present, and clear + present.
+drawFrame runs to completion and produces a correctly cleared, correctly
+sized surface.
+
+What is not
+-----------
+The cell pipelines, the glyph atlas draw path, and the HLSL shader set are
+PLAN Phase 3. RenderPass.step accepts steps and ignores them - one of the two
+`phase1_skeleton` markers in the tree. Everything else on the path is real,
+which is why the generic renderer is wired up rather than bypassed: the
+compiler checks the whole contract against actual call sites even though
+nothing draws yet.
+
+Composition mode - the DirectComposition surface handle a XAML
+SwapChainPanel consumes, and the mode Windows Terminal will use - is Phase
+2. init() returns UnsupportedSurface for it rather than silently presenting
+nowhere.
+
+Three things only running it could find
+---------------------------------------
+- DXGI rejects DXGI_ALPHA_MODE_PREMULTIPLIED for hwnd swap chains with
+  DXGI_ERROR_INVALID_CALL. Transparency only means something when a
+  compositor is behind the surface, so alpha mode now follows the
+  presentation target: IGNORE for a window, PREMULTIPLIED for composition.
+- generic.zig clears each pass to transparent black and paints the real
+  background with the bg_color *pipeline*, explicitly avoiding clear_color so
+  it need not do colour-space conversion on the CPU. With draw steps stubbed
+  that leaves a black window, indistinguishable from a broken swap chain. The
+  second `phase1_skeleton` marker clears to the terminal background instead,
+  taken from the same uniforms the shader would have read - and has to apply
+  the sRGB transfer function itself, because the target is an _SRGB format
+  under linear blending and ClearRenderTargetView re-encodes on store.
+  Without that conversion #282C34 rendered as #6E737D.
+- GenericRenderer learns about size changes solely by comparing
+  api.surfaceSize() against its own state. Returning the device's cached
+  dimensions meant a grown window never reached the renderer and the newly
+  exposed region stayed blank. drawFrameStart now re-syncs the swap chain
+  from the window's client rect, which drawFrame calls immediately before
+  consulting surfaceSize().
+
+Notes on the harvest
+--------------------
+The COM/D3D11/DXGI bindings come from PR #11886 by deblasis (MIT), noted in
+each file header. That PR wired only the vtable slots its SwapChainPanel
+demo called and left the rest as `Reserved`, so this completes them:
+CreateSwapChainForHwnd, CreateTexture2D, CreateShaderResourceView,
+CreateSamplerState, CopyResource, UpdateSubresource, and the descriptor
+types they take. Its device.zig was not reusable at all - it hardcoded
+D3D_DRIVER_TYPE.HARDWARE with no fallback and took an ISwapChainPanelNative
+- so device.zig here is new.
+
+Details worth keeping in mind
+-----------------------------
+- The GPU data structs in directx11/shaders.zig are byte-identical to
+  metal/shaders.zig, alignments included. GenericRenderer writes the same
+  bytes for every backend, so drift there is silent corruption rather than
+  a compile error. Metal's @sizeOf(CellText) == 32 test is carried over.
+- present() copies the target to the back buffer instead of rendering
+  straight into it, which is what keeps the Phase 6 post-process chain and
+  Phase 7 damage gating possible without restructuring.
+- RenderPass.Step.Draw.type is a backend-neutral Primitive enum mapped to
+  D3D topology at draw time, so D3D vocabulary stays out of generic.zig.
+- shadertoy.Target gains `hlsl`, whose conversion returns an explicit error.
+  SPIRV-Cross has an HLSL backend, so Phase 6 is wiring rather than missing
+  capability; refusing beats silently dropping a user's shader.
+- GHOSTTY_D3D11_DRIVER=warp|hardware pins the rasterizer, which is how the
+  forced-WARP exit criterion gets exercised on a machine with a working GPU.
+
+zig build -Dapp-runtime=none -> ghostty-internal.dll, imports d3d11.dll,
+                                234 exports
+zig build test                -> 3065 passed, 55 skipped, 0 failed
+                                (4 new: CellText size, DriverKind mapping,
+                                 and the COM layer tests)
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/renderer.zig                      |    2 +
+ src/renderer/D3D11.zig                |  354 +++++++
+ src/renderer/backend.zig              |    7 +
+ src/renderer/directx11/Frame.zig      |  110 +++
+ src/renderer/directx11/RenderPass.zig |  140 +++
+ src/renderer/directx11/Sampler.zig    |   76 ++
+ src/renderer/directx11/Target.zig     |  100 ++
+ src/renderer/directx11/Texture.zig    |  186 ++++
+ src/renderer/directx11/buffer.zig     |  184 ++++
+ src/renderer/directx11/com.zig        |   70 ++
+ src/renderer/directx11/com_test.zig   |  116 +++
+ src/renderer/directx11/d3d11.zig      | 1214 +++++++++++++++++++++++++
+ src/renderer/directx11/device.zig     |  399 ++++++++
+ src/renderer/directx11/dxgi.zig       |  590 ++++++++++++
+ src/renderer/directx11/shaders.zig    |  232 +++++
+ src/renderer/shadertoy.zig            |    9 +-
+ 16 files changed, 3788 insertions(+), 1 deletion(-)
+ create mode 100644 src/renderer/D3D11.zig
+ create mode 100644 src/renderer/directx11/Frame.zig
+ create mode 100644 src/renderer/directx11/RenderPass.zig
+ create mode 100644 src/renderer/directx11/Sampler.zig
+ create mode 100644 src/renderer/directx11/Target.zig
+ create mode 100644 src/renderer/directx11/Texture.zig
+ create mode 100644 src/renderer/directx11/buffer.zig
+ create mode 100644 src/renderer/directx11/com.zig
+ create mode 100644 src/renderer/directx11/com_test.zig
+ create mode 100644 src/renderer/directx11/d3d11.zig
+ create mode 100644 src/renderer/directx11/device.zig
+ create mode 100644 src/renderer/directx11/dxgi.zig
+ create mode 100644 src/renderer/directx11/shaders.zig
+
+diff --git a/src/renderer.zig b/src/renderer.zig
+index 747556847..2e25a96ce 100644
+--- a/src/renderer.zig
++++ b/src/renderer.zig
+@@ -18,6 +18,7 @@ pub const GenericRenderer = @import("renderer/generic.zig").Renderer;
+ pub const Metal = @import("renderer/Metal.zig");
+ pub const OpenGL = @import("renderer/OpenGL.zig");
+ pub const WebGL = @import("renderer/WebGL.zig");
++pub const D3D11 = @import("renderer/D3D11.zig");
+ pub const Options = @import("renderer/Options.zig");
+ pub const Overlay = @import("renderer/Overlay.zig");
+ pub const Thread = @import("renderer/Thread.zig");
+@@ -39,6 +40,7 @@ pub const Renderer = switch (build_config.renderer) {
+     .metal => GenericRenderer(Metal),
+     .opengl => GenericRenderer(OpenGL),
+     .webgl => WebGL,
++    .directx11 => GenericRenderer(D3D11),
+ };
+ 
+ /// The health status of a renderer. These must be shared across all
+diff --git a/src/renderer/D3D11.zig b/src/renderer/D3D11.zig
+new file mode 100644
+index 000000000..efc5ddf24
+--- /dev/null
++++ b/src/renderer/D3D11.zig
+@@ -0,0 +1,354 @@
++//! Graphics API wrapper for Direct3D 11 (ADR 0002).
++//!
++//! This implements the `GraphicsAPI` contract that `renderer/generic.zig`
++//! requires, mirroring the structure of `Metal.zig` and `OpenGL.zig`.
++//!
++//! ## Phase 1 status
++//!
++//! What is real: device creation with the hardware -> WARP degradation ladder,
++//! the hwnd-mode swap chain, render targets, textures, samplers, buffers,
++//! resize, device-lost detection, and clear + present. That is enough for
++//! `GenericRenderer.drawFrame` to run end to end and produce a correctly
++//! cleared, correctly sized surface.
++//!
++//! What is not, and is marked `phase1_skeleton` where it matters: the cell
++//! pipelines, the HLSL shader set, and therefore any actual drawing.
++//! `RenderPass.step` accepts steps and ignores them. PLAN Phase 3 fills these
++//! in; the markers must all be gone by the end of it.
++//!
++//! Composition mode (the DirectComposition surface handle that a XAML
++//! SwapChainPanel consumes, and the mode Windows Terminal uses) is Phase 2.
++
++pub const D3D11 = @This();
++
++const std = @import("std");
++const builtin = @import("builtin");
++const Allocator = std.mem.Allocator;
++
++const apprt = @import("../apprt.zig");
++const configpkg = @import("../config.zig");
++const global = @import("../global.zig");
++const font = @import("../font/main.zig");
++const rendererpkg = @import("../renderer.zig");
++const shadertoy = @import("shadertoy.zig");
++const Renderer = rendererpkg.GenericRenderer(D3D11);
++
++const com = @import("directx11/com.zig");
++const d3d11 = @import("directx11/d3d11.zig");
++const dxgi = @import("directx11/dxgi.zig");
++const devicepkg = @import("directx11/device.zig");
++
++pub const GraphicsAPI = D3D11;
++pub const Target = @import("directx11/Target.zig");
++pub const Frame = @import("directx11/Frame.zig");
++pub const RenderPass = @import("directx11/RenderPass.zig");
++const bufferpkg = @import("directx11/buffer.zig");
++pub const Buffer = bufferpkg.Buffer;
++pub const Sampler = @import("directx11/Sampler.zig");
++pub const Texture = @import("directx11/Texture.zig");
++pub const shaders = @import("directx11/shaders.zig");
++pub const Pipeline = shaders.Pipeline;
++
++pub const Device = devicepkg.Device;
++pub const DriverKind = devicepkg.DriverKind;
++
++/// HLSL, compiled to DXBC with fxc. Note this is SM 5.0, not the SM 6 DXIL
++/// that dxc emits - D3D11 cannot consume DXIL.
++pub const custom_shader_target: shadertoy.Target = .hlsl;
++
++/// D3D11's clip space has +Y = up but its texture/fragment coordinates have
++/// +Y = down, matching Metal.
++pub const custom_shader_y_is_down = true;
++
++/// Double buffering. FLIP_SEQUENTIAL requires at least two buffers, and we do
++/// not yet have the waitable swap chain that would make a third useful
++/// (Phase 7).
++pub const swap_chain_count = 2;
++
++const log = std.log.scoped(.directx11);
++
++alloc: Allocator,
++
++/// Alpha blending mode.
++blending: configpkg.Config.AlphaBlending,
++
++/// The D3D11 device, swap chain, and back-buffer view.
++device: Device,
++
++/// The most recently presented target, in case we need to present it again.
++last_target: ?Target = null,
++
++pub const Error = error{
++    /// The surface was created without a Windows platform payload, or with one
++    /// selecting a mode this build does not implement yet.
++    UnsupportedSurface,
++} || devicepkg.Error;
++
++pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
++    comptime switch (builtin.os.tag) {
++        .windows => {},
++        else => @compileError("unsupported platform for D3D11"),
++    };
++
++    // The surface tells us where to present. Only hwnd mode exists in Phase 1;
++    // composition mode arrives in Phase 2.
++    const target: devicepkg.Target = switch (opts.rt_surface.platform) {
++        .win32 => |v| if (v.hwnd) |hwnd|
++            .{ .hwnd = hwnd }
++        else if (v.composition)
++            // Phase 2. Fail loudly rather than silently presenting nowhere.
++            return Error.UnsupportedSurface
++        else
++            return Error.UnsupportedSurface,
++
++        else => return Error.UnsupportedSurface,
++    };
++
++    const size = opts.rt_surface.size;
++    const device = try Device.init(
++        target,
++        @max(size.width, 1),
++        @max(size.height, 1),
++        forced_driver,
++    );
++
++    return .{
++        .alloc = alloc,
++        .blending = opts.config.blending,
++        .device = device,
++    };
++}
++
++/// Set by the harness (via the GHOSTTY_D3D11_DRIVER environment variable) to
++/// pin the rasterizer. This is how the forced-WARP exit criterion is exercised
++/// on a machine that has a working GPU.
++var forced_driver: ?DriverKind = null;
++
++fn utf16(comptime s: []const u8) [:0]const u16 {
++    return std.unicode.utf8ToUtf16LeStringLiteral(s);
++}
++
++/// ASCII case-insensitive comparison of a UTF-16 environment value against an
++/// ASCII literal. Values here are always ASCII keywords, so this does not need
++/// to handle full Unicode case folding.
++fn eqlIgnoreCaseUtf16(value: []const u16, comptime expect: []const u8) bool {
++    if (value.len != expect.len) return false;
++    for (value, expect) |v, e| {
++        if (v > 127) return false;
++        if (std.ascii.toLower(@intCast(v)) != std.ascii.toLower(e)) return false;
++    }
++    return true;
++}
++
++/// Read the driver override once at startup. Called by `surfaceInit`.
++fn readDriverOverride() void {
++    const value = global.environ().getWindows(
++        utf16("GHOSTTY_D3D11_DRIVER"),
++    ) orelse return;
++
++    if (eqlIgnoreCaseUtf16(value, "warp")) {
++        forced_driver = .warp;
++        log.info("GHOSTTY_D3D11_DRIVER=warp, forcing software rasterizer", .{});
++    } else if (eqlIgnoreCaseUtf16(value, "hardware")) {
++        forced_driver = .hardware;
++        log.info("GHOSTTY_D3D11_DRIVER=hardware, disabling WARP fallback", .{});
++    } else {
++        log.warn("unrecognized GHOSTTY_D3D11_DRIVER value, ignoring", .{});
++    }
++}
++
++pub fn deinit(self: *D3D11) void {
++    if (self.last_target) |*t| t.deinit();
++    self.device.deinit();
++    self.* = undefined;
++}
++
++/// Called early right after surface creation, before the renderer thread.
++pub fn surfaceInit(surface: *apprt.Surface) !void {
++    _ = surface;
++    readDriverOverride();
++}
++
++pub fn drawFrameStart(self: *D3D11) void {
++    // Pick up window resizes before `surfaceSize()` is consulted. drawFrame
++    // calls this first and then compares surfaceSize() against its own state
++    // to decide whether to rebuild targets, so doing it here is what makes a
++    // resized window actually reach the renderer.
++    self.device.syncToWindow();
++}
++
++pub fn drawFrameEnd(self: *D3D11) void {
++    _ = self;
++}
++
++pub fn initShaders(
++    self: *const D3D11,
++    alloc: Allocator,
++    custom_shaders: []const [:0]const u8,
++) !shaders.Shaders {
++    _ = alloc;
++    return try shaders.Shaders.init(self.alloc, custom_shaders);
++}
++
++/// Get the current size of the runtime surface.
++pub fn surfaceSize(self: *const D3D11) !struct { width: u32, height: u32 } {
++    return .{ .width = self.device.width, .height = self.device.height };
++}
++
++/// Initialize a new render target which can be presented by this API.
++pub fn initTarget(self: *const D3D11, width: usize, height: usize) !Target {
++    return Target.init(.{
++        .device = self.device.device,
++        .width = @max(width, 1),
++        .height = @max(height, 1),
++        .srgb = self.blending.isLinear(),
++    });
++}
++
++/// Present the provided target by copying it to the swap chain back buffer.
++///
++/// A copy rather than rendering straight to the back buffer is what keeps the
++/// post-process shader chain (Phase 6) and damage-gated presentation (Phase 7)
++/// possible without restructuring.
++pub fn present(self: *D3D11, target: Target) !void {
++    // The swap chain may have been resized since this target was made. Growing
++    // the window before the target catches up is normal for a frame or two.
++    if (target.width != self.device.width or
++        target.height != self.device.height)
++    {
++        log.debug("target {d}x{d} does not match swap chain {d}x{d}, skipping copy", .{
++            target.width, target.height, self.device.width, self.device.height,
++        });
++    } else if (self.device.backBuffer()) |back| {
++        defer _ = back.Release();
++        self.device.context.CopyResource(@ptrCast(back), @ptrCast(target.texture));
++    }
++
++    const lost = self.device.present(true);
++    if (lost) return error.DeviceLost;
++
++    self.last_target = target;
++}
++
++/// Present the last presented target again.
++pub fn presentLastTarget(self: *D3D11) !void {
++    if (self.last_target) |target| try self.present(target);
++}
++
++/// Resize the swap chain to match the surface.
++pub fn resize(self: *D3D11, width: u32, height: u32) !void {
++    try self.device.resize(width, height);
++}
++
++/// Returns the options to use when constructing buffers.
++pub inline fn bufferOptions(self: D3D11) bufferpkg.Options {
++    return .{
++        .device = self.device.device,
++        .context = self.device.context,
++        .bind = .vertex,
++    };
++}
++
++pub inline fn uniformBufferOptions(self: D3D11) bufferpkg.Options {
++    return .{
++        .device = self.device.device,
++        .context = self.device.context,
++        .bind = .constant,
++    };
++}
++
++pub const instanceBufferOptions = bufferOptions;
++pub const fgBufferOptions = bufferOptions;
++pub const bgBufferOptions = bufferOptions;
++pub const imageBufferOptions = bufferOptions;
++pub const bgImageBufferOptions = bufferOptions;
++
++/// Returns the options to use when constructing textures.
++pub inline fn textureOptions(self: D3D11) Texture.Options {
++    return .{
++        .device = self.device.device,
++        .context = self.device.context,
++        .format = .rgba,
++        .srgb = true,
++    };
++}
++
++/// Returns the options to use when constructing samplers.
++pub inline fn samplerOptions(self: D3D11) Sampler.Options {
++    return .{
++        .device = self.device.device,
++        .min_filter = .linear,
++        .mag_filter = .linear,
++        .wrap_s = .clamp_to_edge,
++        .wrap_t = .clamp_to_edge,
++    };
++}
++
++/// Pixel format for image texture options.
++pub const ImageTextureFormat = enum {
++    gray,
++    rgba,
++    bgra,
++
++    fn toTextureFormat(self: ImageTextureFormat) Texture.Format {
++        return switch (self) {
++            .gray => .gray,
++            .rgba => .rgba,
++            .bgra => .bgra,
++        };
++    }
++};
++
++pub inline fn imageTextureOptions(
++    self: D3D11,
++    format: ImageTextureFormat,
++    srgb: bool,
++) Texture.Options {
++    return .{
++        .device = self.device.device,
++        .context = self.device.context,
++        .format = format.toTextureFormat(),
++        .srgb = srgb,
++    };
++}
++
++/// Initializes a Texture suitable for the provided font atlas.
++pub fn initAtlasTexture(
++    self: *const D3D11,
++    atlas: *const font.Atlas,
++) Texture.Error!Texture {
++    const format: Texture.Format = switch (atlas.format) {
++        .grayscale => .gray,
++        .bgra => .bgra,
++        else => return Texture.Error.UnsupportedFormat,
++    };
++
++    return try Texture.init(
++        .{
++            .device = self.device.device,
++            .context = self.device.context,
++            .format = format,
++            // The glyph atlas holds coverage/color data that the shader
++            // samples directly; it must not be sRGB-decoded on read.
++            .srgb = false,
++        },
++        atlas.size,
++        atlas.size,
++        null,
++    );
++}
++
++/// Begin a frame.
++pub inline fn beginFrame(
++    self: *const D3D11,
++    renderer: *Renderer,
++    target: *Target,
++) !Frame {
++    _ = self;
++    return try Frame.begin(.{}, renderer, target);
++}
++
++test {
++    _ = shaders;
++    _ = devicepkg;
++}
+diff --git a/src/renderer/backend.zig b/src/renderer/backend.zig
+index 942e1f0ff..36985a971 100644
+--- a/src/renderer/backend.zig
++++ b/src/renderer/backend.zig
+@@ -6,6 +6,7 @@ pub const Backend = enum {
+     opengl,
+     metal,
+     webgl,
++    directx11,
+ 
+     pub fn default(
+         target: std.Target,
+@@ -18,6 +19,12 @@ pub const Backend = enum {
+         }
+ 
+         if (target.os.tag.isDarwin()) return .metal;
++
++        // On Windows the OpenGL backend is a compile-only stub for the
++        // embedded apprt requiring desktop GL 4.3, so D3D11 is the only
++        // usable default (ADR 0002).
++        if (target.os.tag == .windows) return .directx11;
++
+         return .opengl;
+     }
+ };
+diff --git a/src/renderer/directx11/Frame.zig b/src/renderer/directx11/Frame.zig
+new file mode 100644
+index 000000000..05c495983
+--- /dev/null
++++ b/src/renderer/directx11/Frame.zig
+@@ -0,0 +1,110 @@
++//! Wrapper for handling frames.
++//!
++//! D3D11's immediate context has no explicit frame object, so this is a thin
++//! bookkeeping type: it owns the target for the duration of the frame, hands
++//! out render passes, and reports health on completion.
++
++const Self = @This();
++
++const std = @import("std");
++
++const D3D11 = @import("../D3D11.zig");
++const Renderer = @import("../generic.zig").Renderer(D3D11);
++const Target = @import("Target.zig");
++const RenderPass = @import("RenderPass.zig");
++
++const Health = @import("../../renderer.zig").Health;
++
++const log = std.log.scoped(.directx11);
++
++/// Options for beginning a frame.
++pub const Options = struct {};
++
++renderer: *Renderer,
++target: *Target,
++
++pub fn begin(
++    opts: Options,
++    /// Once the frame has been completed, the `frameCompleted` method
++    /// on the renderer is called with the health status of the frame.
++    renderer: *Renderer,
++    /// The target is presented via the provided renderer's API when completed.
++    target: *Target,
++) !Self {
++    _ = opts;
++    return .{ .renderer = renderer, .target = target };
++}
++
++/// Add a render pass to this frame with the provided attachments.
++pub inline fn renderPass(
++    self: *const Self,
++    attachments: []const RenderPass.Options.Attachment,
++) RenderPass {
++    return RenderPass.begin(.{
++        .api = &self.renderer.api,
++        .attachments = attachments,
++        .skeleton_clear = self.skeletonClear(),
++    });
++}
++
++/// phase1_skeleton: the colour the surface should end up when nothing can be
++/// drawn yet.
++///
++/// `generic.zig` clears each pass to transparent black and paints the real
++/// background with the `bg_color` *pipeline*, deliberately avoiding
++/// `clear_color` so it does not have to do colour-space conversion on the CPU.
++/// With draw steps stubbed out that leaves a black window, which is
++/// indistinguishable from a broken swap chain and proves nothing.
++///
++/// So until Phase 3 supplies pipelines, clear to the terminal's own background
++/// colour instead. It comes from the same uniforms the shader would have read,
++/// so the window visibly tracks the config - `--background=ff0000` turns it
++/// red - which is what makes this phase's deliverable meaningful.
++///
++/// The colour-space handling here is the thing `generic.zig`'s comment is
++/// warning about. When alpha blending is linear the render target has an
++/// `_SRGB` format, and `ClearRenderTargetView` treats the value it is given as
++/// *linear*, re-encoding it to sRGB on store. Passing the config's sRGB bytes
++/// straight through therefore renders visibly too bright - #282C34 came out as
++/// #6E737D before this conversion was added.
++fn skeletonClear(self: *const Self) ?[4]f32 {
++    const bg = self.renderer.uniforms.bg_color;
++    const to_linear = self.renderer.api.blending.isLinear();
++
++    var out: [4]f32 = .{ 0, 0, 0, 1 };
++    for (0..3) |i| {
++        const c = @as(f32, @floatFromInt(bg[i])) / 255.0;
++        out[i] = if (to_linear) srgbToLinear(c) else c;
++    }
++    return out;
++}
++
++/// The standard sRGB electro-optical transfer function.
++fn srgbToLinear(c: f32) f32 {
++    return if (c <= 0.04045)
++        c / 12.92
++    else
++        std.math.pow(f32, (c + 0.055) / 1.055, 2.4);
++}
++
++/// Complete this frame and present the target.
++///
++/// `sync` is ignored: Phase 1 presents on the immediate context and does not
++/// yet use a waitable swap chain. The frame-latency wait object and the
++/// damage-gated present policy are Phase 7 (DESIGN presentation policy).
++pub fn complete(self: *const Self, sync: bool) void {
++    _ = sync;
++
++    // Health is driven by whether presentation reported a lost device. There
++    // is no fence to wait on here, so a frame that reached present without the
++    // device dropping is healthy.
++    const health: Health = health: {
++        self.renderer.api.present(self.target.*) catch |err| {
++            log.err("failed to present render target: err={}", .{err});
++            break :health .unhealthy;
++        };
++        break :health .healthy;
++    };
++
++    self.renderer.frameCompleted(health);
++}
+diff --git a/src/renderer/directx11/RenderPass.zig b/src/renderer/directx11/RenderPass.zig
+new file mode 100644
+index 000000000..d70356af9
+--- /dev/null
++++ b/src/renderer/directx11/RenderPass.zig
+@@ -0,0 +1,140 @@
++//! Wrapper for handling render passes.
++//!
++//! Phase 1 status: attachment handling (bind + clear) is real, because that is
++//! what produces the cleared surface this phase has to demonstrate. Draw steps
++//! are **not** - `step` is a documented no-op until the cell pipelines, glyph
++//! atlas, and HLSL land in Phase 3. See the `phase1_skeleton` marker in
++//! `../D3D11.zig`.
++
++const Self = @This();
++
++const std = @import("std");
++
++const com = @import("com.zig");
++const d3d11 = @import("d3d11.zig");
++
++const Sampler = @import("Sampler.zig");
++const Target = @import("Target.zig");
++const Texture = @import("Texture.zig");
++const shaders = @import("shaders.zig");
++const Pipeline = shaders.Pipeline;
++const Buffer = @import("buffer.zig").Buffer;
++
++const log = std.log.scoped(.directx11);
++
++/// Options for beginning a render pass.
++pub const Options = struct {
++    /// The graphics API, for access to the immediate context.
++    api: *const @import("../D3D11.zig"),
++
++    /// Color attachments for this render pass.
++    attachments: []const Attachment,
++
++    /// phase1_skeleton: substituted for a fully-transparent `clear_color`.
++    /// See `Frame.skeletonClear` for why this exists.
++    skeleton_clear: ?[4]f32 = null,
++
++    pub const Attachment = struct {
++        target: union(enum) {
++            texture: Texture,
++            target: Target,
++        },
++        clear_color: ?[4]f32 = null,
++    };
++};
++
++/// Describes a step in a render pass.
++///
++/// The field set mirrors the Metal and OpenGL backends so that Phase 3 fills in
++/// `step`'s body without reshaping callers in `generic.zig`.
++pub const Step = struct {
++    pipeline: Pipeline,
++    uniforms: ?*d3d11.ID3D11Buffer = null,
++    buffers: []const ?*d3d11.ID3D11Buffer = &.{},
++    textures: []const ?Texture = &.{},
++    samplers: []const ?Sampler = &.{},
++    draw: Draw,
++
++    pub const Draw = struct {
++        type: Primitive,
++        vertex_count: usize,
++        instance_count: usize = 1,
++    };
++
++    /// Backend-neutral primitive names, matching what `generic.zig` passes and
++    /// what `gl.Primitive` spells them as. Mapped to D3D topology at draw
++    /// time rather than exposing `D3D_PRIMITIVE_TOPOLOGY` directly, so the
++    /// generic renderer stays free of D3D vocabulary.
++    pub const Primitive = enum {
++        triangle,
++        triangle_strip,
++
++        pub fn topology(self: Primitive) d3d11.D3D_PRIMITIVE_TOPOLOGY {
++            return switch (self) {
++                .triangle => .TRIANGLELIST,
++                .triangle_strip => .TRIANGLESTRIP,
++            };
++        }
++    };
++};
++
++api: *const @import("../D3D11.zig"),
++attachments: []const Options.Attachment,
++step_number: usize = 0,
++
++/// Begin a render pass: bind the attachments and clear those that ask for it.
++pub fn begin(opts: Options) Self {
++    const ctx = opts.api.device.context;
++
++    // D3D11 binds a fixed-size array of render targets, so gather the views
++    // first. Eight is the D3D11 limit for simultaneous render targets.
++    var rtvs: [8]?*d3d11.ID3D11RenderTargetView = @splat(null);
++    var count: usize = 0;
++    for (opts.attachments) |attachment| {
++        if (count >= rtvs.len) {
++            log.warn("more than {d} attachments, ignoring the rest", .{rtvs.len});
++            break;
++        }
++        const rtv: *d3d11.ID3D11RenderTargetView = switch (attachment.target) {
++            .target => |t| t.rtv,
++            .texture => |t| t.rtv orelse {
++                // A texture used as an attachment must have been created with
++                // render-target binding; skip it rather than crash.
++                log.warn("attachment texture has no render target view", .{});
++                continue;
++            },
++        };
++        rtvs[count] = rtv;
++        count += 1;
++
++        if (attachment.clear_color) |c| {
++            // phase1_skeleton: a fully transparent clear means "the pipelines
++            // will paint this", which they cannot yet. Substitute the
++            // terminal background so the surface shows something real.
++            const use_skeleton = c[3] == 0.0 and opts.skeleton_clear != null;
++            ctx.ClearRenderTargetView(rtv, if (use_skeleton)
++                &opts.skeleton_clear.?
++            else
++                &c);
++        }
++    }
++
++    ctx.OMSetRenderTargets(rtvs[0..count], null);
++
++    return .{ .api = opts.api, .attachments = opts.attachments };
++}
++
++/// Add a step to this render pass.
++///
++/// phase1_skeleton: no-op. Issuing a draw needs a compiled pipeline, an input
++/// layout, and a bound glyph atlas, none of which exist before Phase 3.
++/// Silently ignoring steps is what lets `GenericRenderer.drawFrame` run
++/// end-to-end and produce a correctly cleared, correctly sized surface now.
++pub fn step(self: *Self, s: Step) void {
++    _ = s;
++    self.step_number += 1;
++}
++
++pub fn complete(self: *const Self) void {
++    _ = self;
++}
+diff --git a/src/renderer/directx11/Sampler.zig b/src/renderer/directx11/Sampler.zig
+new file mode 100644
+index 000000000..8ed6ff3ec
+--- /dev/null
++++ b/src/renderer/directx11/Sampler.zig
+@@ -0,0 +1,76 @@
++//! Wrapper for handling samplers.
++
++const Self = @This();
++
++const std = @import("std");
++
++const com = @import("com.zig");
++const d3d11 = @import("d3d11.zig");
++
++const log = std.log.scoped(.directx11);
++
++pub const Error = error{
++    SamplerCreationFailed,
++};
++
++pub const Filter = enum { nearest, linear };
++pub const AddressMode = enum { clamp_to_edge, repeat };
++
++/// Options for initializing a sampler.
++pub const Options = struct {
++    /// Borrowed; the `D3D11` instance outlives its samplers.
++    device: *d3d11.ID3D11Device,
++
++    min_filter: Filter = .linear,
++    mag_filter: Filter = .linear,
++    wrap_s: AddressMode = .clamp_to_edge,
++    wrap_t: AddressMode = .clamp_to_edge,
++};
++
++sampler: *d3d11.ID3D11SamplerState,
++
++pub fn init(opts: Options) Error!Self {
++    // D3D11 encodes min/mag/mip filtering in a single enum rather than as
++    // separate fields, and only exposes the combinations it has values for. We
++    // only ever use all-point or all-linear, so collapse to those two: if
++    // either filter asks for linear, use linear.
++    const filter: d3d11.D3D11_FILTER =
++        if (opts.min_filter == .linear or opts.mag_filter == .linear)
++            .MIN_MAG_MIP_LINEAR
++        else
++            .MIN_MAG_MIP_POINT;
++
++    const desc: d3d11.D3D11_SAMPLER_DESC = .{
++        .Filter = filter,
++        .AddressU = addressMode(opts.wrap_s),
++        .AddressV = addressMode(opts.wrap_t),
++        .AddressW = .CLAMP,
++        .MipLODBias = 0,
++        .MaxAnisotropy = 1,
++        .ComparisonFunc = .NEVER,
++        .BorderColor = .{ 0, 0, 0, 0 },
++        .MinLOD = 0,
++        .MaxLOD = 0,
++    };
++
++    var sampler: ?*d3d11.ID3D11SamplerState = null;
++    if (com.FAILED(opts.device.CreateSamplerState(&desc, &sampler)) or
++        sampler == null)
++    {
++        log.err("failed to create sampler state", .{});
++        return Error.SamplerCreationFailed;
++    }
++
++    return .{ .sampler = sampler.? };
++}
++
++fn addressMode(mode: AddressMode) d3d11.D3D11_TEXTURE_ADDRESS_MODE {
++    return switch (mode) {
++        .clamp_to_edge => .CLAMP,
++        .repeat => .WRAP,
++    };
++}
++
++pub fn deinit(self: Self) void {
++    _ = self.sampler.Release();
++}
+diff --git a/src/renderer/directx11/Target.zig b/src/renderer/directx11/Target.zig
+new file mode 100644
+index 000000000..bd886a869
+--- /dev/null
++++ b/src/renderer/directx11/Target.zig
+@@ -0,0 +1,100 @@
++//! Represents a render target: an offscreen D3D11 texture plus its render
++//! target view.
++//!
++//! `GenericRenderer` renders into a target and then asks the API to present it,
++//! rather than drawing straight to the back buffer. Keeping that indirection
++//! is what makes custom post-process shaders (Phase 6) and the damage-gated
++//! present policy (Phase 7) possible later, so we honour it now even though
++//! Phase 1 only clears.
++
++const Self = @This();
++
++const std = @import("std");
++
++const com = @import("com.zig");
++const d3d11 = @import("d3d11.zig");
++const dxgi = @import("dxgi.zig");
++
++const log = std.log.scoped(.directx11);
++
++pub const Error = error{
++    TextureCreationFailed,
++    RenderTargetViewFailed,
++};
++
++/// Options for initializing a Target.
++pub const Options = struct {
++    /// Device used to allocate the texture. Borrowed, not retained: the
++    /// `D3D11` instance outlives every target it hands out.
++    device: *d3d11.ID3D11Device,
++
++    width: usize,
++    height: usize,
++
++    /// Use an sRGB texture format so blending happens in linear space and the
++    /// hardware re-encodes on store. Mirrors the OpenGL backend's choice of
++    /// internal format based on the alpha-blending config.
++    srgb: bool,
++};
++
++texture: *d3d11.ID3D11Texture2D,
++rtv: *d3d11.ID3D11RenderTargetView,
++
++width: usize,
++height: usize,
++
++pub fn init(opts: Options) Error!Self {
++    const format: dxgi.DXGI_FORMAT = if (opts.srgb)
++        .B8G8R8A8_UNORM_SRGB
++    else
++        .B8G8R8A8_UNORM;
++
++    const desc: d3d11.D3D11_TEXTURE2D_DESC = .{
++        .Width = @intCast(opts.width),
++        .Height = @intCast(opts.height),
++        .MipLevels = 1,
++        .ArraySize = 1,
++        .Format = format,
++        .SampleDesc = .{ .Count = 1, .Quality = 0 },
++        .Usage = .DEFAULT,
++        // SHADER_RESOURCE is needed so post-process shaders can sample this
++        // target as an input in Phase 6.
++        .BindFlags = d3d11.D3D11_BIND_RENDER_TARGET |
++            d3d11.D3D11_BIND_SHADER_RESOURCE,
++        .CPUAccessFlags = 0,
++        .MiscFlags = 0,
++    };
++
++    var texture: ?*d3d11.ID3D11Texture2D = null;
++    if (com.FAILED(opts.device.CreateTexture2D(&desc, null, &texture)) or
++        texture == null)
++    {
++        log.err("failed to create {d}x{d} render target texture", .{
++            opts.width, opts.height,
++        });
++        return Error.TextureCreationFailed;
++    }
++    errdefer _ = texture.?.Release();
++
++    var rtv: ?*d3d11.ID3D11RenderTargetView = null;
++    if (com.FAILED(opts.device.CreateRenderTargetView(
++        @ptrCast(texture.?),
++        null,
++        &rtv,
++    )) or rtv == null) {
++        return Error.RenderTargetViewFailed;
++    }
++
++    return .{
++        .texture = texture.?,
++        .rtv = rtv.?,
++        .width = opts.width,
++        .height = opts.height,
++    };
++}
++
++pub fn deinit(self: *Self) void {
++    _ = self.rtv.Release();
++    _ = self.texture.Release();
++    self.* = undefined;
++}
+diff --git a/src/renderer/directx11/Texture.zig b/src/renderer/directx11/Texture.zig
+new file mode 100644
+index 000000000..38e096e57
+--- /dev/null
++++ b/src/renderer/directx11/Texture.zig
+@@ -0,0 +1,186 @@
++//! Wrapper for handling textures.
++//!
++//! Used for the glyph atlas and for image content. Phase 1 creates and uploads
++//! textures correctly, because `GenericRenderer` builds the atlas regardless of
++//! whether anything is drawn with it; only the draw path is deferred.
++
++const Self = @This();
++
++const std = @import("std");
++
++const com = @import("com.zig");
++const d3d11 = @import("d3d11.zig");
++const dxgi = @import("dxgi.zig");
++
++const log = std.log.scoped(.directx11);
++
++pub const Error = error{
++    TextureCreationFailed,
++    ShaderResourceViewFailed,
++    /// The requested pixel format has no D3D11 equivalent we support.
++    UnsupportedFormat,
++};
++
++/// Pixel formats we can create textures for.
++pub const Format = enum {
++    /// 1 byte per pixel, used by the grayscale glyph atlas.
++    gray,
++    /// 4 bytes per pixel RGBA.
++    rgba,
++    /// 4 bytes per pixel BGRA.
++    bgra,
++
++    fn dxgiFormat(self: Format, srgb: bool) dxgi.DXGI_FORMAT {
++        return switch (self) {
++            // R8_UNORM is the D3D11 spelling of a single-channel 8-bit
++            // texture; the shader swizzles it to alpha.
++            .gray => .R8_UNORM,
++            .rgba => if (srgb) .R8G8B8A8_UNORM_SRGB else .R8G8B8A8_UNORM,
++            .bgra => if (srgb) .B8G8R8A8_UNORM_SRGB else .B8G8R8A8_UNORM,
++        };
++    }
++
++    fn bytesPerPixel(self: Format) usize {
++        return switch (self) {
++            .gray => 1,
++            .rgba, .bgra => 4,
++        };
++    }
++};
++
++/// Options for initializing a texture.
++pub const Options = struct {
++    /// Borrowed; the `D3D11` instance outlives its textures.
++    device: *d3d11.ID3D11Device,
++    context: *d3d11.ID3D11DeviceContext,
++
++    format: Format = .rgba,
++    srgb: bool = false,
++
++    /// Also create a render target view, so this texture can be used as a
++    /// render pass attachment. Needed for post-process targets (Phase 6).
++    render_target: bool = false,
++};
++
++texture: *d3d11.ID3D11Texture2D,
++srv: *d3d11.ID3D11ShaderResourceView,
++rtv: ?*d3d11.ID3D11RenderTargetView,
++
++/// Borrowed context, for uploads.
++context: *d3d11.ID3D11DeviceContext,
++
++width: usize,
++height: usize,
++format: Format,
++
++pub fn init(
++    opts: Options,
++    width: usize,
++    height: usize,
++    data: ?[]const u8,
++) Error!Self {
++    var bind: u32 = d3d11.D3D11_BIND_SHADER_RESOURCE;
++    if (opts.render_target) bind |= d3d11.D3D11_BIND_RENDER_TARGET;
++
++    const desc: d3d11.D3D11_TEXTURE2D_DESC = .{
++        .Width = @intCast(width),
++        .Height = @intCast(height),
++        .MipLevels = 1,
++        .ArraySize = 1,
++        .Format = opts.format.dxgiFormat(opts.srgb),
++        .SampleDesc = .{ .Count = 1, .Quality = 0 },
++        // DEFAULT + UpdateSubresource rather than DYNAMIC + Map: atlas updates
++        // are region replacements, not whole-surface rewrites, and DYNAMIC
++        // textures only support full-discard maps.
++        .Usage = .DEFAULT,
++        .BindFlags = bind,
++        .CPUAccessFlags = 0,
++        .MiscFlags = 0,
++    };
++
++    var initial: d3d11.D3D11_SUBRESOURCE_DATA = undefined;
++    const initial_ptr: ?[*]const d3d11.D3D11_SUBRESOURCE_DATA = if (data) |d| blk: {
++        initial = .{
++            .pSysMem = d.ptr,
++            .SysMemPitch = @intCast(width * opts.format.bytesPerPixel()),
++            .SysMemSlicePitch = 0,
++        };
++        break :blk @ptrCast(&initial);
++    } else null;
++
++    var texture: ?*d3d11.ID3D11Texture2D = null;
++    if (com.FAILED(opts.device.CreateTexture2D(&desc, initial_ptr, &texture)) or
++        texture == null)
++    {
++        log.err("failed to create {d}x{d} texture", .{ width, height });
++        return Error.TextureCreationFailed;
++    }
++    errdefer _ = texture.?.Release();
++
++    var srv: ?*d3d11.ID3D11ShaderResourceView = null;
++    if (com.FAILED(opts.device.CreateShaderResourceView(
++        @ptrCast(texture.?),
++        null,
++        &srv,
++    )) or srv == null) {
++        return Error.ShaderResourceViewFailed;
++    }
++    errdefer _ = srv.?.Release();
++
++    var rtv: ?*d3d11.ID3D11RenderTargetView = null;
++    if (opts.render_target) {
++        if (com.FAILED(opts.device.CreateRenderTargetView(
++            @ptrCast(texture.?),
++            null,
++            &rtv,
++        ))) {
++            return Error.ShaderResourceViewFailed;
++        }
++    }
++
++    return .{
++        .texture = texture.?,
++        .srv = srv.?,
++        .rtv = rtv,
++        .context = opts.context,
++        .width = width,
++        .height = height,
++        .format = opts.format,
++    };
++}
++
++pub fn deinit(self: Self) void {
++    if (self.rtv) |rtv| _ = rtv.Release();
++    _ = self.srv.Release();
++    _ = self.texture.Release();
++}
++
++/// Replace a region of the texture with the provided data.
++///
++/// Does NOT check the dimensions of the data to ensure correctness, matching
++/// the other backends.
++pub fn replaceRegion(
++    self: Self,
++    x: usize,
++    y: usize,
++    width: usize,
++    height: usize,
++    data: []const u8,
++) Error!void {
++    const box: d3d11.D3D11_BOX = .{
++        .left = @intCast(x),
++        .top = @intCast(y),
++        .front = 0,
++        .right = @intCast(x + width),
++        .bottom = @intCast(y + height),
++        .back = 1,
++    };
++    self.context.UpdateSubresource(
++        @ptrCast(self.texture),
++        0,
++        &box,
++        data.ptr,
++        @intCast(width * self.format.bytesPerPixel()),
++        0,
++    );
++}
+diff --git a/src/renderer/directx11/buffer.zig b/src/renderer/directx11/buffer.zig
+new file mode 100644
+index 000000000..07650bb8a
+--- /dev/null
++++ b/src/renderer/directx11/buffer.zig
+@@ -0,0 +1,184 @@
++//! GPU buffer wrapper.
++//!
++//! `GenericRenderer` keeps these long-lived and re-syncs their whole contents
++//! each frame, so they are created DYNAMIC and updated with a discard Map,
++//! which is the cheapest path for full rewrites on D3D11.
++
++const std = @import("std");
++const Allocator = std.mem.Allocator;
++
++const com = @import("com.zig");
++const d3d11 = @import("d3d11.zig");
++
++const log = std.log.scoped(.directx11);
++
++/// Options for initializing a buffer.
++pub const Options = struct {
++    /// Borrowed; the `D3D11` instance outlives its buffers.
++    device: *d3d11.ID3D11Device,
++    context: *d3d11.ID3D11DeviceContext,
++
++    /// What the buffer is bound as. Constant buffers have stricter size rules
++    /// (see `init`).
++    bind: Bind = .vertex,
++
++    pub const Bind = enum {
++        vertex,
++        constant,
++
++        fn flag(self: Bind) u32 {
++            return switch (self) {
++                .vertex => d3d11.D3D11_BIND_VERTEX_BUFFER,
++                .constant => d3d11.D3D11_BIND_CONSTANT_BUFFER,
++            };
++        }
++    };
++};
++
++pub const Error = error{
++    BufferCreationFailed,
++    MapFailed,
++};
++
++pub fn Buffer(comptime T: type) type {
++    return struct {
++        const Self = @This();
++
++        buffer: *d3d11.ID3D11Buffer,
++        opts: Options,
++
++        /// Current allocated length of the data store, in units of `T`.
++        len: usize,
++
++        pub fn init(opts: Options, len: usize) !Self {
++            const buffer = try create(opts, len, null);
++            return .{ .buffer = buffer, .opts = opts, .len = len };
++        }
++
++        pub fn initFill(opts: Options, data: []const T) !Self {
++            const buffer = try create(opts, data.len, data);
++            return .{ .buffer = buffer, .opts = opts, .len = data.len };
++        }
++
++        fn create(
++            opts: Options,
++            len: usize,
++            data: ?[]const T,
++        ) Error!*d3d11.ID3D11Buffer {
++            // A zero-byte buffer is invalid in D3D11, and the renderer does
++            // ask for empty buffers before it knows the grid size.
++            const count = @max(len, 1);
++            var byte_width: u32 = @intCast(count * @sizeOf(T));
++
++            // Constant buffers must be a multiple of 16 bytes.
++            if (opts.bind == .constant) {
++                byte_width = std.mem.alignForward(u32, byte_width, 16);
++            }
++
++            const desc: d3d11.D3D11_BUFFER_DESC = .{
++                .ByteWidth = byte_width,
++                .Usage = .DYNAMIC,
++                .BindFlags = opts.bind.flag(),
++                .CPUAccessFlags = d3d11.D3D11_CPU_ACCESS_WRITE,
++                .MiscFlags = 0,
++                .StructureByteStride = 0,
++            };
++
++            var initial: d3d11.D3D11_SUBRESOURCE_DATA = undefined;
++            const initial_ptr: ?*const d3d11.D3D11_SUBRESOURCE_DATA = if (data) |d| blk: {
++                if (d.len == 0) break :blk null;
++                initial = .{
++                    .pSysMem = d.ptr,
++                    .SysMemPitch = 0,
++                    .SysMemSlicePitch = 0,
++                };
++                break :blk &initial;
++            } else null;
++
++            var buffer: ?*d3d11.ID3D11Buffer = null;
++            if (com.FAILED(opts.device.CreateBuffer(&desc, initial_ptr, &buffer)) or
++                buffer == null)
++            {
++                log.err("failed to create {d}-byte buffer", .{byte_width});
++                return Error.BufferCreationFailed;
++            }
++            return buffer.?;
++        }
++
++        pub fn deinit(self: Self) void {
++            _ = self.buffer.Release();
++        }
++
++        /// Sync new contents to the buffer. The data is expected to be the
++        /// complete contents. Grows (reallocating) if the data does not fit.
++        pub fn sync(self: *Self, data: []const T) !void {
++            if (data.len > self.len) {
++                // Grow to double what we need, matching the other backends, so
++                // a steadily growing grid does not reallocate every frame.
++                const new_len = data.len * 2;
++                const new_buffer = try create(self.opts, new_len, null);
++                _ = self.buffer.Release();
++                self.buffer = new_buffer;
++                self.len = new_len;
++            }
++            try self.write(data, 0);
++        }
++
++        /// Like `sync` but gathers from several array lists. Returns the
++        /// number of items synced.
++        pub fn syncFromArrayLists(
++            self: *Self,
++            lists: []const std.ArrayListUnmanaged(T),
++        ) !usize {
++            var total: usize = 0;
++            for (lists) |list| total += list.items.len;
++
++            if (total > self.len) {
++                const new_len = total * 2;
++                const new_buffer = try create(self.opts, new_len, null);
++                _ = self.buffer.Release();
++                self.buffer = new_buffer;
++                self.len = new_len;
++            }
++
++            // One Map for the whole gather: mapping per list would discard the
++            // previous list's writes, since DYNAMIC buffers only support
++            // WRITE_DISCARD.
++            var mapped: d3d11.D3D11_MAPPED_SUBRESOURCE = undefined;
++            if (com.FAILED(self.opts.context.Map(
++                @ptrCast(self.buffer),
++                0,
++                .WRITE_DISCARD,
++                0,
++                &mapped,
++            ))) return Error.MapFailed;
++            defer self.opts.context.Unmap(@ptrCast(self.buffer), 0);
++
++            const dst: [*]T = @ptrCast(@alignCast(mapped.pData));
++            var i: usize = 0;
++            for (lists) |list| {
++                @memcpy(dst[i .. i + list.items.len], list.items);
++                i += list.items.len;
++            }
++
++            return total;
++        }
++
++        fn write(self: *Self, data: []const T, offset: usize) Error!void {
++            if (data.len == 0) return;
++
++            var mapped: d3d11.D3D11_MAPPED_SUBRESOURCE = undefined;
++            if (com.FAILED(self.opts.context.Map(
++                @ptrCast(self.buffer),
++                0,
++                .WRITE_DISCARD,
++                0,
++                &mapped,
++            ))) return Error.MapFailed;
++            defer self.opts.context.Unmap(@ptrCast(self.buffer), 0);
++
++            const dst: [*]T = @ptrCast(@alignCast(mapped.pData));
++            @memcpy(dst[offset .. offset + data.len], data);
++        }
++    };
++}
+diff --git a/src/renderer/directx11/com.zig b/src/renderer/directx11/com.zig
+new file mode 100644
+index 000000000..0562bbcc0
+--- /dev/null
++++ b/src/renderer/directx11/com.zig
+@@ -0,0 +1,70 @@
++//! Minimal COM support: GUIDs, HRESULT, and IUnknown.
++//!
++//! Harvested from ghostty-org/ghostty PR #11886 by deblasis (MIT), which is
++//! also the upstream home of the D3D11 work this backend builds on. Extended
++//! here as the renderer needed more of the API surface.
++const std = @import("std");
++
++/// COM GUID (Globally Unique Identifier).
++pub const GUID = extern struct {
++    data1: u32,
++    data2: u16,
++    data3: u16,
++    data4: [8]u8,
++};
++
++/// COM HRESULT return type.
++pub const HRESULT = i32;
++
++/// Returns true if the HRESULT indicates success (non-negative).
++pub inline fn SUCCEEDED(hr: HRESULT) bool {
++    return hr >= 0;
++}
++
++/// Returns true if the HRESULT indicates failure (negative).
++pub inline fn FAILED(hr: HRESULT) bool {
++    return hr < 0;
++}
++
++pub const S_OK: HRESULT = 0;
++pub const E_NOINTERFACE: HRESULT = @bitCast(@as(u32, 0x80004002));
++pub const E_FAIL: HRESULT = @bitCast(@as(u32, 0x80004005));
++pub const DXGI_ERROR_DEVICE_REMOVED: HRESULT = @bitCast(@as(u32, 0x887A0005));
++
++/// IUnknown — base COM interface that all COM objects implement.
++pub const IUnknown = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (
++            self: *IUnknown,
++            riid: *const GUID,
++            ppvObject: *?*anyopaque,
++        ) callconv(.winapi) HRESULT,
++        AddRef: *const fn (self: *IUnknown) callconv(.winapi) u32,
++        Release: *const fn (self: *IUnknown) callconv(.winapi) u32,
++    };
++
++    pub inline fn Release(self: *IUnknown) u32 {
++        return self.vtable.Release(self);
++    }
++
++    pub inline fn AddRef(self: *IUnknown) u32 {
++        return self.vtable.AddRef(self);
++    }
++
++    pub inline fn QueryInterface(
++        self: *IUnknown,
++        riid: *const GUID,
++        ppvObject: *?*anyopaque,
++    ) HRESULT {
++        return self.vtable.QueryInterface(self, riid, ppvObject);
++    }
++};
++
++/// Stub vtable entry for COM methods not yet wrapped.
++pub const Reserved = *const fn () callconv(.winapi) void;
++
++test {
++    _ = @import("com_test.zig");
++}
+diff --git a/src/renderer/directx11/com_test.zig b/src/renderer/directx11/com_test.zig
+new file mode 100644
+index 000000000..8ffcfddbc
+--- /dev/null
++++ b/src/renderer/directx11/com_test.zig
+@@ -0,0 +1,116 @@
++//! Tests for the COM layer.
++//!
++//! Harvested from ghostty-org/ghostty PR #11886 by deblasis (MIT).
++const std = @import("std");
++const com = @import("com.zig");
++const dxgi = @import("dxgi.zig");
++const d3d11 = @import("d3d11.zig");
++
++// Verify COM GUID byte layout matches the Windows SDK definitions.
++// GUIDs are stored as { u32, u16, u16, [8]u8 } in little-endian.
++
++test "IUnknown GUID has no definition" {
++    // IUnknown doesn't define its own IID in our bindings (it's accessed
++    // via derived interfaces), so verify the base struct layout instead.
++    try std.testing.expectEqual(@sizeOf(com.GUID), 16);
++    try std.testing.expectEqual(@alignOf(com.GUID), 4);
++}
++
++test "HRESULT helpers" {
++    try std.testing.expect(com.SUCCEEDED(com.S_OK));
++    try std.testing.expect(!com.FAILED(com.S_OK));
++    try std.testing.expect(com.FAILED(com.E_FAIL));
++    try std.testing.expect(!com.SUCCEEDED(com.E_FAIL));
++    try std.testing.expect(com.FAILED(com.E_NOINTERFACE));
++    try std.testing.expect(com.FAILED(com.DXGI_ERROR_DEVICE_REMOVED));
++}
++
++test "Reserved type is function pointer sized" {
++    try std.testing.expectEqual(@sizeOf(com.Reserved), @sizeOf(*anyopaque));
++}
++
++// Verify struct sizes match the C ABI (these are extern structs that
++// cross the COM boundary, so size mismatches cause runtime crashes).
++
++test "DXGI_SWAP_CHAIN_DESC1 size" {
++    // DXGI_SWAP_CHAIN_DESC1 is 48 bytes on 64-bit Windows.
++    try std.testing.expectEqual(@sizeOf(dxgi.DXGI_SWAP_CHAIN_DESC1), 48);
++}
++
++test "DXGI_SAMPLE_DESC size" {
++    try std.testing.expectEqual(@sizeOf(dxgi.DXGI_SAMPLE_DESC), 8);
++}
++
++test "D3D11_VIEWPORT size" {
++    // D3D11_VIEWPORT is 6 floats = 24 bytes.
++    try std.testing.expectEqual(@sizeOf(d3d11.D3D11_VIEWPORT), 24);
++}
++
++test "D3D11_BUFFER_DESC size" {
++    // D3D11_BUFFER_DESC is 24 bytes (6 u32 fields).
++    try std.testing.expectEqual(@sizeOf(d3d11.D3D11_BUFFER_DESC), 24);
++}
++
++test "D3D11_INPUT_ELEMENT_DESC size" {
++    // D3D11_INPUT_ELEMENT_DESC: ptr + u32 + enum + enum + u32 + u32 + enum = 32 bytes on 64-bit.
++    const expected: usize = if (@sizeOf(*anyopaque) == 8) 32 else 24;
++    try std.testing.expectEqual(@sizeOf(d3d11.D3D11_INPUT_ELEMENT_DESC), expected);
++}
++
++test "D3D11_MAPPED_SUBRESOURCE size" {
++    // D3D11_MAPPED_SUBRESOURCE: ptr + u32 + u32.
++    const expected: usize = if (@sizeOf(*anyopaque) == 8) 16 else 12;
++    try std.testing.expectEqual(@sizeOf(d3d11.D3D11_MAPPED_SUBRESOURCE), expected);
++}
++
++// Verify vtable pointer layout — COM objects are a single pointer to a vtable.
++
++test "IDXGIDevice is a single vtable pointer" {
++    try std.testing.expectEqual(@sizeOf(dxgi.IDXGIDevice), @sizeOf(*anyopaque));
++}
++
++test "IDXGISwapChain1 is a single vtable pointer" {
++    try std.testing.expectEqual(@sizeOf(dxgi.IDXGISwapChain1), @sizeOf(*anyopaque));
++}
++
++test "ID3D11Device is a single vtable pointer" {
++    try std.testing.expectEqual(@sizeOf(d3d11.ID3D11Device), @sizeOf(*anyopaque));
++}
++
++test "ID3D11DeviceContext is a single vtable pointer" {
++    try std.testing.expectEqual(@sizeOf(d3d11.ID3D11DeviceContext), @sizeOf(*anyopaque));
++}
++
++// Verify GUID constants are the right values (cross-referenced with
++// Windows SDK headers).
++
++test "IDXGIDevice IID" {
++    const iid = dxgi.IDXGIDevice.IID;
++    try std.testing.expectEqual(iid.data1, 0x54ec77fa);
++    try std.testing.expectEqual(iid.data2, 0x1377);
++    try std.testing.expectEqual(iid.data3, 0x44e6);
++    try std.testing.expectEqualSlices(u8, &iid.data4, &[_]u8{ 0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c });
++}
++
++test "IDXGIFactory2 IID" {
++    const iid = dxgi.IDXGIFactory2.IID;
++    try std.testing.expectEqual(iid.data1, 0x50c83a1c);
++    try std.testing.expectEqual(iid.data2, 0xe072);
++    try std.testing.expectEqual(iid.data3, 0x4c48);
++    try std.testing.expectEqualSlices(u8, &iid.data4, &[_]u8{ 0x87, 0xb0, 0x36, 0x30, 0xfa, 0x36, 0xa6, 0xd0 });
++}
++
++test "ISwapChainPanelNative IID" {
++    const iid = dxgi.ISwapChainPanelNative.IID;
++    try std.testing.expectEqual(iid.data1, 0xf92f19d2);
++    try std.testing.expectEqual(iid.data2, 0x3ade);
++    try std.testing.expectEqual(iid.data3, 0x45a6);
++    try std.testing.expectEqualSlices(u8, &iid.data4, &[_]u8{ 0xa2, 0x0c, 0xf6, 0xf1, 0xea, 0x90, 0x55, 0x4b });
++}
++
++test "ID3D11Texture2D IID" {
++    const iid = d3d11.ID3D11Texture2D.IID;
++    try std.testing.expectEqual(iid.data1, 0x6f15aaf2);
++    try std.testing.expectEqual(iid.data2, 0xd208);
++    try std.testing.expectEqual(iid.data3, 0x4e89);
++}
+diff --git a/src/renderer/directx11/d3d11.zig b/src/renderer/directx11/d3d11.zig
+new file mode 100644
+index 000000000..b72215851
+--- /dev/null
++++ b/src/renderer/directx11/d3d11.zig
+@@ -0,0 +1,1214 @@
++//! Direct3D 11 bindings.
++//!
++//! Harvested from ghostty-org/ghostty PR #11886 by deblasis (MIT).
++//!
++//! That PR only wired the vtable slots its demo called and left the rest as
++//! `Reserved`. Slots added here for the renderer: CreateTexture2D,
++//! CreateShaderResourceView, CreateSamplerState, CopyResource, and
++//! UpdateSubresource, plus the D3D11_TEXTURE2D_DESC, D3D11_BOX, and
++//! D3D11_SAMPLER_DESC types they take.
++//!
++//! Vtable layouts are ABI, not convention: a slot added in the wrong position
++//! silently calls the wrong function. Keep the slot comments accurate.
++const std = @import("std");
++const com = @import("com.zig");
++const dxgi = @import("dxgi.zig");
++const GUID = com.GUID;
++const HRESULT = com.HRESULT;
++const IUnknown = com.IUnknown;
++const DXGI_FORMAT = dxgi.DXGI_FORMAT;
++
++const Reserved = com.Reserved;
++
++// --- Enums ---
++
++pub const D3D_FEATURE_LEVEL = enum(u32) {
++    @"9_1" = 0x9100,
++    @"9_2" = 0x9200,
++    @"9_3" = 0x9300,
++    @"10_0" = 0xa000,
++    @"10_1" = 0xa100,
++    @"11_0" = 0xb000,
++    @"11_1" = 0xb100,
++    _,
++};
++
++pub const D3D_DRIVER_TYPE = enum(u32) {
++    UNKNOWN = 0,
++    HARDWARE = 1,
++    REFERENCE = 2,
++    NULL = 3,
++    SOFTWARE = 4,
++    WARP = 5,
++};
++
++pub const D3D11_USAGE = enum(u32) {
++    DEFAULT = 0,
++    IMMUTABLE = 1,
++    DYNAMIC = 2,
++    STAGING = 3,
++};
++
++pub const D3D11_BIND_FLAG = u32;
++pub const D3D11_BIND_VERTEX_BUFFER: D3D11_BIND_FLAG = 0x1;
++pub const D3D11_BIND_INDEX_BUFFER: D3D11_BIND_FLAG = 0x2;
++pub const D3D11_BIND_CONSTANT_BUFFER: D3D11_BIND_FLAG = 0x4;
++pub const D3D11_BIND_SHADER_RESOURCE: D3D11_BIND_FLAG = 0x8;
++pub const D3D11_BIND_RENDER_TARGET: D3D11_BIND_FLAG = 0x20;
++
++pub const D3D11_CPU_ACCESS_FLAG = u32;
++pub const D3D11_CPU_ACCESS_WRITE: D3D11_CPU_ACCESS_FLAG = 0x10000;
++pub const D3D11_CPU_ACCESS_READ: D3D11_CPU_ACCESS_FLAG = 0x20000;
++
++pub const D3D11_MAP = enum(u32) {
++    READ = 1,
++    WRITE = 2,
++    READ_WRITE = 3,
++    WRITE_DISCARD = 4,
++    WRITE_NO_OVERWRITE = 5,
++};
++
++pub const D3D_PRIMITIVE_TOPOLOGY = enum(u32) {
++    UNDEFINED = 0,
++    POINTLIST = 1,
++    LINELIST = 2,
++    LINESTRIP = 3,
++    TRIANGLELIST = 4,
++    TRIANGLESTRIP = 5,
++    _,
++};
++
++pub const D3D11_CREATE_DEVICE_FLAG = u32;
++pub const D3D11_CREATE_DEVICE_SINGLETHREADED: D3D11_CREATE_DEVICE_FLAG = 0x1;
++pub const D3D11_CREATE_DEVICE_DEBUG: D3D11_CREATE_DEVICE_FLAG = 0x2;
++pub const D3D11_CREATE_DEVICE_BGRA_SUPPORT: D3D11_CREATE_DEVICE_FLAG = 0x20;
++
++pub const D3D11_INPUT_CLASSIFICATION = enum(u32) {
++    PER_VERTEX_DATA = 0,
++    PER_INSTANCE_DATA = 1,
++};
++
++// --- Structs ---
++
++pub const D3D11_VIEWPORT = extern struct {
++    TopLeftX: f32,
++    TopLeftY: f32,
++    Width: f32,
++    Height: f32,
++    MinDepth: f32,
++    MaxDepth: f32,
++};
++
++pub const D3D11_BUFFER_DESC = extern struct {
++    ByteWidth: u32,
++    Usage: D3D11_USAGE,
++    BindFlags: D3D11_BIND_FLAG,
++    CPUAccessFlags: D3D11_CPU_ACCESS_FLAG,
++    MiscFlags: u32,
++    StructureByteStride: u32,
++};
++
++/// Sub-region of a resource, for partial updates. `right`/`bottom`/`back` are
++/// exclusive bounds.
++pub const D3D11_BOX = extern struct {
++    left: u32,
++    top: u32,
++    front: u32,
++    right: u32,
++    bottom: u32,
++    back: u32,
++};
++
++pub const D3D11_FILTER = enum(u32) {
++    MIN_MAG_MIP_POINT = 0,
++    MIN_MAG_MIP_LINEAR = 0x15,
++};
++
++pub const D3D11_TEXTURE_ADDRESS_MODE = enum(u32) {
++    WRAP = 1,
++    MIRROR = 2,
++    CLAMP = 3,
++    BORDER = 4,
++    MIRROR_ONCE = 5,
++};
++
++pub const D3D11_COMPARISON_FUNC = enum(u32) {
++    NEVER = 1,
++    ALWAYS = 8,
++};
++
++pub const D3D11_SAMPLER_DESC = extern struct {
++    Filter: D3D11_FILTER,
++    AddressU: D3D11_TEXTURE_ADDRESS_MODE,
++    AddressV: D3D11_TEXTURE_ADDRESS_MODE,
++    AddressW: D3D11_TEXTURE_ADDRESS_MODE,
++    MipLODBias: f32,
++    MaxAnisotropy: u32,
++    ComparisonFunc: D3D11_COMPARISON_FUNC,
++    BorderColor: [4]f32,
++    MinLOD: f32,
++    MaxLOD: f32,
++};
++
++pub const D3D11_TEXTURE2D_DESC = extern struct {
++    Width: u32,
++    Height: u32,
++    MipLevels: u32,
++    ArraySize: u32,
++    Format: dxgi.DXGI_FORMAT,
++    SampleDesc: dxgi.DXGI_SAMPLE_DESC,
++    Usage: D3D11_USAGE,
++    BindFlags: D3D11_BIND_FLAG,
++    CPUAccessFlags: D3D11_CPU_ACCESS_FLAG,
++    MiscFlags: u32,
++};
++
++pub const D3D11_SUBRESOURCE_DATA = extern struct {
++    pSysMem: *const anyopaque,
++    SysMemPitch: u32,
++    SysMemSlicePitch: u32,
++};
++
++pub const D3D11_INPUT_ELEMENT_DESC = extern struct {
++    SemanticName: [*:0]const u8,
++    SemanticIndex: u32,
++    Format: DXGI_FORMAT,
++    InputSlot: u32,
++    AlignedByteOffset: u32,
++    InputSlotClass: D3D11_INPUT_CLASSIFICATION,
++    InstanceDataStepRate: u32,
++};
++
++pub const D3D11_MAPPED_SUBRESOURCE = extern struct {
++    pData: ?*anyopaque,
++    RowPitch: u32,
++    DepthPitch: u32,
++};
++
++// =============================================================================
++// ID3D11DeviceChild — 7 methods total (3 IUnknown + 4 own)
++// =============================================================================
++pub const ID3D11DeviceChild = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: Reserved,
++        AddRef: Reserved,
++        Release: Reserved,
++        // ID3D11DeviceChild (slots 3-6)
++        GetDevice: Reserved,
++        GetPrivateData: Reserved,
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++    };
++};
++
++// =============================================================================
++// ID3D11Resource — 10 methods total (7 ID3D11DeviceChild + 3 own)
++// =============================================================================
++pub const ID3D11Resource = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: Reserved,
++        AddRef: Reserved,
++        Release: Reserved,
++        // ID3D11DeviceChild (slots 3-6)
++        GetDevice: Reserved,
++        GetPrivateData: Reserved,
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++        // ID3D11Resource (slot 7)
++        GetType: Reserved,
++        SetEvictionPriority: Reserved,
++        GetEvictionPriority: Reserved,
++    };
++};
++
++// =============================================================================
++// ID3D11View — 8 methods total (7 ID3D11DeviceChild + 1 own)
++// =============================================================================
++pub const ID3D11View = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: Reserved,
++        AddRef: Reserved,
++        Release: Reserved,
++        // ID3D11DeviceChild (slots 3-6)
++        GetDevice: Reserved,
++        GetPrivateData: Reserved,
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++        // ID3D11View (slot 7)
++        GetResource: Reserved,
++    };
++};
++
++// =============================================================================
++// ID3D11RenderTargetView — 9 methods total (8 ID3D11View + 1 own)
++// Inherits: IUnknown(3) + ID3D11DeviceChild(4) + ID3D11View(1) + own(1)
++// =============================================================================
++pub const ID3D11RenderTargetView = extern struct {
++    vtable: *const VTable,
++
++    pub const IID = GUID{
++        .data1 = 0xdfdba067,
++        .data2 = 0x0b8d,
++        .data3 = 0x4865,
++        .data4 = .{ 0x87, 0x5b, 0xd7, 0xb4, 0x51, 0x6c, 0xc1, 0x64 },
++    };
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: *const fn (*ID3D11RenderTargetView, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*ID3D11RenderTargetView) callconv(.winapi) u32,
++        Release: *const fn (*ID3D11RenderTargetView) callconv(.winapi) u32,
++        // ID3D11DeviceChild (slots 3-6)
++        GetDevice: Reserved,
++        GetPrivateData: Reserved,
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++        // ID3D11View (slot 7)
++        GetResource: Reserved,
++        // ID3D11RenderTargetView (slot 8)
++        GetDesc: Reserved,
++    };
++
++    pub inline fn Release(self: *ID3D11RenderTargetView) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// ID3D11Texture2D — 11 methods total
++// Inherits: IUnknown(3) + ID3D11DeviceChild(4) + ID3D11Resource(3) + own(1)
++// =============================================================================
++pub const ID3D11Texture2D = extern struct {
++    vtable: *const VTable,
++
++    pub const IID = GUID{
++        .data1 = 0x6f15aaf2,
++        .data2 = 0xd208,
++        .data3 = 0x4e89,
++        .data4 = .{ 0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c },
++    };
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: *const fn (*ID3D11Texture2D, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*ID3D11Texture2D) callconv(.winapi) u32,
++        Release: *const fn (*ID3D11Texture2D) callconv(.winapi) u32,
++        // ID3D11DeviceChild (slots 3-6)
++        GetDevice: Reserved,
++        GetPrivateData: Reserved,
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++        // ID3D11Resource (slots 7-9)
++        GetType: Reserved,
++        SetEvictionPriority: Reserved,
++        GetEvictionPriority: Reserved,
++        // ID3D11Texture2D (slot 10)
++        GetDesc: Reserved,
++    };
++
++    pub inline fn Release(self: *ID3D11Texture2D) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// ID3D11Buffer — 11 methods total
++// Inherits: IUnknown(3) + ID3D11DeviceChild(4) + ID3D11Resource(3) + own(1)
++// =============================================================================
++pub const ID3D11Buffer = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: *const fn (*ID3D11Buffer, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*ID3D11Buffer) callconv(.winapi) u32,
++        Release: *const fn (*ID3D11Buffer) callconv(.winapi) u32,
++        // ID3D11DeviceChild (slots 3-6)
++        GetDevice: Reserved,
++        GetPrivateData: Reserved,
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++        // ID3D11Resource (slots 7-9)
++        GetType: Reserved,
++        SetEvictionPriority: Reserved,
++        GetEvictionPriority: Reserved,
++        // ID3D11Buffer (slot 10)
++        GetDesc: Reserved,
++    };
++
++    pub inline fn Release(self: *ID3D11Buffer) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// Simple ID3D11DeviceChild derivatives — 7 methods each (no own methods)
++// ID3D11VertexShader, ID3D11PixelShader, ID3D11InputLayout, ID3D11SamplerState
++// =============================================================================
++pub const ID3D11VertexShader = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*ID3D11VertexShader, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*ID3D11VertexShader) callconv(.winapi) u32,
++        Release: *const fn (*ID3D11VertexShader) callconv(.winapi) u32,
++        GetDevice: Reserved,
++        GetPrivateData: Reserved,
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++    };
++
++    pub inline fn Release(self: *ID3D11VertexShader) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++pub const ID3D11PixelShader = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*ID3D11PixelShader, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*ID3D11PixelShader) callconv(.winapi) u32,
++        Release: *const fn (*ID3D11PixelShader) callconv(.winapi) u32,
++        GetDevice: Reserved,
++        GetPrivateData: Reserved,
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++    };
++
++    pub inline fn Release(self: *ID3D11PixelShader) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++pub const ID3D11InputLayout = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*ID3D11InputLayout, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*ID3D11InputLayout) callconv(.winapi) u32,
++        Release: *const fn (*ID3D11InputLayout) callconv(.winapi) u32,
++        GetDevice: Reserved,
++        GetPrivateData: Reserved,
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++    };
++
++    pub inline fn Release(self: *ID3D11InputLayout) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++pub const ID3D11SamplerState = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*ID3D11SamplerState, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*ID3D11SamplerState) callconv(.winapi) u32,
++        Release: *const fn (*ID3D11SamplerState) callconv(.winapi) u32,
++        GetDevice: Reserved,
++        GetPrivateData: Reserved,
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++        // ID3D11SamplerState (slot 7)
++        GetDesc: Reserved,
++    };
++
++    pub inline fn Release(self: *ID3D11SamplerState) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++pub const ID3D11ShaderResourceView = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*ID3D11ShaderResourceView, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*ID3D11ShaderResourceView) callconv(.winapi) u32,
++        Release: *const fn (*ID3D11ShaderResourceView) callconv(.winapi) u32,
++        GetDevice: Reserved,
++        GetPrivateData: Reserved,
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++        // ID3D11View (slot 7)
++        GetResource: Reserved,
++        // ID3D11ShaderResourceView (slot 8)
++        GetDesc: Reserved,
++    };
++
++    pub inline fn Release(self: *ID3D11ShaderResourceView) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// ID3D11Device — 43 methods total (3 IUnknown + 40 own)
++// Vtable order from d3d11.h:
++//   0: QueryInterface
++//   1: AddRef
++//   2: Release
++//   3: CreateBuffer
++//   4: CreateTexture1D
++//   5: CreateTexture2D
++//   6: CreateTexture3D
++//   7: CreateShaderResourceView
++//   8: CreateUnorderedAccessView
++//   9: CreateRenderTargetView
++//  10: CreateDepthStencilView
++//  11: CreateInputLayout
++//  12: CreateVertexShader
++//  13: CreateGeometryShader
++//  14: CreateGeometryShaderWithStreamOutput
++//  15: CreatePixelShader
++//  16: CreateHullShader
++//  17: CreateDomainShader
++//  18: CreateComputeShader
++//  19: CreateClassLinkage
++//  20: CreateBlendState
++//  21: CreateDepthStencilState
++//  22: CreateRasterizerState
++//  23: CreateSamplerState
++//  24: CreateQuery
++//  25: CreatePredicate
++//  26: CreateCounter
++//  27: CreateDeferredContext
++//  28: OpenSharedResource
++//  29: CheckFormatSupport
++//  30: CheckMultisampleQualityLevels
++//  31: CheckCounterInfo
++//  32: CheckCounter
++//  33: CheckFeatureSupport
++//  34: GetPrivateData
++//  35: SetPrivateData
++//  36: SetPrivateDataInterface
++//  37: GetFeatureLevel
++//  38: GetCreationFlags
++//  39: GetDeviceRemovedReason
++//  40: GetImmediateContext
++//  41: SetExceptionMode
++//  42: GetExceptionMode
++// =============================================================================
++pub const ID3D11Device = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: *const fn (*ID3D11Device, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*ID3D11Device) callconv(.winapi) u32,
++        Release: *const fn (*ID3D11Device) callconv(.winapi) u32,
++        // slot 3: CreateBuffer
++        CreateBuffer: *const fn (
++            *ID3D11Device,
++            *const D3D11_BUFFER_DESC,
++            ?*const D3D11_SUBRESOURCE_DATA,
++            *?*ID3D11Buffer,
++        ) callconv(.winapi) HRESULT,
++        // slots 4-6
++        CreateTexture1D: Reserved,
++        CreateTexture2D: *const fn (
++            *ID3D11Device,
++            *const D3D11_TEXTURE2D_DESC,
++            ?[*]const D3D11_SUBRESOURCE_DATA, // nullable for uninitialized
++            *?*ID3D11Texture2D,
++        ) callconv(.winapi) HRESULT,
++        CreateTexture3D: Reserved,
++        // slot 7
++        CreateShaderResourceView: *const fn (
++            *ID3D11Device,
++            *ID3D11Resource,
++            ?*const anyopaque, // D3D11_SHADER_RESOURCE_VIEW_DESC, null = default
++            *?*ID3D11ShaderResourceView,
++        ) callconv(.winapi) HRESULT,
++        // slot 8
++        CreateUnorderedAccessView: Reserved,
++        // slot 9: CreateRenderTargetView
++        CreateRenderTargetView: *const fn (
++            *ID3D11Device,
++            *ID3D11Resource,
++            ?*const anyopaque, // D3D11_RENDER_TARGET_VIEW_DESC, nullable for default
++            *?*ID3D11RenderTargetView,
++        ) callconv(.winapi) HRESULT,
++        // slot 10
++        CreateDepthStencilView: Reserved,
++        // slot 11: CreateInputLayout
++        CreateInputLayout: *const fn (
++            *ID3D11Device,
++            [*]const D3D11_INPUT_ELEMENT_DESC,
++            u32, // NumElements
++            *const anyopaque, // pShaderBytecodeWithInputSignature
++            usize, // BytecodeLength
++            *?*ID3D11InputLayout,
++        ) callconv(.winapi) HRESULT,
++        // slot 12: CreateVertexShader
++        CreateVertexShader: *const fn (
++            *ID3D11Device,
++            *const anyopaque, // pShaderBytecode
++            usize, // BytecodeLength
++            ?*ID3D11ClassLinkage,
++            *?*ID3D11VertexShader,
++        ) callconv(.winapi) HRESULT,
++        // slot 13
++        CreateGeometryShader: Reserved,
++        // slot 14
++        CreateGeometryShaderWithStreamOutput: Reserved,
++        // slot 15: CreatePixelShader
++        CreatePixelShader: *const fn (
++            *ID3D11Device,
++            *const anyopaque, // pShaderBytecode
++            usize, // BytecodeLength
++            ?*ID3D11ClassLinkage,
++            *?*ID3D11PixelShader,
++        ) callconv(.winapi) HRESULT,
++        // slots 16-18
++        CreateHullShader: Reserved,
++        CreateDomainShader: Reserved,
++        CreateComputeShader: Reserved,
++        // slot 19
++        CreateClassLinkage: Reserved,
++        // slots 20-22
++        CreateBlendState: Reserved,
++        CreateDepthStencilState: Reserved,
++        CreateRasterizerState: Reserved,
++        // slot 23
++        CreateSamplerState: *const fn (
++            *ID3D11Device,
++            *const D3D11_SAMPLER_DESC,
++            *?*ID3D11SamplerState,
++        ) callconv(.winapi) HRESULT,
++        // slots 24-26
++        CreateQuery: Reserved,
++        CreatePredicate: Reserved,
++        CreateCounter: Reserved,
++        // slots 27-28
++        CreateDeferredContext: Reserved,
++        OpenSharedResource: Reserved,
++        // slots 29-33
++        CheckFormatSupport: Reserved,
++        CheckMultisampleQualityLevels: Reserved,
++        CheckCounterInfo: Reserved,
++        CheckCounter: Reserved,
++        CheckFeatureSupport: Reserved,
++        // slots 34-36
++        GetPrivateData: Reserved,
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++        // slot 37
++        GetFeatureLevel: Reserved,
++        // slot 38
++        GetCreationFlags: Reserved,
++        // slot 39
++        GetDeviceRemovedReason: Reserved,
++        // slot 40
++        GetImmediateContext: Reserved,
++        // slot 41
++        SetExceptionMode: Reserved,
++        // slot 42
++        GetExceptionMode: Reserved,
++    };
++
++    pub inline fn CreateBuffer(
++        self: *ID3D11Device,
++        desc: *const D3D11_BUFFER_DESC,
++        initial_data: ?*const D3D11_SUBRESOURCE_DATA,
++        buffer: *?*ID3D11Buffer,
++    ) HRESULT {
++        return self.vtable.CreateBuffer(self, desc, initial_data, buffer);
++    }
++
++    pub inline fn CreateTexture2D(
++        self: *ID3D11Device,
++        desc: *const D3D11_TEXTURE2D_DESC,
++        initial_data: ?[*]const D3D11_SUBRESOURCE_DATA,
++        texture: *?*ID3D11Texture2D,
++    ) HRESULT {
++        return self.vtable.CreateTexture2D(self, desc, initial_data, texture);
++    }
++
++    pub inline fn CreateShaderResourceView(
++        self: *ID3D11Device,
++        resource: *ID3D11Resource,
++        desc: ?*const anyopaque,
++        srv: *?*ID3D11ShaderResourceView,
++    ) HRESULT {
++        return self.vtable.CreateShaderResourceView(self, resource, desc, srv);
++    }
++
++    pub inline fn CreateSamplerState(
++        self: *ID3D11Device,
++        desc: *const D3D11_SAMPLER_DESC,
++        sampler: *?*ID3D11SamplerState,
++    ) HRESULT {
++        return self.vtable.CreateSamplerState(self, desc, sampler);
++    }
++
++    pub inline fn CreateRenderTargetView(
++        self: *ID3D11Device,
++        resource: *ID3D11Resource,
++        desc: ?*const anyopaque,
++        rtv: *?*ID3D11RenderTargetView,
++    ) HRESULT {
++        return self.vtable.CreateRenderTargetView(self, resource, desc, rtv);
++    }
++
++    pub inline fn CreateInputLayout(
++        self: *ID3D11Device,
++        input_element_descs: [*]const D3D11_INPUT_ELEMENT_DESC,
++        num_elements: u32,
++        shader_bytecode: *const anyopaque,
++        bytecode_length: usize,
++        input_layout: *?*ID3D11InputLayout,
++    ) HRESULT {
++        return self.vtable.CreateInputLayout(self, input_element_descs, num_elements, shader_bytecode, bytecode_length, input_layout);
++    }
++
++    pub inline fn CreateVertexShader(
++        self: *ID3D11Device,
++        shader_bytecode: *const anyopaque,
++        bytecode_length: usize,
++        class_linkage: ?*ID3D11ClassLinkage,
++        vertex_shader: *?*ID3D11VertexShader,
++    ) HRESULT {
++        return self.vtable.CreateVertexShader(self, shader_bytecode, bytecode_length, class_linkage, vertex_shader);
++    }
++
++    pub inline fn CreatePixelShader(
++        self: *ID3D11Device,
++        shader_bytecode: *const anyopaque,
++        bytecode_length: usize,
++        class_linkage: ?*ID3D11ClassLinkage,
++        pixel_shader: *?*ID3D11PixelShader,
++    ) HRESULT {
++        return self.vtable.CreatePixelShader(self, shader_bytecode, bytecode_length, class_linkage, pixel_shader);
++    }
++
++    pub inline fn QueryInterface(self: *ID3D11Device, riid: *const GUID, ppvObject: *?*anyopaque) HRESULT {
++        return self.vtable.QueryInterface(self, riid, ppvObject);
++    }
++
++    pub inline fn Release(self: *ID3D11Device) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++/// Opaque type — we never call methods on this, only pass null.
++pub const ID3D11ClassLinkage = opaque {};
++
++// =============================================================================
++// ID3D11DeviceContext — 115 methods total
++// Inherits: IUnknown(3) + ID3D11DeviceChild(4) = 7 inherited, 108 own
++// Vtable order from d3d11.h (verified against d3d11_c.h):
++//   0: QueryInterface          56: GetResourceMinLOD
++//   1: AddRef                  57: ResolveSubresource
++//   2: Release                 58: ExecuteCommandList
++//   3: GetDevice               59: HSSetShaderResources
++//   4: GetPrivateData          60: HSSetShader
++//   5: SetPrivateData          61: HSSetSamplers
++//   6: SetPrivateDataInterface 62: HSSetConstantBuffers
++//   7: VSSetConstantBuffers    63: DSSetShaderResources
++//   8: PSSetShaderResources    64: DSSetShader
++//   9: PSSetShader             65: DSSetSamplers
++//  10: PSSetSamplers           66: DSSetConstantBuffers
++//  11: VSSetShader             67: CSSetShaderResources
++//  12: DrawIndexed             68: CSSetUnorderedAccessViews
++//  13: Draw                    69: CSSetShader
++//  14: Map                     70: CSSetSamplers
++//  15: Unmap                   71: CSSetConstantBuffers
++//  16: PSSetConstantBuffers    72: VSGetConstantBuffers
++//  17: IASetInputLayout        73: PSGetShaderResources
++//  18: IASetVertexBuffers      74: PSGetShader
++//  19: IASetIndexBuffer        75: PSGetSamplers
++//  20: DrawIndexedInstanced    76: VSGetShader
++//  21: DrawInstanced           77: PSGetConstantBuffers
++//  22: GSSetConstantBuffers    78: IAGetInputLayout
++//  23: GSSetShader             79: IAGetVertexBuffers
++//  24: IASetPrimitiveTopology  80: IAGetIndexBuffer
++//  25: VSSetShaderResources    81: GSGetConstantBuffers
++//  26: VSSetSamplers           82: GSGetShader
++//  27: Begin                   83: IAGetPrimitiveTopology
++//  28: End                     84: VSGetShaderResources
++//  29: GetData                 85: VSGetSamplers
++//  30: SetPredication          86: GetPredication
++//  31: GSSetShaderResources    87: GSGetShaderResources
++//  32: GSSetSamplers           88: GSGetSamplers
++//  33: OMSetRenderTargets      89: OMGetRenderTargets
++//  34: OMSetRenderTargetsAndUAV 90: OMGetRenderTargetsAndUAV
++//  35: OMSetBlendState         91: OMGetBlendState
++//  36: OMSetDepthStencilState  92: OMGetDepthStencilState
++//  37: SOSetTargets            93: SOGetTargets
++//  38: DrawAuto                94: RSGetState
++//  39: DrawIndexedInstIndirect 95: RSGetViewports
++//  40: DrawInstancedIndirect   96: RSGetScissorRects
++//  41: Dispatch                97: HSGetShaderResources
++//  42: DispatchIndirect        98: HSGetShader
++//  43: RSSetState              99: HSGetSamplers
++//  44: RSSetViewports         100: HSGetConstantBuffers
++//  45: RSSetScissorRects      101: DSGetShaderResources
++//  46: CopySubresourceRegion  102: DSGetShader
++//  47: CopyResource           103: DSGetSamplers
++//  48: UpdateSubresource      104: DSGetConstantBuffers
++//  49: CopyStructureCount     105: CSGetShaderResources
++//  50: ClearRenderTargetView  106: CSGetUnorderedAccessViews
++//  51: ClearUAVUint           107: CSGetShader
++//  52: ClearUAVFloat          108: CSGetSamplers
++//  53: ClearDepthStencilView  109: CSGetConstantBuffers
++//  54: GenerateMips           110: ClearState
++//  55: SetResourceMinLOD      111: Flush
++//                             112: GetType
++//                             113: GetContextFlags
++//                             114: FinishCommandList
++// =============================================================================
++pub const ID3D11DeviceContext = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: *const fn (*ID3D11DeviceContext, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*ID3D11DeviceContext) callconv(.winapi) u32,
++        Release: *const fn (*ID3D11DeviceContext) callconv(.winapi) u32,
++        // ID3D11DeviceChild (slots 3-6)
++        GetDevice: Reserved,
++        GetPrivateData: Reserved,
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++        // slot 7: VSSetConstantBuffers
++        VSSetConstantBuffers: *const fn (
++            *ID3D11DeviceContext,
++            StartSlot: u32,
++            NumBuffers: u32,
++            ppConstantBuffers: [*]const ?*ID3D11Buffer,
++        ) callconv(.winapi) void,
++        // slot 8: PSSetShaderResources
++        PSSetShaderResources: *const fn (
++            *ID3D11DeviceContext,
++            StartSlot: u32,
++            NumViews: u32,
++            ppShaderResourceViews: [*]const ?*ID3D11ShaderResourceView,
++        ) callconv(.winapi) void,
++        // slot 9: PSSetShader
++        PSSetShader: *const fn (
++            *ID3D11DeviceContext,
++            ?*ID3D11PixelShader,
++            ?[*]const ?*ID3D11ClassInstance,
++            u32, // NumClassInstances
++        ) callconv(.winapi) void,
++        // slot 10: PSSetSamplers
++        PSSetSamplers: *const fn (
++            *ID3D11DeviceContext,
++            StartSlot: u32,
++            NumSamplers: u32,
++            ppSamplers: [*]const ?*ID3D11SamplerState,
++        ) callconv(.winapi) void,
++        // slot 11: VSSetShader
++        VSSetShader: *const fn (
++            *ID3D11DeviceContext,
++            ?*ID3D11VertexShader,
++            ?[*]const ?*ID3D11ClassInstance,
++            u32, // NumClassInstances
++        ) callconv(.winapi) void,
++        // slot 12: DrawIndexed
++        DrawIndexed: Reserved,
++        // slot 13: Draw
++        Draw: Reserved,
++        // slot 14: Map
++        Map: *const fn (
++            *ID3D11DeviceContext,
++            *ID3D11Resource,
++            u32, // Subresource
++            D3D11_MAP,
++            u32, // MapFlags
++            *D3D11_MAPPED_SUBRESOURCE,
++        ) callconv(.winapi) HRESULT,
++        // slot 15: Unmap
++        Unmap: *const fn (
++            *ID3D11DeviceContext,
++            *ID3D11Resource,
++            u32, // Subresource
++        ) callconv(.winapi) void,
++        // slot 16: PSSetConstantBuffers
++        _reserved16: Reserved,
++        // slot 17: IASetInputLayout
++        IASetInputLayout: *const fn (
++            *ID3D11DeviceContext,
++            ?*ID3D11InputLayout,
++        ) callconv(.winapi) void,
++        // slot 18: IASetVertexBuffers
++        IASetVertexBuffers: *const fn (
++            *ID3D11DeviceContext,
++            StartSlot: u32,
++            NumBuffers: u32,
++            ppVertexBuffers: [*]const ?*ID3D11Buffer,
++            pStrides: [*]const u32,
++            pOffsets: [*]const u32,
++        ) callconv(.winapi) void,
++        // slot 19: IASetIndexBuffer
++        _reserved19: Reserved,
++        // slot 20: DrawIndexedInstanced
++        _reserved20: Reserved,
++        // slot 21: DrawInstanced
++        DrawInstanced: *const fn (
++            *ID3D11DeviceContext,
++            VertexCountPerInstance: u32,
++            InstanceCount: u32,
++            StartVertexLocation: u32,
++            StartInstanceLocation: u32,
++        ) callconv(.winapi) void,
++        // slot 22: GSSetConstantBuffers
++        _reserved22: Reserved,
++        // slot 23: GSSetShader
++        _reserved23: Reserved,
++        // slot 24: IASetPrimitiveTopology
++        IASetPrimitiveTopology: *const fn (
++            *ID3D11DeviceContext,
++            D3D_PRIMITIVE_TOPOLOGY,
++        ) callconv(.winapi) void,
++        // slot 25: VSSetShaderResources
++        _reserved25: Reserved,
++        // slot 26: VSSetSamplers
++        _reserved26: Reserved,
++        // slot 27: Begin
++        _reserved27: Reserved,
++        // slot 28: End
++        _reserved28: Reserved,
++        // slot 29: GetData
++        _reserved29: Reserved,
++        // slot 30: SetPredication
++        _reserved30: Reserved,
++        // slot 31: GSSetShaderResources
++        _reserved31: Reserved,
++        // slot 32: GSSetSamplers
++        _reserved32: Reserved,
++        // slot 33: OMSetRenderTargets
++        OMSetRenderTargets: *const fn (
++            *ID3D11DeviceContext,
++            NumViews: u32,
++            ppRenderTargetViews: ?[*]const ?*ID3D11RenderTargetView,
++            pDepthStencilView: ?*anyopaque, // ID3D11DepthStencilView
++        ) callconv(.winapi) void,
++        // slot 34: OMSetRenderTargetsAndUnorderedAccessViews
++        _reserved34: Reserved,
++        // slot 35: OMSetBlendState
++        _reserved35: Reserved,
++        // slot 36: OMSetDepthStencilState
++        _reserved36: Reserved,
++        // slot 37: SOSetTargets
++        _reserved37: Reserved,
++        // slot 38: DrawAuto
++        _reserved38: Reserved,
++        // slot 39: DrawIndexedInstancedIndirect
++        _reserved39: Reserved,
++        // slot 40: DrawInstancedIndirect
++        _reserved40: Reserved,
++        // slot 41: Dispatch
++        _reserved41: Reserved,
++        // slot 42: DispatchIndirect
++        _reserved42: Reserved,
++        // slot 43: RSSetState
++        _reserved43: Reserved,
++        // slot 44: RSSetViewports
++        RSSetViewports: *const fn (
++            *ID3D11DeviceContext,
++            NumViewports: u32,
++            pViewports: [*]const D3D11_VIEWPORT,
++        ) callconv(.winapi) void,
++        // slot 45: RSSetScissorRects
++        _reserved45: Reserved,
++        // slot 46: CopySubresourceRegion
++        _reserved46: Reserved,
++        // slot 47: CopyResource
++        CopyResource: *const fn (
++            *ID3D11DeviceContext,
++            *ID3D11Resource, // dst
++            *ID3D11Resource, // src
++        ) callconv(.winapi) void,
++        // slot 48: UpdateSubresource
++        UpdateSubresource: *const fn (
++            *ID3D11DeviceContext,
++            *ID3D11Resource,
++            u32, // DstSubresource
++            ?*const D3D11_BOX, // nullable = whole resource
++            *const anyopaque, // pSrcData
++            u32, // SrcRowPitch
++            u32, // SrcDepthPitch
++        ) callconv(.winapi) void,
++        // slot 49: CopyStructureCount
++        _reserved49: Reserved,
++        // slot 50: ClearRenderTargetView
++        ClearRenderTargetView: *const fn (
++            *ID3D11DeviceContext,
++            *ID3D11RenderTargetView,
++            *const [4]f32,
++        ) callconv(.winapi) void,
++        // slot 51: ClearUnorderedAccessViewUint
++        _reserved51: Reserved,
++        // slot 52: ClearUnorderedAccessViewFloat
++        _reserved52: Reserved,
++        // slot 53: ClearDepthStencilView
++        _reserved53: Reserved,
++        // slot 54: GenerateMips
++        _reserved54: Reserved,
++        // slot 55: SetResourceMinLOD
++        _reserved55: Reserved,
++        // slot 56: GetResourceMinLOD
++        _reserved56: Reserved,
++        // slot 57: ResolveSubresource
++        _reserved57: Reserved,
++        // slot 58: ExecuteCommandList
++        _reserved58: Reserved,
++        // slot 59: HSSetShaderResources
++        _reserved59: Reserved,
++        // slot 60: HSSetShader
++        _reserved60: Reserved,
++        // slot 61: HSSetSamplers
++        _reserved61: Reserved,
++        // slot 62: HSSetConstantBuffers
++        _reserved62: Reserved,
++        // slot 63: DSSetShaderResources
++        _reserved63: Reserved,
++        // slot 64: DSSetShader
++        _reserved64: Reserved,
++        // slot 65: DSSetSamplers
++        _reserved65: Reserved,
++        // slot 66: DSSetConstantBuffers
++        _reserved66: Reserved,
++        // slot 67: CSSetShaderResources
++        _reserved67: Reserved,
++        // slot 68: CSSetUnorderedAccessViews
++        _reserved68: Reserved,
++        // slot 69: CSSetShader
++        _reserved69: Reserved,
++        // slot 70: CSSetSamplers
++        _reserved70: Reserved,
++        // slot 71: CSSetConstantBuffers
++        _reserved71: Reserved,
++        // slot 72: VSGetConstantBuffers
++        _reserved72: Reserved,
++        // slot 73: PSGetShaderResources
++        _reserved73: Reserved,
++        // slot 74: PSGetShader
++        _reserved74: Reserved,
++        // slot 75: PSGetSamplers
++        _reserved75: Reserved,
++        // slot 76: VSGetShader
++        _reserved76: Reserved,
++        // slot 77: PSGetConstantBuffers
++        _reserved77: Reserved,
++        // slot 78: IAGetInputLayout
++        _reserved78: Reserved,
++        // slot 79: IAGetVertexBuffers
++        _reserved79: Reserved,
++        // slot 80: IAGetIndexBuffer
++        _reserved80: Reserved,
++        // slot 81: GSGetConstantBuffers
++        _reserved81: Reserved,
++        // slot 82: GSGetShader
++        _reserved82: Reserved,
++        // slot 83: IAGetPrimitiveTopology
++        _reserved83: Reserved,
++        // slot 84: VSGetShaderResources
++        _reserved84: Reserved,
++        // slot 85: VSGetSamplers
++        _reserved85: Reserved,
++        // slot 86: GetPredication
++        _reserved86: Reserved,
++        // slot 87: GSGetShaderResources
++        _reserved87: Reserved,
++        // slot 88: GSGetSamplers
++        _reserved88: Reserved,
++        // slot 89: OMGetRenderTargets
++        _reserved89: Reserved,
++        // slot 90: OMGetRenderTargetsAndUnorderedAccessViews
++        _reserved90: Reserved,
++        // slot 91: OMGetBlendState
++        _reserved91: Reserved,
++        // slot 92: OMGetDepthStencilState
++        _reserved92: Reserved,
++        // slot 93: SOGetTargets
++        _reserved93: Reserved,
++        // slot 94: RSGetState
++        _reserved94: Reserved,
++        // slot 95: RSGetViewports
++        _reserved95: Reserved,
++        // slot 96: RSGetScissorRects
++        _reserved96: Reserved,
++        // slot 97: HSGetShaderResources
++        _reserved97: Reserved,
++        // slot 98: HSGetShader
++        _reserved98: Reserved,
++        // slot 99: HSGetSamplers
++        _reserved99: Reserved,
++        // slot 100: HSGetConstantBuffers
++        _reserved100: Reserved,
++        // slot 101: DSGetShaderResources
++        _reserved101: Reserved,
++        // slot 102: DSGetShader
++        _reserved102: Reserved,
++        // slot 103: DSGetSamplers
++        _reserved103: Reserved,
++        // slot 104: DSGetConstantBuffers
++        _reserved104: Reserved,
++        // slot 105: CSGetShaderResources
++        _reserved105: Reserved,
++        // slot 106: CSGetUnorderedAccessViews
++        _reserved106: Reserved,
++        // slot 107: CSGetShader
++        _reserved107: Reserved,
++        // slot 108: CSGetSamplers
++        _reserved108: Reserved,
++        // slot 109: CSGetConstantBuffers
++        _reserved109: Reserved,
++        // slot 110: ClearState
++        _reserved110: Reserved,
++        // slot 111: Flush
++        _reserved111: Reserved,
++        // slot 112: GetType
++        _reserved112: Reserved,
++        // slot 113: GetContextFlags
++        _reserved113: Reserved,
++        // slot 114: FinishCommandList
++        _reserved114: Reserved,
++    };
++
++    pub inline fn VSSetConstantBuffers(self: *ID3D11DeviceContext, start_slot: u32, buffers: []const ?*ID3D11Buffer) void {
++        self.vtable.VSSetConstantBuffers(self, start_slot, @intCast(buffers.len), buffers.ptr);
++    }
++
++    pub inline fn PSSetShaderResources(self: *ID3D11DeviceContext, start_slot: u32, views: []const ?*ID3D11ShaderResourceView) void {
++        self.vtable.PSSetShaderResources(self, start_slot, @intCast(views.len), views.ptr);
++    }
++
++    pub inline fn PSSetShader(self: *ID3D11DeviceContext, shader: ?*ID3D11PixelShader) void {
++        self.vtable.PSSetShader(self, shader, null, 0);
++    }
++
++    pub inline fn PSSetSamplers(self: *ID3D11DeviceContext, start_slot: u32, samplers: []const ?*ID3D11SamplerState) void {
++        self.vtable.PSSetSamplers(self, start_slot, @intCast(samplers.len), samplers.ptr);
++    }
++
++    pub inline fn VSSetShader(self: *ID3D11DeviceContext, shader: ?*ID3D11VertexShader) void {
++        self.vtable.VSSetShader(self, shader, null, 0);
++    }
++
++    pub inline fn Map(
++        self: *ID3D11DeviceContext,
++        resource: *ID3D11Resource,
++        subresource: u32,
++        map_type: D3D11_MAP,
++        map_flags: u32,
++        mapped: *D3D11_MAPPED_SUBRESOURCE,
++    ) HRESULT {
++        return self.vtable.Map(self, resource, subresource, map_type, map_flags, mapped);
++    }
++
++    pub inline fn Unmap(self: *ID3D11DeviceContext, resource: *ID3D11Resource, subresource: u32) void {
++        self.vtable.Unmap(self, resource, subresource);
++    }
++
++    pub inline fn IASetInputLayout(self: *ID3D11DeviceContext, layout: ?*ID3D11InputLayout) void {
++        self.vtable.IASetInputLayout(self, layout);
++    }
++
++    pub inline fn IASetVertexBuffers(
++        self: *ID3D11DeviceContext,
++        start_slot: u32,
++        buffers: []const ?*ID3D11Buffer,
++        strides: []const u32,
++        offsets: []const u32,
++    ) void {
++        self.vtable.IASetVertexBuffers(self, start_slot, @intCast(buffers.len), buffers.ptr, strides.ptr, offsets.ptr);
++    }
++
++    pub inline fn IASetPrimitiveTopology(self: *ID3D11DeviceContext, topology: D3D_PRIMITIVE_TOPOLOGY) void {
++        self.vtable.IASetPrimitiveTopology(self, topology);
++    }
++
++    pub inline fn DrawInstanced(
++        self: *ID3D11DeviceContext,
++        vertex_count: u32,
++        instance_count: u32,
++        start_vertex: u32,
++        start_instance: u32,
++    ) void {
++        self.vtable.DrawInstanced(self, vertex_count, instance_count, start_vertex, start_instance);
++    }
++
++    pub inline fn OMSetRenderTargets(
++        self: *ID3D11DeviceContext,
++        rtvs: []const ?*ID3D11RenderTargetView,
++        dsv: ?*anyopaque,
++    ) void {
++        self.vtable.OMSetRenderTargets(self, @intCast(rtvs.len), rtvs.ptr, dsv);
++    }
++
++    pub inline fn RSSetViewports(self: *ID3D11DeviceContext, viewports: []const D3D11_VIEWPORT) void {
++        self.vtable.RSSetViewports(self, @intCast(viewports.len), viewports.ptr);
++    }
++
++    pub inline fn ClearRenderTargetView(self: *ID3D11DeviceContext, rtv: *ID3D11RenderTargetView, color: *const [4]f32) void {
++        self.vtable.ClearRenderTargetView(self, rtv, color);
++    }
++
++    pub inline fn CopyResource(
++        self: *ID3D11DeviceContext,
++        dst: *ID3D11Resource,
++        src: *ID3D11Resource,
++    ) void {
++        self.vtable.CopyResource(self, dst, src);
++    }
++
++    pub inline fn UpdateSubresource(
++        self: *ID3D11DeviceContext,
++        resource: *ID3D11Resource,
++        subresource: u32,
++        box: ?*const D3D11_BOX,
++        src_data: *const anyopaque,
++        src_row_pitch: u32,
++        src_depth_pitch: u32,
++    ) void {
++        self.vtable.UpdateSubresource(
++            self,
++            resource,
++            subresource,
++            box,
++            src_data,
++            src_row_pitch,
++            src_depth_pitch,
++        );
++    }
++
++    pub inline fn Release(self: *ID3D11DeviceContext) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++/// Opaque type — we never call methods on class instances directly.
++pub const ID3D11ClassInstance = opaque {};
++
++// =============================================================================
++// D3D11CreateDevice — imported from d3d11.dll
++// =============================================================================
++pub const D3D11CreateDevice = @extern(*const fn (
++    pAdapter: ?*anyopaque, // IDXGIAdapter
++    DriverType: D3D_DRIVER_TYPE,
++    Software: ?*anyopaque, // HMODULE
++    Flags: D3D11_CREATE_DEVICE_FLAG,
++    pFeatureLevels: ?[*]const D3D_FEATURE_LEVEL,
++    FeatureLevels: u32,
++    SDKVersion: u32,
++    ppDevice: ?*?*ID3D11Device,
++    pFeatureLevel: ?*D3D_FEATURE_LEVEL,
++    ppImmediateContext: ?*?*ID3D11DeviceContext,
++) callconv(.winapi) HRESULT, .{
++    .library_name = "d3d11",
++    .name = "D3D11CreateDevice",
++});
++
++pub const D3D11_SDK_VERSION: u32 = 7;
+diff --git a/src/renderer/directx11/device.zig b/src/renderer/directx11/device.zig
+new file mode 100644
+index 000000000..c9d0d32c4
+--- /dev/null
++++ b/src/renderer/directx11/device.zig
+@@ -0,0 +1,399 @@
++//! D3D11 device and swap-chain lifecycle.
++//!
++//! This is deliberately *not* the `device.zig` from PR #11886. That one takes
++//! an `ISwapChainPanelNative` and hardcodes `D3D_DRIVER_TYPE.HARDWARE` with no
++//! fallback, because it only ever targeted a XAML panel. Two things ADR 0002
++//! requires are therefore ours to write:
++//!
++//!   1. The **degradation ladder**: hardware -> WARP. WARP is the same code
++//!      path, not a reduced one, which is what makes it viable for RDP and
++//!      driverless machines. Verified on the dev box (`harness/warp-probe`):
++//!      hardware and WARP both report feature level 11_1.
++//!   2. **hwnd presentation mode**, for the standalone harness. Composition
++//!      mode (the Windows Terminal path) arrives in Phase 2.
++//!
++//! Threading: D3D11 is free-threaded and we keep ghostty's renderer thread, so
++//! nothing here assumes an app-thread affinity.
++
++const std = @import("std");
++const builtin = @import("builtin");
++
++const com = @import("com.zig");
++const d3d11 = @import("d3d11.zig");
++const dxgi = @import("dxgi.zig");
++
++const log = std.log.scoped(.directx11);
++
++const HRESULT = com.HRESULT;
++
++/// Which rasterizer backed the device we ended up with. Reported so the
++/// embedder can surface "running in software" without having to re-query DXGI,
++/// and so tests can force a path.
++pub const DriverKind = enum {
++    hardware,
++    /// Windows Advanced Rasterization Platform - the software rasterizer.
++    warp,
++
++    pub fn driverType(self: DriverKind) d3d11.D3D_DRIVER_TYPE {
++        return switch (self) {
++            .hardware => .HARDWARE,
++            .warp => .WARP,
++        };
++    }
++};
++
++/// Where a device presents. Mirrors `apprt.embedded.Platform.Win32`, but as a
++/// renderer-side concept so this module does not depend on the apprt.
++pub const Target = union(enum) {
++    /// Present to a window.
++    hwnd: *anyopaque,
++
++    /// Present to a DirectComposition surface handle (Phase 2).
++    composition,
++};
++
++pub const Error = error{
++    DeviceCreationFailed,
++    NoSuitableDriver,
++    QueryInterfaceFailed,
++    GetAdapterFailed,
++    GetFactoryFailed,
++    SwapChainCreationFailed,
++    BackBufferFailed,
++    RenderTargetViewFailed,
++    ResizeFailed,
++    Unsupported,
++};
++
++/// We ask for 11_0 as the floor. Everything the terminal renderer needs is in
++/// 11_0, and WARP provides it on every supported Windows version.
++const feature_levels = [_]d3d11.D3D_FEATURE_LEVEL{ .@"11_1", .@"11_0" };
++
++/// FLIP_SEQUENTIAL requires at least 2 buffers and a flip-model format.
++const buffer_count: u32 = 2;
++const swap_chain_format: dxgi.DXGI_FORMAT = .B8G8R8A8_UNORM;
++
++const RECT = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
++
++extern "user32" fn GetClientRect(hWnd: *anyopaque, lpRect: *RECT) callconv(.winapi) i32;
++
++pub const Device = struct {
++    device: *d3d11.ID3D11Device,
++    context: *d3d11.ID3D11DeviceContext,
++    swap_chain: *dxgi.IDXGISwapChain1,
++    rtv: ?*d3d11.ID3D11RenderTargetView,
++
++    /// Where this device presents. Retained so we can re-query the window for
++    /// its size; see `syncToWindow`.
++    target: Target,
++
++    driver: DriverKind,
++    feature_level: d3d11.D3D_FEATURE_LEVEL,
++    width: u32,
++    height: u32,
++
++    /// Create a device and swap chain for `target`.
++    ///
++    /// `force_driver` pins the rasterizer instead of walking the ladder, which
++    /// is how the harness exercises the forced-WARP exit criterion without
++    /// needing a machine that lacks a GPU.
++    pub fn init(
++        target: Target,
++        width: u32,
++        height: u32,
++        force_driver: ?DriverKind,
++    ) Error!Device {
++        if (comptime builtin.os.tag != .windows) return Error.Unsupported;
++
++        const ladder: []const DriverKind = if (force_driver) |d|
++            &.{d}
++        else
++            &.{ .hardware, .warp };
++
++        var device: ?*d3d11.ID3D11Device = null;
++        var context: ?*d3d11.ID3D11DeviceContext = null;
++        var level: d3d11.D3D_FEATURE_LEVEL = .@"11_0";
++        var chosen: DriverKind = .hardware;
++
++        for (ladder) |kind| {
++            // BGRA_SUPPORT is required for D2D/DirectComposition interop. We
++            // ask for it even in hwnd mode so that a device created here stays
++            // usable when composition mode lands in Phase 2.
++            const hr = d3d11.D3D11CreateDevice(
++                null, // default adapter for this driver type
++                kind.driverType(),
++                null,
++                d3d11.D3D11_CREATE_DEVICE_BGRA_SUPPORT,
++                &feature_levels,
++                feature_levels.len,
++                d3d11.D3D11_SDK_VERSION,
++                &device,
++                &level,
++                &context,
++            );
++            if (com.SUCCEEDED(hr)) {
++                chosen = kind;
++                break;
++            }
++            log.warn("D3D11CreateDevice failed for {t}: hr=0x{x}", .{
++                kind, @as(u32, @bitCast(hr)),
++            });
++        } else {
++            // Every rung of the ladder failed. There is nothing below WARP.
++            log.err("no D3D11 driver could be created", .{});
++            return Error.NoSuitableDriver;
++        }
++
++        const dev = device orelse return Error.DeviceCreationFailed;
++        errdefer _ = dev.Release();
++        const ctx = context orelse return Error.DeviceCreationFailed;
++        errdefer _ = ctx.Release();
++
++        if (chosen == .warp) {
++            log.info("using WARP software rasterizer", .{});
++        }
++
++        const factory = try getFactory(dev);
++        defer _ = factory.Release();
++
++        const desc: dxgi.DXGI_SWAP_CHAIN_DESC1 = .{
++            .Width = width,
++            .Height = height,
++            .Format = swap_chain_format,
++            .Stereo = 0,
++            .SampleDesc = .{ .Count = 1, .Quality = 0 },
++            .BufferUsage = dxgi.DXGI_USAGE_RENDER_TARGET_OUTPUT,
++            .BufferCount = buffer_count,
++            .Scaling = .NONE,
++            .SwapEffect = .FLIP_SEQUENTIAL,
++            // Alpha mode is not a free choice: DXGI rejects PREMULTIPLIED for
++            // hwnd swap chains with DXGI_ERROR_INVALID_CALL (0x887A0001).
++            // Transparency only means something when a compositor is behind
++            // the surface, so premultiplied belongs to composition mode and
++            // IGNORE is the only sensible value for a window.
++            .AlphaMode = switch (target) {
++                .hwnd => .IGNORE,
++                .composition => .PREMULTIPLIED,
++            },
++            .Flags = 0,
++        };
++
++        var swap_chain: ?*dxgi.IDXGISwapChain1 = null;
++        const hr = switch (target) {
++            .hwnd => |hwnd| factory.CreateSwapChainForHwnd(
++                @ptrCast(dev),
++                hwnd,
++                &desc,
++                null, // windowed; never take over the display mode
++                null,
++                &swap_chain,
++            ),
++            .composition => return Error.Unsupported, // Phase 2
++        };
++        if (com.FAILED(hr) or swap_chain == null) {
++            log.err("swap chain creation failed: hr=0x{x}", .{@as(u32, @bitCast(hr))});
++            return Error.SwapChainCreationFailed;
++        }
++        errdefer _ = swap_chain.?.Release();
++
++        var self: Device = .{
++            .device = dev,
++            .context = ctx,
++            .swap_chain = swap_chain.?,
++            .rtv = null,
++            .target = target,
++            .driver = chosen,
++            .feature_level = level,
++            .width = width,
++            .height = height,
++        };
++        try self.createRenderTarget();
++
++        log.info("D3D11 device ready: driver={t} feature_level={t} size={d}x{d}", .{
++            chosen, level, width, height,
++        });
++        return self;
++    }
++
++    pub fn deinit(self: *Device) void {
++        self.releaseRenderTarget();
++        _ = self.swap_chain.Release();
++        _ = self.context.Release();
++        _ = self.device.Release();
++        self.* = undefined;
++    }
++
++    /// Walk device -> IDXGIDevice -> adapter -> factory. Using the factory that
++    /// owns our device (rather than a fresh CreateDXGIFactory) is required: a
++    /// swap chain must come from the same factory as its device, and it also
++    /// keeps us on the WARP adapter when that is what we fell back to.
++    fn getFactory(dev: *d3d11.ID3D11Device) Error!*dxgi.IDXGIFactory2 {
++        var dxgi_device_opt: ?*anyopaque = null;
++        if (com.FAILED(dev.QueryInterface(&dxgi.IDXGIDevice.IID, &dxgi_device_opt)) or
++            dxgi_device_opt == null)
++        {
++            return Error.QueryInterfaceFailed;
++        }
++        const dxgi_device: *dxgi.IDXGIDevice = @ptrCast(@alignCast(dxgi_device_opt.?));
++        defer _ = dxgi_device.Release();
++
++        var adapter: ?*dxgi.IDXGIAdapter = null;
++        if (com.FAILED(dxgi_device.GetAdapter(&adapter)) or adapter == null) {
++            return Error.GetAdapterFailed;
++        }
++        defer _ = adapter.?.Release();
++
++        var factory_opt: ?*anyopaque = null;
++        if (com.FAILED(adapter.?.GetParent(&dxgi.IDXGIFactory2.IID, &factory_opt)) or
++            factory_opt == null)
++        {
++            return Error.GetFactoryFailed;
++        }
++        return @ptrCast(@alignCast(factory_opt.?));
++    }
++
++    fn createRenderTarget(self: *Device) Error!void {
++        var back_buffer_opt: ?*anyopaque = null;
++        if (com.FAILED(self.swap_chain.GetBuffer(
++            0,
++            &d3d11.ID3D11Texture2D.IID,
++            &back_buffer_opt,
++        )) or back_buffer_opt == null) {
++            return Error.BackBufferFailed;
++        }
++        const back_buffer: *d3d11.ID3D11Texture2D = @ptrCast(@alignCast(back_buffer_opt.?));
++        defer _ = back_buffer.Release();
++
++        var rtv: ?*d3d11.ID3D11RenderTargetView = null;
++        if (com.FAILED(self.device.CreateRenderTargetView(
++            @ptrCast(back_buffer),
++            null,
++            &rtv,
++        )) or rtv == null) {
++            return Error.RenderTargetViewFailed;
++        }
++        self.rtv = rtv;
++    }
++
++    fn releaseRenderTarget(self: *Device) void {
++        if (self.rtv) |rtv| {
++            // The context can still hold a reference to the view through OM
++            // state. Unbind before releasing, otherwise ResizeBuffers fails
++            // with "outstanding references to the swap chain's buffers".
++            self.context.OMSetRenderTargets(&.{null}, null);
++            _ = rtv.Release();
++            self.rtv = null;
++        }
++    }
++
++    /// Resize the swap chain. No-op when the size is unchanged, and ignores
++    /// zero dimensions, which Windows sends on minimize.
++    pub fn resize(self: *Device, width: u32, height: u32) Error!void {
++        if (width == 0 or height == 0) return;
++        if (width == self.width and height == self.height) return;
++
++        self.releaseRenderTarget();
++
++        const hr = self.swap_chain.ResizeBuffers(
++            buffer_count,
++            width,
++            height,
++            swap_chain_format,
++            0,
++        );
++        if (com.FAILED(hr)) {
++            log.err("ResizeBuffers failed: hr=0x{x}", .{@as(u32, @bitCast(hr))});
++            return Error.ResizeFailed;
++        }
++
++        self.width = width;
++        self.height = height;
++        try self.createRenderTarget();
++    }
++
++    /// Re-sync the swap chain to the window's current client size.
++    ///
++    /// In hwnd mode the window is the authority on how big the surface is, and
++    /// `GenericRenderer` learns about size changes solely by comparing
++    /// `surfaceSize()` against its own state. If this is not called, a resized
++    /// window never reaches the renderer: it keeps drawing at the old size and
++    /// the newly exposed region stays blank.
++    ///
++    /// Composition mode has no window to ask, so it is driven by the
++    /// embedder's explicit resize call instead (Phase 2).
++    pub fn syncToWindow(self: *Device) void {
++        const hwnd = switch (self.target) {
++            .hwnd => |h| h,
++            .composition => return,
++        };
++
++        var rect: RECT = undefined;
++        if (GetClientRect(hwnd, &rect) == 0) return;
++
++        const w: u32 = @intCast(@max(rect.right - rect.left, 0));
++        const h: u32 = @intCast(@max(rect.bottom - rect.top, 0));
++        if (w == 0 or h == 0) return; // minimized
++        if (w == self.width and h == self.height) return;
++
++        self.resize(w, h) catch |err| {
++            log.warn("failed to resize swap chain to {d}x{d}: {}", .{ w, h, err });
++        };
++    }
++
++    /// Borrow the swap chain's back buffer texture. The caller must Release
++    /// it. Returns null if the buffer could not be obtained, which callers
++    /// treat as "skip this frame" rather than a fatal error.
++    pub fn backBuffer(self: *Device) ?*d3d11.ID3D11Texture2D {
++        var buffer: ?*anyopaque = null;
++        if (com.FAILED(self.swap_chain.GetBuffer(
++            0,
++            &d3d11.ID3D11Texture2D.IID,
++            &buffer,
++        )) or buffer == null) return null;
++        return @ptrCast(@alignCast(buffer.?));
++    }
++
++    /// Bind the back buffer and set a full-surface viewport.
++    pub fn bindRenderTarget(self: *Device) void {
++        const rtv = self.rtv orelse return;
++        self.context.OMSetRenderTargets(&.{rtv}, null);
++        const viewport: d3d11.D3D11_VIEWPORT = .{
++            .TopLeftX = 0,
++            .TopLeftY = 0,
++            .Width = @floatFromInt(self.width),
++            .Height = @floatFromInt(self.height),
++            .MinDepth = 0,
++            .MaxDepth = 1,
++        };
++        self.context.RSSetViewports(&.{viewport});
++    }
++
++    pub fn clear(self: *Device, rgba: [4]f32) void {
++        const rtv = self.rtv orelse return;
++        self.context.ClearRenderTargetView(rtv, &rgba);
++    }
++
++    /// Present the back buffer. Returns true if the device was lost, which the
++    /// caller must handle by rebuilding (step 3 of ADR 0002's ladder).
++    pub fn present(self: *Device, vsync: bool) bool {
++        const hr = self.swap_chain.Present(if (vsync) 1 else 0, 0);
++        if (hr == com.DXGI_ERROR_DEVICE_REMOVED or
++            hr == DXGI_ERROR_DEVICE_RESET)
++        {
++            log.warn("device lost on present: hr=0x{x}", .{@as(u32, @bitCast(hr))});
++            return true;
++        }
++        if (com.FAILED(hr)) {
++            log.warn("Present failed: hr=0x{x}", .{@as(u32, @bitCast(hr))});
++        }
++        return false;
++    }
++};
++
++const DXGI_ERROR_DEVICE_RESET: HRESULT = @bitCast(@as(u32, 0x887A0007));
++
++test "DriverKind maps to D3D driver types" {
++    const testing = std.testing;
++    try testing.expectEqual(d3d11.D3D_DRIVER_TYPE.HARDWARE, DriverKind.hardware.driverType());
++    try testing.expectEqual(d3d11.D3D_DRIVER_TYPE.WARP, DriverKind.warp.driverType());
++}
+diff --git a/src/renderer/directx11/dxgi.zig b/src/renderer/directx11/dxgi.zig
+new file mode 100644
+index 000000000..b485dc85f
+--- /dev/null
++++ b/src/renderer/directx11/dxgi.zig
+@@ -0,0 +1,590 @@
++//! DXGI bindings.
++//!
++//! Harvested from ghostty-org/ghostty PR #11886 by deblasis (MIT).
++//!
++//! That PR targeted a XAML SwapChainPanel, so it wired only
++//! CreateSwapChainForComposition. CreateSwapChainForHwnd (and its
++//! DXGI_SWAP_CHAIN_FULLSCREEN_DESC) are added here for the standalone harness
++//! path, along with the sRGB and single-channel DXGI_FORMAT values.
++const com = @import("com.zig");
++const GUID = com.GUID;
++const HRESULT = com.HRESULT;
++const IUnknown = com.IUnknown;
++
++// --- Enums ---
++
++pub const DXGI_FORMAT = enum(u32) {
++    UNKNOWN = 0,
++    R32G32B32A32_FLOAT = 2,
++    R32_UINT = 42,
++    R8G8B8A8_UNORM = 28,
++    R8G8B8A8_UNORM_SRGB = 29,
++    /// Single-channel 8-bit, used by the grayscale glyph atlas.
++    R8_UNORM = 61,
++    B8G8R8A8_UNORM = 87,
++    B8G8R8A8_UNORM_SRGB = 91,
++    _,
++};
++
++pub const DXGI_SWAP_EFFECT = enum(u32) {
++    DISCARD = 0,
++    SEQUENTIAL = 1,
++    FLIP_SEQUENTIAL = 3,
++    FLIP_DISCARD = 4,
++};
++
++pub const DXGI_SCALING = enum(u32) {
++    STRETCH = 0,
++    NONE = 1,
++    ASPECT_RATIO_STRETCH = 2,
++};
++
++pub const DXGI_ALPHA_MODE = enum(u32) {
++    UNSPECIFIED = 0,
++    PREMULTIPLIED = 1,
++    STRAIGHT = 2,
++    IGNORE = 3,
++};
++
++pub const DXGI_USAGE = u32;
++pub const DXGI_USAGE_RENDER_TARGET_OUTPUT: DXGI_USAGE = 0x00000020;
++
++// --- Structs ---
++
++pub const DXGI_SAMPLE_DESC = extern struct {
++    Count: u32,
++    Quality: u32,
++};
++
++pub const DXGI_SWAP_CHAIN_DESC1 = extern struct {
++    Width: u32,
++    Height: u32,
++    Format: DXGI_FORMAT,
++    Stereo: i32, // BOOL
++    SampleDesc: DXGI_SAMPLE_DESC,
++    BufferUsage: DXGI_USAGE,
++    BufferCount: u32,
++    Scaling: DXGI_SCALING,
++    SwapEffect: DXGI_SWAP_EFFECT,
++    AlphaMode: DXGI_ALPHA_MODE,
++    Flags: u32,
++};
++
++pub const DXGI_MODE_SCANLINE_ORDER = enum(u32) {
++    UNSPECIFIED = 0,
++    PROGRESSIVE = 1,
++    UPPER_FIELD_FIRST = 2,
++    LOWER_FIELD_FIRST = 3,
++};
++
++pub const DXGI_MODE_SCALING = enum(u32) {
++    UNSPECIFIED = 0,
++    CENTERED = 1,
++    STRETCHED = 2,
++};
++
++pub const DXGI_RATIONAL = extern struct {
++    Numerator: u32,
++    Denominator: u32,
++};
++
++/// Only used by `CreateSwapChainForHwnd`, and only when exclusive fullscreen
++/// is wanted. We always pass null.
++pub const DXGI_SWAP_CHAIN_FULLSCREEN_DESC = extern struct {
++    RefreshRate: DXGI_RATIONAL,
++    ScanlineOrdering: DXGI_MODE_SCANLINE_ORDER,
++    Scaling: DXGI_MODE_SCALING,
++    Windowed: i32, // BOOL
++};
++
++pub const DXGI_MATRIX_3X2_F = extern struct {
++    _11: f32,
++    _12: f32,
++    _21: f32,
++    _22: f32,
++    _31: f32,
++    _32: f32,
++};
++
++const Reserved = com.Reserved;
++
++// =============================================================================
++// IDXGIObject — 7 methods total (3 IUnknown + 4 own)
++// =============================================================================
++pub const IDXGIObject = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: *const fn (*IDXGIObject, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDXGIObject) callconv(.winapi) u32,
++        Release: *const fn (*IDXGIObject) callconv(.winapi) u32,
++        // IDXGIObject (slots 3-6)
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++        GetPrivateData: Reserved,
++        GetParent: *const fn (*IDXGIObject, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++    };
++};
++
++// =============================================================================
++// IDXGIDeviceSubObject — 8 methods total (7 IDXGIObject + 1 own)
++// =============================================================================
++pub const IDXGIDeviceSubObject = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: Reserved,
++        AddRef: Reserved,
++        Release: Reserved,
++        // IDXGIObject (slots 3-6)
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++        GetPrivateData: Reserved,
++        GetParent: Reserved,
++        // IDXGIDeviceSubObject (slot 7)
++        GetDevice: Reserved,
++    };
++};
++
++// =============================================================================
++// IDXGISwapChain — 18 methods total (8 IDXGIDeviceSubObject + 10 own)
++// Slots we call: Present (8), GetBuffer (9)
++// =============================================================================
++pub const IDXGISwapChain = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: *const fn (*IDXGISwapChain, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDXGISwapChain) callconv(.winapi) u32,
++        Release: *const fn (*IDXGISwapChain) callconv(.winapi) u32,
++        // IDXGIObject (slots 3-6)
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++        GetPrivateData: Reserved,
++        GetParent: Reserved,
++        // IDXGIDeviceSubObject (slot 7)
++        GetDevice: Reserved,
++        // IDXGISwapChain (slots 8-17)
++        Present: *const fn (*IDXGISwapChain, SyncInterval: u32, Flags: u32) callconv(.winapi) HRESULT,
++        GetBuffer: *const fn (*IDXGISwapChain, Buffer: u32, riid: *const GUID, ppSurface: *?*anyopaque) callconv(.winapi) HRESULT,
++        SetFullscreenState: Reserved,
++        GetFullscreenState: Reserved,
++        GetDesc: Reserved,
++        ResizeBuffers: Reserved,
++        ResizeTarget: Reserved,
++        GetContainingOutput: Reserved,
++        GetFrameStatistics: Reserved,
++        GetLastPresentCount: Reserved,
++    };
++
++    pub inline fn Present(self: *IDXGISwapChain, sync_interval: u32, flags: u32) HRESULT {
++        return self.vtable.Present(self, sync_interval, flags);
++    }
++
++    pub inline fn GetBuffer(self: *IDXGISwapChain, buffer: u32, riid: *const GUID, surface: *?*anyopaque) HRESULT {
++        return self.vtable.GetBuffer(self, buffer, riid, surface);
++    }
++
++    pub inline fn Release(self: *IDXGISwapChain) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// IDXGISwapChain1 — 29 methods total (18 IDXGISwapChain + 11 own)
++// =============================================================================
++pub const IDXGISwapChain1 = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: *const fn (*IDXGISwapChain1, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDXGISwapChain1) callconv(.winapi) u32,
++        Release: *const fn (*IDXGISwapChain1) callconv(.winapi) u32,
++        // IDXGIObject (slots 3-6)
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++        GetPrivateData: Reserved,
++        GetParent: Reserved,
++        // IDXGIDeviceSubObject (slot 7)
++        GetDevice: Reserved,
++        // IDXGISwapChain (slots 8-17)
++        Present: *const fn (*IDXGISwapChain1, u32, u32) callconv(.winapi) HRESULT,
++        GetBuffer: *const fn (*IDXGISwapChain1, u32, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        SetFullscreenState: Reserved,
++        GetFullscreenState: Reserved,
++        GetDesc: Reserved,
++        ResizeBuffers: *const fn (*IDXGISwapChain1, u32, u32, u32, DXGI_FORMAT, u32) callconv(.winapi) HRESULT,
++        ResizeTarget: Reserved,
++        GetContainingOutput: Reserved,
++        GetFrameStatistics: Reserved,
++        GetLastPresentCount: Reserved,
++        // IDXGISwapChain1 (slots 18-28)
++        GetDesc1: Reserved,
++        GetFullscreenDesc: Reserved,
++        GetHwnd: Reserved,
++        GetCoreWindow: Reserved,
++        Present1: Reserved,
++        IsTemporaryMonoSupported: Reserved,
++        GetRestrictToOutput: Reserved,
++        SetBackgroundColor: Reserved,
++        GetBackgroundColor: Reserved,
++        SetRotation: Reserved,
++        GetRotation: Reserved,
++    };
++
++    pub inline fn Present(self: *IDXGISwapChain1, sync_interval: u32, flags: u32) HRESULT {
++        return self.vtable.Present(self, sync_interval, flags);
++    }
++
++    pub inline fn GetBuffer(self: *IDXGISwapChain1, buffer: u32, riid: *const GUID, surface: *?*anyopaque) HRESULT {
++        return self.vtable.GetBuffer(self, buffer, riid, surface);
++    }
++
++    pub inline fn ResizeBuffers(self: *IDXGISwapChain1, buffer_count: u32, width: u32, height: u32, format: DXGI_FORMAT, flags: u32) HRESULT {
++        return self.vtable.ResizeBuffers(self, buffer_count, width, height, format, flags);
++    }
++
++    pub inline fn Release(self: *IDXGISwapChain1) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// IDXGISwapChain2 — 36 methods total (29 IDXGISwapChain1 + 7 own)
++// Slot we call: SetMatrixTransform (34)
++// =============================================================================
++pub const IDXGISwapChain2 = extern struct {
++    vtable: *const VTable,
++
++    pub const IID = GUID{
++        .data1 = 0xa8be2ac4,
++        .data2 = 0x199f,
++        .data3 = 0x4946,
++        .data4 = .{ 0xb3, 0x31, 0x79, 0x59, 0x9f, 0xb9, 0x8d, 0xe7 },
++    };
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: *const fn (*IDXGISwapChain2, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDXGISwapChain2) callconv(.winapi) u32,
++        Release: *const fn (*IDXGISwapChain2) callconv(.winapi) u32,
++        // IDXGIObject (slots 3-6)
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++        GetPrivateData: Reserved,
++        GetParent: Reserved,
++        // IDXGIDeviceSubObject (slot 7)
++        GetDevice: Reserved,
++        // IDXGISwapChain (slots 8-17)
++        Present: *const fn (*IDXGISwapChain2, u32, u32) callconv(.winapi) HRESULT,
++        GetBuffer: *const fn (*IDXGISwapChain2, u32, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        SetFullscreenState: Reserved,
++        GetFullscreenState: Reserved,
++        GetDesc: Reserved,
++        ResizeBuffers: Reserved,
++        ResizeTarget: Reserved,
++        GetContainingOutput: Reserved,
++        GetFrameStatistics: Reserved,
++        GetLastPresentCount: Reserved,
++        // IDXGISwapChain1 (slots 18-28)
++        GetDesc1: Reserved,
++        GetFullscreenDesc: Reserved,
++        GetHwnd: Reserved,
++        GetCoreWindow: Reserved,
++        Present1: Reserved,
++        IsTemporaryMonoSupported: Reserved,
++        GetRestrictToOutput: Reserved,
++        SetBackgroundColor: Reserved,
++        GetBackgroundColor: Reserved,
++        SetRotation: Reserved,
++        GetRotation: Reserved,
++        // IDXGISwapChain2 (slots 29-35)
++        SetSourceSize: Reserved,
++        GetSourceSize: Reserved,
++        SetMaximumFrameLatency: Reserved,
++        GetMaximumFrameLatency: Reserved,
++        GetFrameLatencyWaitableObject: Reserved,
++        SetMatrixTransform: *const fn (*IDXGISwapChain2, *const DXGI_MATRIX_3X2_F) callconv(.winapi) HRESULT,
++        GetMatrixTransform: Reserved,
++    };
++
++    pub inline fn Present(self: *IDXGISwapChain2, sync_interval: u32, flags: u32) HRESULT {
++        return self.vtable.Present(self, sync_interval, flags);
++    }
++
++    pub inline fn GetBuffer(self: *IDXGISwapChain2, buffer: u32, riid: *const GUID, surface: *?*anyopaque) HRESULT {
++        return self.vtable.GetBuffer(self, buffer, riid, surface);
++    }
++
++    pub inline fn SetMatrixTransform(self: *IDXGISwapChain2, matrix: *const DXGI_MATRIX_3X2_F) HRESULT {
++        return self.vtable.SetMatrixTransform(self, matrix);
++    }
++
++    pub inline fn Release(self: *IDXGISwapChain2) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// IDXGIDevice — 11 methods total (7 IDXGIObject + 4 own)
++// Slot we call: GetAdapter (slot 7)
++// =============================================================================
++pub const IDXGIDevice = extern struct {
++    vtable: *const VTable,
++
++    pub const IID = GUID{
++        .data1 = 0x54ec77fa,
++        .data2 = 0x1377,
++        .data3 = 0x44e6,
++        .data4 = .{ 0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c },
++    };
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: *const fn (*IDXGIDevice, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDXGIDevice) callconv(.winapi) u32,
++        Release: *const fn (*IDXGIDevice) callconv(.winapi) u32,
++        // IDXGIObject (slots 3-6)
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++        GetPrivateData: Reserved,
++        GetParent: Reserved,
++        // IDXGIDevice (slots 7-10)
++        GetAdapter: *const fn (*IDXGIDevice, ppAdapter: *?*IDXGIAdapter) callconv(.winapi) HRESULT,
++        CreateSurface: Reserved,
++        QueryResourceResidency: Reserved,
++        SetGPUThreadPriority: Reserved,
++    };
++
++    pub inline fn GetAdapter(self: *IDXGIDevice, adapter: *?*IDXGIAdapter) HRESULT {
++        return self.vtable.GetAdapter(self, adapter);
++    }
++
++    pub inline fn Release(self: *IDXGIDevice) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// IDXGIAdapter — 10 methods total (7 IDXGIObject + 3 own)
++// Slot we call: GetParent (slot 6, inherited from IDXGIObject)
++// =============================================================================
++pub const IDXGIAdapter = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: *const fn (*IDXGIAdapter, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDXGIAdapter) callconv(.winapi) u32,
++        Release: *const fn (*IDXGIAdapter) callconv(.winapi) u32,
++        // IDXGIObject (slots 3-6)
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++        GetPrivateData: Reserved,
++        GetParent: *const fn (*IDXGIAdapter, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        // IDXGIAdapter (slots 7-9)
++        EnumOutputs: Reserved,
++        GetDesc: Reserved,
++        CheckInterfaceSupport: Reserved,
++    };
++
++    pub inline fn GetParent(self: *IDXGIAdapter, riid: *const GUID, parent: *?*anyopaque) HRESULT {
++        return self.vtable.GetParent(self, riid, parent);
++    }
++
++    pub inline fn Release(self: *IDXGIAdapter) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// IDXGIFactory — 12 methods total (7 IDXGIObject + 5 own)
++// =============================================================================
++pub const IDXGIFactory = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: Reserved,
++        AddRef: Reserved,
++        Release: Reserved,
++        // IDXGIObject (slots 3-6)
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++        GetPrivateData: Reserved,
++        GetParent: Reserved,
++        // IDXGIFactory (slots 7-11)
++        EnumAdapters: Reserved,
++        MakeWindowAssociation: Reserved,
++        GetWindowAssociation: Reserved,
++        CreateSwapChain: Reserved,
++        CreateSoftwareAdapter: Reserved,
++    };
++};
++
++// =============================================================================
++// IDXGIFactory1 — 14 methods total (12 IDXGIFactory + 2 own)
++// =============================================================================
++pub const IDXGIFactory1 = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: Reserved,
++        AddRef: Reserved,
++        Release: Reserved,
++        // IDXGIObject (slots 3-6)
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++        GetPrivateData: Reserved,
++        GetParent: Reserved,
++        // IDXGIFactory (slots 7-11)
++        EnumAdapters: Reserved,
++        MakeWindowAssociation: Reserved,
++        GetWindowAssociation: Reserved,
++        CreateSwapChain: Reserved,
++        CreateSoftwareAdapter: Reserved,
++        // IDXGIFactory1 (slots 12-13)
++        EnumAdapters1: Reserved,
++        IsCurrent: Reserved,
++    };
++};
++
++// =============================================================================
++// IDXGIFactory2 — 25 methods total (14 IDXGIFactory1 + 11 own)
++// Slot we call: CreateSwapChainForComposition (slot 24)
++// =============================================================================
++pub const IDXGIFactory2 = extern struct {
++    vtable: *const VTable,
++
++    pub const IID = GUID{
++        .data1 = 0x50c83a1c,
++        .data2 = 0xe072,
++        .data3 = 0x4c48,
++        .data4 = .{ 0x87, 0xb0, 0x36, 0x30, 0xfa, 0x36, 0xa6, 0xd0 },
++    };
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: *const fn (*IDXGIFactory2, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDXGIFactory2) callconv(.winapi) u32,
++        Release: *const fn (*IDXGIFactory2) callconv(.winapi) u32,
++        // IDXGIObject (slots 3-6)
++        SetPrivateData: Reserved,
++        SetPrivateDataInterface: Reserved,
++        GetPrivateData: Reserved,
++        GetParent: Reserved,
++        // IDXGIFactory (slots 7-11)
++        EnumAdapters: Reserved,
++        MakeWindowAssociation: Reserved,
++        GetWindowAssociation: Reserved,
++        CreateSwapChain: Reserved,
++        CreateSoftwareAdapter: Reserved,
++        // IDXGIFactory1 (slots 12-13)
++        EnumAdapters1: Reserved,
++        IsCurrent: Reserved,
++        // IDXGIFactory2 (slots 14-24)
++        IsWindowedStereoEnabled: Reserved,
++        CreateSwapChainForHwnd: *const fn (
++            self: *IDXGIFactory2,
++            pDevice: *IUnknown,
++            hWnd: *anyopaque,
++            pDesc: *const DXGI_SWAP_CHAIN_DESC1,
++            pFullscreenDesc: ?*const DXGI_SWAP_CHAIN_FULLSCREEN_DESC,
++            pRestrictToOutput: ?*anyopaque, // IDXGIOutput, nullable
++            ppSwapChain: *?*IDXGISwapChain1,
++        ) callconv(.winapi) HRESULT,
++        CreateSwapChainForCoreWindow: Reserved,
++        GetSharedResourceAdapterLuid: Reserved,
++        RegisterStereoStatusWindow: Reserved,
++        RegisterStereoStatusEvent: Reserved,
++        UnregisterStereoStatus: Reserved,
++        RegisterOcclusionStatusWindow: Reserved,
++        RegisterOcclusionStatusEvent: Reserved,
++        UnregisterOcclusionStatus: Reserved,
++        CreateSwapChainForComposition: *const fn (
++            self: *IDXGIFactory2,
++            pDevice: *IUnknown,
++            pDesc: *const DXGI_SWAP_CHAIN_DESC1,
++            pRestrictToOutput: ?*anyopaque, // IDXGIOutput, nullable
++            ppSwapChain: *?*IDXGISwapChain1,
++        ) callconv(.winapi) HRESULT,
++    };
++
++    pub inline fn CreateSwapChainForComposition(
++        self: *IDXGIFactory2,
++        device: *IUnknown,
++        desc: *const DXGI_SWAP_CHAIN_DESC1,
++        restrict_to_output: ?*anyopaque,
++        swap_chain: *?*IDXGISwapChain1,
++    ) HRESULT {
++        return self.vtable.CreateSwapChainForComposition(self, device, desc, restrict_to_output, swap_chain);
++    }
++
++    /// Create a swap chain that presents directly to a window. This is the
++    /// standalone/test-harness path; Windows Terminal uses the composition
++    /// entry point above instead.
++    ///
++    /// Pass null for `fullscreen_desc` to get a windowed swap chain, which is
++    /// the only mode a terminal wants - exclusive fullscreen would take over
++    /// the display mode.
++    pub inline fn CreateSwapChainForHwnd(
++        self: *IDXGIFactory2,
++        device: *IUnknown,
++        hwnd: *anyopaque,
++        desc: *const DXGI_SWAP_CHAIN_DESC1,
++        fullscreen_desc: ?*const DXGI_SWAP_CHAIN_FULLSCREEN_DESC,
++        restrict_to_output: ?*anyopaque,
++        swap_chain: *?*IDXGISwapChain1,
++    ) HRESULT {
++        return self.vtable.CreateSwapChainForHwnd(
++            self,
++            device,
++            hwnd,
++            desc,
++            fullscreen_desc,
++            restrict_to_output,
++            swap_chain,
++        );
++    }
++
++    pub inline fn Release(self: *IDXGIFactory2) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
++// =============================================================================
++// ISwapChainPanelNative — 4 methods total (3 IUnknown + 1 own)
++// Slot we call: SetSwapChain (slot 3)
++// =============================================================================
++pub const ISwapChainPanelNative = extern struct {
++    vtable: *const VTable,
++
++    pub const IID = GUID{
++        .data1 = 0xf92f19d2,
++        .data2 = 0x3ade,
++        .data3 = 0x45a6,
++        .data4 = .{ 0xa2, 0x0c, 0xf6, 0xf1, 0xea, 0x90, 0x55, 0x4b },
++    };
++
++    pub const VTable = extern struct {
++        // IUnknown (slots 0-2)
++        QueryInterface: *const fn (*ISwapChainPanelNative, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*ISwapChainPanelNative) callconv(.winapi) u32,
++        Release: *const fn (*ISwapChainPanelNative) callconv(.winapi) u32,
++        // ISwapChainPanelNative (slot 3)
++        SetSwapChain: *const fn (*ISwapChainPanelNative, ?*IDXGISwapChain) callconv(.winapi) HRESULT,
++    };
++
++    pub inline fn SetSwapChain(self: *ISwapChainPanelNative, swap_chain: ?*IDXGISwapChain) HRESULT {
++        return self.vtable.SetSwapChain(self, swap_chain);
++    }
++
++    pub inline fn Release(self: *ISwapChainPanelNative) u32 {
++        return self.vtable.Release(self);
++    }
++};
+diff --git a/src/renderer/directx11/shaders.zig b/src/renderer/directx11/shaders.zig
+new file mode 100644
+index 000000000..b9f1c8d7d
+--- /dev/null
++++ b/src/renderer/directx11/shaders.zig
+@@ -0,0 +1,232 @@
++//! Shader data layouts and the pipeline collection for the D3D11 backend.
++//!
++//! **The GPU data structs below are byte-identical to `metal/shaders.zig` by
++//! design, not by coincidence.** `GenericRenderer` writes the same bytes for
++//! every backend, so any divergence here is a silent corruption rather than a
++//! compile error. The alignments are copied verbatim from the Metal versions
++//! for that reason - do not "tidy" them.
++//!
++//! Phase 1 status: the data layouts are real and complete. The pipeline
++//! objects are not - HLSL, the glyph atlas, and the cell pipelines are Phase 3
++//! (ADR 0002, PLAN Phase 3). `Shaders.init` therefore produces an empty
++//! collection, and `RenderPass.step` ignores steps. See the `phase1_skeleton`
++//! marker in `../D3D11.zig`.
++
++const std = @import("std");
++const Allocator = std.mem.Allocator;
++const math = @import("../../math.zig");
++
++const log = std.log.scoped(.directx11);
++
++/// A single render pipeline (vertex + fragment program pair).
++///
++/// Phase 1: an empty placeholder so the `GraphicsAPI` contract compiles. Phase
++/// 3 replaces this with compiled DXBC shader objects and input layouts.
++pub const Pipeline = struct {
++    pub fn deinit(self: *Pipeline) void {
++        _ = self;
++    }
++};
++
++/// The set of pipelines the generic renderer expects to be able to draw with.
++///
++/// Field names must match what `GenericRenderer` reaches for; they are kept
++/// even though Phase 1 never draws through them, so that Phase 3 fills in
++/// bodies rather than reshaping the type.
++pub const PipelineCollection = struct {
++    /// Fills the whole surface with the background color.
++    bg_color: Pipeline = .{},
++    /// Draws the per-cell background colors.
++    cell_bg: Pipeline = .{},
++    /// Draws glyphs from the atlas.
++    cell_text: Pipeline = .{},
++    /// Draws inline images (kitty graphics).
++    image: Pipeline = .{},
++    /// Draws the configured background image.
++    bg_image: Pipeline = .{},
++};
++
++pub const Shaders = struct {
++    pipelines: PipelineCollection,
++
++    /// Custom postprocess shaders run against the final drawable texture.
++    /// Phase 1 never populates this; ghostty's custom-shader support is
++    /// surfaced in Phase 6.
++    post_pipelines: []const Pipeline,
++
++    /// Set once deinited so a double-deinit is a no-op rather than a
++    /// double-free, matching the OpenGL and Metal implementations.
++    defunct: bool = false,
++
++    pub fn init(
++        alloc: Allocator,
++        post_shaders: []const [:0]const u8,
++    ) !Shaders {
++        _ = alloc;
++
++        if (post_shaders.len > 0) {
++            // Not a failure: custom shaders must never block the terminal from
++            // working, which is why the other backends also degrade rather
++            // than error here.
++            log.warn(
++                "custom shaders are not implemented for D3D11 yet, ignoring {d}",
++                .{post_shaders.len},
++            );
++        }
++
++        return .{
++            .pipelines = .{},
++            .post_pipelines = &.{},
++        };
++    }
++
++    pub fn deinit(self: *Shaders, alloc: Allocator) void {
++        if (self.defunct) return;
++        _ = alloc;
++        self.defunct = true;
++    }
++};
++
++pub const Uniforms = extern struct {
++    // Note: all of the explicit alignments are copied from the Metal
++    // implementation, which copied them from the MSL developer reference.
++    // These must not drift - see the file header.
++
++    /// The projection matrix for turning world coordinates to normalized.
++    /// This is calculated based on the size of the screen.
++    projection_matrix: math.Mat align(16),
++
++    /// Size of the screen (render target) in pixels.
++    screen_size: [2]f32 align(8),
++
++    /// Size of a single cell in pixels, unscaled.
++    cell_size: [2]f32 align(8),
++
++    /// Size of the grid in columns and rows.
++    grid_size: [2]u16 align(4),
++
++    /// The padding around the terminal grid in pixels. In order:
++    /// top, right, bottom, left.
++    grid_padding: [4]f32 align(16),
++
++    /// Bit mask defining which directions to
++    /// extend cell colors in to the padding.
++    /// Order, LSB first: left, right, up, down
++    padding_extend: PaddingExtend align(1),
++
++    /// The minimum contrast ratio for text. The contrast ratio is calculated
++    /// according to the WCAG 2.0 spec.
++    min_contrast: f32 align(4),
++
++    /// The cursor position and color.
++    cursor_pos: [2]u16 align(4),
++    cursor_color: [4]u8 align(4),
++
++    /// The background color for the whole surface.
++    bg_color: [4]u8 align(4),
++
++    /// Various booleans.
++    bools: extern struct {
++        /// Whether the cursor is 2 cells wide.
++        cursor_wide: bool align(1),
++
++        /// Indicates that colors provided to the shader are already in
++        /// the P3 color space, so they don't need to be converted from
++        /// sRGB.
++        use_display_p3: bool align(1),
++
++        /// Indicates that the color attachments for the shaders have
++        /// an sRGB pixel format, which means the shaders need to output
++        /// linear RGB colors rather than gamma encoded colors, since
++        /// blending is performed in linear space and re-encoded on store.
++        use_linear_blending: bool align(1),
++
++        /// Enables a weight correction step that makes text rendered
++        /// with linear alpha blending have a similar apparent weight
++        /// (thickness) to gamma-incorrect blending.
++        use_linear_correction: bool align(1) = false,
++    },
++
++    const PaddingExtend = packed struct(u8) {
++        left: bool = false,
++        right: bool = false,
++        up: bool = false,
++        down: bool = false,
++        _padding: u4 = 0,
++    };
++};
++
++/// This is a single parameter for the terminal cell shader.
++pub const CellText = extern struct {
++    glyph_pos: [2]u32 align(8) = .{ 0, 0 },
++    glyph_size: [2]u32 align(8) = .{ 0, 0 },
++    bearings: [2]i16 align(4) = .{ 0, 0 },
++    grid_pos: [2]u16 align(4),
++    color: [4]u8 align(4),
++    atlas: Atlas align(1),
++    bools: packed struct(u8) {
++        no_min_contrast: bool = false,
++        is_cursor_glyph: bool = false,
++        _padding: u6 = 0,
++    } align(1) = .{},
++
++    pub const Atlas = enum(u8) {
++        grayscale = 0,
++        color = 1,
++    };
++
++    test {
++        // Minimizing the size of this struct is important, and it must match
++        // Metal exactly, so we test it to be aware of any changes.
++        try std.testing.expectEqual(32, @sizeOf(CellText));
++    }
++};
++
++/// This is a single parameter for the cell bg shader.
++pub const CellBg = [4]u8;
++
++/// Single parameter for the image shader. See shader for field details.
++pub const Image = extern struct {
++    grid_pos: [2]f32,
++    cell_offset: [2]f32,
++    source_rect: [4]f32,
++    dest_size: [2]f32,
++};
++
++/// Single parameter for the bg image shader.
++pub const BgImage = extern struct {
++    opacity: f32 align(4),
++    info: Info align(1),
++
++    pub const Info = packed struct(u8) {
++        position: Position,
++        fit: Fit,
++        repeat: bool,
++        _padding: u1 = 0,
++
++        pub const Position = enum(u4) {
++            tl = 0,
++            tc = 1,
++            tr = 2,
++            ml = 3,
++            mc = 4,
++            mr = 5,
++            bl = 6,
++            bc = 7,
++            br = 8,
++        };
++
++        pub const Fit = enum(u2) {
++            contain = 0,
++            cover = 1,
++            stretch = 2,
++            none = 3,
++        };
++    };
++};
++
++test {
++    _ = Uniforms;
++    _ = CellText;
++    _ = BgImage;
++}
+diff --git a/src/renderer/shadertoy.zig b/src/renderer/shadertoy.zig
+index 6dee18b04..688b80d1b 100644
+--- a/src/renderer/shadertoy.zig
++++ b/src/renderer/shadertoy.zig
+@@ -42,7 +42,7 @@ pub const Uniforms = extern struct {
+ };
+ 
+ /// The target to load shaders for.
+-pub const Target = enum { glsl, msl };
++pub const Target = enum { glsl, msl, hlsl };
+ 
+ /// Load a set of shaders from files and convert them to the target
+ /// format. The shader order is preserved.
+@@ -137,6 +137,13 @@ pub fn loadFromFile(
+         // is the final result that will be returned to the caller.
+         .glsl => try glslFromSpv(alloc_gpa, spirv),
+         .msl => try mslFromSpv(alloc_gpa, spirv),
++
++        // SPIRV-Cross has an HLSL backend, so this is a matter of wiring it up
++        // and picking a shader model, not of missing capability. Custom
++        // shaders are surfaced for the D3D11 backend in PLAN Phase 6; until
++        // then the D3D11 shader set refuses custom shaders rather than
++        // silently dropping them.
++        .hlsl => error.HlslCustomShadersNotImplemented,
+     };
+ }
+ 

@@ -30,3 +30,16 @@ desktop.ini
 harness/warp-probe/*.exe
 harness/warp-probe/*.obj
 
+
+# Harness build output
+harness/hwnd-host/*.exe
+harness/hwnd-host/*.obj
+harness/hwnd-host/*.pdb
+harness/hwnd-host/*.ilk
+harness/hwnd-host/*.lib
+harness/hwnd-host/*.def
+harness/hwnd-host/*.dll
+
+harness/hwnd-host/*.exp
+harness/hwnd-host/*.txt
+

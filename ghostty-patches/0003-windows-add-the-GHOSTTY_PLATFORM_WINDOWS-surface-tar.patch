@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Fri, 31 Jul 2026 16:32:00 -0700
+Subject: [PATCH] windows: add the GHOSTTY_PLATFORM_WINDOWS surface target
+
+Adds the platform tag, its configuration struct, and the two swap-chain
+accessors an embedder needs to bind libghostty's output into its own
+compositor. No renderer changes - the accessors return null until the D3D11
+backend supplies them.
+
+Unlike the Darwin variants, the Windows platform payload does not name a view
+to render into. It selects which of three presentation modes the renderer
+builds a swap chain for:
+
+  hwnd            present to a window (standalone, test harness)
+  composition     present to a DirectComposition surface handle, which is
+                  what a XAML SwapChainPanel consumes
+  shared_texture  present to an offscreen shared texture
+
+These are mode selectors, never retained resources - nothing here is kept
+alive by libghostty. Exactly one must be set: Platform.init rejects zero or
+several with error.InvalidWin32SurfaceMode rather than picking a default,
+because a surface presenting somewhere the embedder is not watching is far
+harder to diagnose later than a failure at ghostty_surface_new.
+
+Off Windows the payload compiles to void, mirroring how MacOS/IOS already
+handle non-Darwin targets, so the union stays one variant per platform
+without cfg-style duplication.
+
+Two accessors, both null for now:
+
+  ghostty_surface_get_swap_chain_handle -> DirectComposition HANDLE, for
+      ISwapChainPanelNative2::SetSwapChainHandle
+  ghostty_surface_get_swap_chain        -> IDXGISwapChain1*, for embedders
+      binding the swap chain object directly
+
+Their ownership rules are documented now rather than after someone gets them
+wrong: the handle must be re-read after a device-lost event because
+recreating the device produces a new one, and the IDXGISwapChain1 reference
+is borrowed, so callers AddRef before retaining it.
+
+zig build -Dapp-runtime=none -> ok
+zig build test                -> 3061 passed, 55 skipped, 0 failed
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ include/ghostty.h      | 41 ++++++++++++++++++++
+ src/apprt/embedded.zig | 85 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 126 insertions(+)
+
+diff --git a/include/ghostty.h b/include/ghostty.h
+index dd52cc01f..bf4441d93 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -66,6 +66,7 @@ typedef enum {
+   GHOSTTY_PLATFORM_INVALID,
+   GHOSTTY_PLATFORM_MACOS,
+   GHOSTTY_PLATFORM_IOS,
++  GHOSTTY_PLATFORM_WINDOWS,
+ } ghostty_platform_e;
+ 
+ typedef enum {
+@@ -453,9 +454,36 @@ typedef struct {
+   void* uiview;
+ } ghostty_platform_ios_s;
+ 
++// Unlike the Darwin platforms, this does not name a view to render into: it
++// selects which of three presentation modes the renderer builds its swap chain
++// for. These fields are mode selectors, never retained resources - libghostty
++// does not take ownership of anything here.
++//
++// Exactly one mode must be selected. Zero or several is an error and
++// ghostty_surface_new will fail, rather than pick a default: a surface that
++// presents somewhere the embedder is not watching is far harder to diagnose
++// later than a failure at construction.
++typedef struct {
++  // Mode 1: present into this window. Standalone and test-harness use.
++  void* hwnd;
++
++  // Mode 2: present into a DirectComposition surface handle, retrievable with
++  // ghostty_surface_get_swap_chain_handle(). This is what a XAML
++  // SwapChainPanel consumes, and the mode Windows Terminal uses.
++  bool composition;
++
++  // Mode 3: present into an offscreen shared texture of a fixed size.
++  struct {
++    bool enabled;
++    uint32_t width;
++    uint32_t height;
++  } shared_texture;
++} ghostty_platform_windows_s;
++
+ typedef union {
+   ghostty_platform_macos_s macos;
+   ghostty_platform_ios_s ios;
++  ghostty_platform_windows_s windows;
+ } ghostty_platform_u;
+ 
+ typedef enum {
+@@ -1116,6 +1144,19 @@ GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,
+ GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
+ GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
+ GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
++
++// The DirectComposition surface HANDLE backing this surface's swap chain, for
++// ISwapChainPanelNative2::SetSwapChainHandle. Null unless the surface was
++// created in composition mode and the renderer has built a swap chain.
++//
++// Re-read this after a device-lost event: recreating the device produces a new
++// handle. The handle stays owned by libghostty - do not close it.
++GHOSTTY_API void* ghostty_surface_get_swap_chain_handle(ghostty_surface_t);
++
++// The IDXGISwapChain1* backing this surface, for embedders binding the swap
++// chain object directly. Null under the same conditions as above. The
++// reference is borrowed; AddRef before retaining it.
++GHOSTTY_API void* ghostty_surface_get_swap_chain(ghostty_surface_t);
+ GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);
+ GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
+ GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index 1f3b98e24..2d1e9d9a8 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -346,6 +346,7 @@ pub const App = struct {
+ pub const Platform = union(PlatformTag) {
+     macos: MacOS,
+     ios: IOS,
++    win32: Win32,
+ 
+     // If our build target for libghostty is not darwin then we do
+     // not include macos support at all.
+@@ -359,6 +360,30 @@ pub const Platform = union(PlatformTag) {
+         uiview: objc.Object,
+     } else void;
+ 
++    /// Windows presentation target. Unlike the Darwin variants this does not
++    /// name a view object: it selects which of the three presentation modes
++    /// the renderer should build its swap chain for. The fields are mode
++    /// selectors, not retained resources - nothing here is kept alive by us.
++    ///
++    /// Exactly one mode must be selected; `init` rejects zero or several.
++    pub const Win32 = if (builtin.target.os.tag == .windows) struct {
++        /// Present to a window. Standalone and test-harness mode.
++        hwnd: ?*anyopaque,
++
++        /// Present to a DirectComposition surface handle, which is what a
++        /// XAML `SwapChainPanel` consumes via `ISwapChainPanelNative2`.
++        /// This is the mode Windows Terminal uses.
++        composition: bool,
++
++        /// Present to an offscreen shared texture of a fixed size.
++        shared_texture: ?SharedTexture,
++
++        pub const SharedTexture = struct {
++            width: u32,
++            height: u32,
++        };
++    } else void;
++
+     // The C ABI compatible version of this union. The tag is expected
+     // to be stored elsewhere.
+     pub const C = extern union {
+@@ -369,6 +394,16 @@ pub const Platform = union(PlatformTag) {
+         ios: extern struct {
+             uiview: ?*anyopaque,
+         },
++
++        win32: extern struct {
++            hwnd: ?*anyopaque,
++            composition: bool,
++            shared_texture: extern struct {
++                enabled: bool,
++                width: u32,
++                height: u32,
++            },
++        },
+     };
+ 
+     /// Initialize a Platform a tag and configuration from the C ABI.
+@@ -388,6 +423,29 @@ pub const Platform = union(PlatformTag) {
+                     break :ios error.UIViewMustBeSet);
+                 break :ios .{ .ios = .{ .uiview = uiview } };
+             } else error.UnsupportedPlatform,
++
++            .win32 => if (Win32 != void) win32: {
++                const config = c_platform.win32;
++
++                // The three modes are mutually exclusive and one is required.
++                // Presentation target is not something to guess at: silently
++                // picking a default would surface much later as a surface that
++                // renders somewhere the embedder is not looking.
++                var modes: u8 = 0;
++                if (config.hwnd != null) modes += 1;
++                if (config.composition) modes += 1;
++                if (config.shared_texture.enabled) modes += 1;
++                if (modes != 1) break :win32 error.InvalidWin32SurfaceMode;
++
++                break :win32 .{ .win32 = .{
++                    .hwnd = config.hwnd,
++                    .composition = config.composition,
++                    .shared_texture = if (config.shared_texture.enabled) .{
++                        .width = config.shared_texture.width,
++                        .height = config.shared_texture.height,
++                    } else null,
++                } };
++            } else error.UnsupportedPlatform,
+         };
+     }
+ };
+@@ -398,6 +456,7 @@ pub const PlatformTag = enum(c_int) {
+ 
+     macos = 1,
+     ios = 2,
++    win32 = 3,
+ };
+ 
+ pub const EnvVar = extern struct {
+@@ -1554,6 +1613,32 @@ pub const CAPI = struct {
+         ptr.app.closeSurface(ptr);
+     }
+ 
++    /// The DirectComposition surface handle backing this surface's swap chain,
++    /// for binding to a XAML SwapChainPanel via
++    /// `ISwapChainPanelNative2::SetSwapChainHandle`.
++    ///
++    /// Returns null when the surface is not in composition mode, when the
++    /// renderer has not yet created a swap chain, or on any non-Windows
++    /// target. Callers must re-read this after a device-lost event, because
++    /// recreating the device produces a new handle.
++    ///
++    /// The handle remains owned by libghostty; do not close it.
++    export fn ghostty_surface_get_swap_chain_handle(_: *Surface) ?*anyopaque {
++        // Provided by the D3D11 backend once composition mode exists.
++        return null;
++    }
++
++    /// The `IDXGISwapChain1*` backing this surface, for embedders that bind the
++    /// swap chain object directly rather than through a composition handle.
++    ///
++    /// Returns null under the same conditions as
++    /// `ghostty_surface_get_swap_chain_handle`. The reference is borrowed - the
++    /// caller must not Release it without first taking its own AddRef.
++    export fn ghostty_surface_get_swap_chain(_: *Surface) ?*anyopaque {
++        // Provided by the D3D11 backend once swap chains exist.
++        return null;
++    }
++
+     /// Returns the userdata associated with the surface.
+     export fn ghostty_surface_userdata(surface: *Surface) ?*anyopaque {
+         return surface.userdata;
