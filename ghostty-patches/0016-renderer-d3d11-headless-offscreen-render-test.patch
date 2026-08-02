@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Sat, 1 Aug 2026 19:09:51 -0700
+Subject: [PATCH] renderer/d3d11: headless offscreen render test
+
+Renders a frame into an offscreen texture and reads the pixels back, without a
+window, a swap chain, DirectComposition or a compositing desktop. It runs on
+WARP, so it needs no GPU either.
+
+That combination is the point. Visual checks so far have depended on capturing
+a window, which cannot work in CI and - as this session discovered the hard
+way - also cannot work over a DETACHED RDP session, where DWM stops
+compositing and no window on the desktop yields a frame to capture. This path
+depends on none of that.
+
+It is also the regression test for the bug that made every draw invisible for a
+whole session: D3D11 starts with no viewport bound, ClearRenderTargetView
+ignores the viewport, and draws are clipped entirely by it, so a missing
+viewport looks exactly like a correctly cleared surface. Asserting a DRAWN
+colour rather than a cleared one is what gives that teeth - confirmed by
+mutation: removing RSSetViewports makes it fail with "expected 238, found 0".
+
+The background colour is 0x11/0x55/0xEE with no two channels equal, so a
+swizzle or a wrong-offset cbuffer read cannot coincidentally produce a pass.
+The whole Uniforms struct is uploaded rather than just the field in use, so a
+layout drift against common.hlsli's cbuffer surfaces here too.
+
+Deliberately does not go through Device or RenderPass: Device.swap_chain is
+non-optional, so a genuine offscreen device mode would ripple through present
+and resize. Testing the shaders and the draw state directly buys the CI
+coverage now without that change.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/renderer/directx11/shaders.zig | 152 +++++++++++++++++++++++++++++
+ 1 file changed, 152 insertions(+)
+
+diff --git a/src/renderer/directx11/shaders.zig b/src/renderer/directx11/shaders.zig
+index 93f92421e..fa6ecf5eb 100644
+--- a/src/renderer/directx11/shaders.zig
++++ b/src/renderer/directx11/shaders.zig
+@@ -324,3 +324,155 @@ test {
+     _ = CellText;
+     _ = BgImage;
+ }
++
++test "offscreen: bg_color renders the configured background" {
++    // Renders one frame into an offscreen texture and reads the pixels back.
++    //
++    // Deliberately does not touch Device or a swap chain, so it needs no
++    // window, no DirectComposition and no compositing desktop. That matters
++    // for CI, and it matters on a detached RDP session, where DWM stops
++    // compositing and *nothing* on screen can be captured.
++    //
++    // This is also the regression test for the bug that made every draw
++    // invisible for a whole session: D3D11 starts with no viewport bound, and
++    // ClearRenderTargetView ignores the viewport while draws are clipped
++    // entirely by it. Asserting a *drawn* colour rather than a cleared one is
++    // what gives that teeth.
++    const testing = std.testing;
++
++    var device_o: ?*d3d11.ID3D11Device = null;
++    var context_o: ?*d3d11.ID3D11DeviceContext = null;
++    const levels = [_]d3d11.D3D_FEATURE_LEVEL{ .@"11_1", .@"11_0" };
++    if (com.FAILED(d3d11.D3D11CreateDevice(
++        null,
++        // WARP so this passes on a CI machine with no GPU. The pipeline being
++        // exercised is identical either way.
++        .WARP,
++        null,
++        0,
++        &levels,
++        levels.len,
++        d3d11.D3D11_SDK_VERSION,
++        &device_o,
++        null,
++        &context_o,
++    )) or device_o == null or context_o == null) return error.SkipZigTest;
++    const device = device_o.?;
++    const context = context_o.?;
++    defer _ = device.Release();
++    defer _ = context.Release();
++
++    const w: u32 = 64;
++    const h: u32 = 32;
++
++    // Render target.
++    const rt_desc: d3d11.D3D11_TEXTURE2D_DESC = .{
++        .Width = w,
++        .Height = h,
++        .MipLevels = 1,
++        .ArraySize = 1,
++        .Format = .B8G8R8A8_UNORM,
++        .SampleDesc = .{ .Count = 1, .Quality = 0 },
++        .Usage = .DEFAULT,
++        .BindFlags = d3d11.D3D11_BIND_RENDER_TARGET,
++        .CPUAccessFlags = 0,
++        .MiscFlags = 0,
++    };
++    var rt_o: ?*d3d11.ID3D11Texture2D = null;
++    if (com.FAILED(device.CreateTexture2D(&rt_desc, null, &rt_o)) or rt_o == null) {
++        return error.SkipZigTest;
++    }
++    defer _ = rt_o.?.Release();
++
++    var rtv_o: ?*d3d11.ID3D11RenderTargetView = null;
++    if (com.FAILED(device.CreateRenderTargetView(@ptrCast(rt_o.?), null, &rtv_o)) or
++        rtv_o == null) return error.SkipZigTest;
++    defer _ = rtv_o.?.Release();
++
++    // Pipelines, from the DXBC compiled at build time.
++    var shaders = try Shaders.init(testing.allocator, device, &.{});
++    defer shaders.deinit(testing.allocator);
++
++    // Uniforms. Only bg_color matters to this shader, but the whole struct is
++    // uploaded so a layout mismatch between it and common.hlsli's cbuffer shows
++    // up as the wrong colour rather than passing silently.
++    var uniforms: Uniforms = std.mem.zeroes(Uniforms);
++    uniforms.projection_matrix = math.ortho2d(0, @floatFromInt(w), @floatFromInt(h), 0);
++    uniforms.screen_size = .{ @floatFromInt(w), @floatFromInt(h) };
++    uniforms.cell_size = .{ 8, 16 };
++    uniforms.grid_size = .{ 8, 2 };
++    // Opaque orange, chosen so no channel equals another: a swizzle or a
++    // wrong-offset read cannot coincidentally produce it.
++    uniforms.bg_color = .{ 0x11, 0x55, 0xEE, 0xFF };
++    uniforms.bools.use_linear_blending = false;
++
++    const cb_desc: d3d11.D3D11_BUFFER_DESC = .{
++        .ByteWidth = @intCast(std.mem.alignForward(usize, @sizeOf(Uniforms), 16)),
++        .Usage = .DEFAULT,
++        .BindFlags = d3d11.D3D11_BIND_CONSTANT_BUFFER,
++        .CPUAccessFlags = 0,
++        .MiscFlags = 0,
++        .StructureByteStride = 0,
++    };
++    const cb_data: d3d11.D3D11_SUBRESOURCE_DATA = .{
++        .pSysMem = &uniforms,
++        .SysMemPitch = 0,
++        .SysMemSlicePitch = 0,
++    };
++    var cb_o: ?*d3d11.ID3D11Buffer = null;
++    if (com.FAILED(device.CreateBuffer(&cb_desc, &cb_data, &cb_o)) or cb_o == null) {
++        return error.SkipZigTest;
++    }
++    defer _ = cb_o.?.Release();
++
++    // Draw.
++    const rtvs = [_]?*d3d11.ID3D11RenderTargetView{rtv_o.?};
++    context.OMSetRenderTargets(&rtvs, null);
++    const clear = [4]f32{ 0, 0, 0, 0 };
++    context.ClearRenderTargetView(rtv_o.?, &clear);
++    const viewport: d3d11.D3D11_VIEWPORT = .{
++        .TopLeftX = 0,
++        .TopLeftY = 0,
++        .Width = @floatFromInt(w),
++        .Height = @floatFromInt(h),
++        .MinDepth = 0,
++        .MaxDepth = 1,
++    };
++    context.RSSetViewports(&.{viewport});
++
++    const cbs = [_]?*d3d11.ID3D11Buffer{cb_o.?};
++    context.VSSetConstantBuffers(0, &cbs);
++    context.PSSetConstantBuffers(0, &cbs);
++    context.VSSetShader(shaders.pipelines.bg_color.vs.?);
++    context.PSSetShader(shaders.pipelines.bg_color.ps.?);
++    context.IASetPrimitiveTopology(.TRIANGLELIST);
++    context.OMSetBlendState(shaders.pipelines.bg_color.blend);
++    context.Draw(3, 0);
++
++    // Read back.
++    var stage_desc = rt_desc;
++    stage_desc.Usage = .STAGING;
++    stage_desc.BindFlags = 0;
++    stage_desc.CPUAccessFlags = d3d11.D3D11_CPU_ACCESS_READ;
++    var stage_o: ?*d3d11.ID3D11Texture2D = null;
++    if (com.FAILED(device.CreateTexture2D(&stage_desc, null, &stage_o)) or stage_o == null) {
++        return error.SkipZigTest;
++    }
++    defer _ = stage_o.?.Release();
++    context.CopyResource(@ptrCast(stage_o.?), @ptrCast(rt_o.?));
++
++    var mapped: d3d11.D3D11_MAPPED_SUBRESOURCE = undefined;
++    if (com.FAILED(context.Map(@ptrCast(stage_o.?), 0, .READ, 0, &mapped))) {
++        return error.SkipZigTest;
++    }
++    defer context.Unmap(@ptrCast(stage_o.?), 0);
++
++    const pixels: [*]const u8 = @ptrCast(mapped.pData);
++    const centre = pixels + (h / 2) * mapped.RowPitch + (w / 2) * 4;
++
++    // B8G8R8A8, and bg_color is R,G,B,A.
++    try testing.expectEqual(@as(u8, 0xEE), centre[0]); // B
++    try testing.expectEqual(@as(u8, 0x55), centre[1]); // G
++    try testing.expectEqual(@as(u8, 0x11), centre[2]); // R
++    try testing.expectEqual(@as(u8, 0xFF), centre[3]); // A
++}

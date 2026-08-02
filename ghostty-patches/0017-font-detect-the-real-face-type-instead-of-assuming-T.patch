@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Sat, 1 Aug 2026 19:32:49 -0700
+Subject: [PATCH] font: detect the real face type instead of assuming TRUETYPE
+
+initFile passed DWRITE_FONT_FACE_TYPE_TRUETYPE to CreateFontFace regardless of
+what the file actually was, so it failed for anything else - CFF-flavoured .otf
+and, far more importantly, .ttc collections. Windows ships several of the CJK
+fonts the system fallback chain returns as collections, so the fallback landed
+in ADR 0005 could resolve the right font and then fail to open it.
+
+Now asks IDWriteFontFile::Analyze, which also reports whether the file is a
+supported font type at all.
+
+Found by the new test rather than by reading: "fallback glyphs rasterize" takes
+a codepoint no Latin font covers, resolves it through MapCharacters, opens it
+from its path and rasterizes it into an atlas. That is the end of the chain the
+fallback exists for, and nothing before it exercised initFile with a real
+system font - the embedded test fonts are all plain .ttf.
+
+CJK goes into a grayscale atlas and asserts ink. Emoji goes into a bgra atlas
+and asserts CHROMATIC pixels, which is what separates the colour path having
+run from a monochrome outline drawn in its place.
+
+Runs headless: no window, no swap chain, no compositing desktop. Works in CI
+and on a detached RDP session.
+
+  directwrite_harfbuzz : 3087 pass, 56 skip, 0 fail
+  default              : 3084 pass, 58 skip, 0 fail
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/font/face/directwrite.zig | 12 ++++-
+ src/font/face/dwrite/api.zig  | 25 +++++++++-
+ src/font/library.zig          | 87 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 122 insertions(+), 2 deletions(-)
+
+diff --git a/src/font/face/directwrite.zig b/src/font/face/directwrite.zig
+index 963afa89c..fd259aae6 100644
+--- a/src/font/face/directwrite.zig
++++ b/src/font/face/directwrite.zig
+@@ -145,10 +145,20 @@ pub fn initFile(
+     }
+     errdefer _ = file.?.Release();
+ 
++    // Ask the file what it is rather than assuming. TRUETYPE is wrong for
++    // CFF-flavoured .otf and for .ttc collections, and Windows ships several
++    // of the CJK fonts the system fallback chain returns as collections.
++    var supported: i32 = 0;
++    var file_type: u32 = 0;
++    var face_type: dw.DWRITE_FONT_FACE_TYPE = .TRUETYPE;
++    var num_faces: u32 = 0;
++    if (dw.FAILED(file.?.Analyze(&supported, &file_type, &face_type, &num_faces)) or
++        supported == 0) return Error.CannotOpenResource;
++
+     const files = [_]*dw.IDWriteFontFile{file.?};
+     var face: ?*dw.IDWriteFontFace = null;
+     if (dw.FAILED(lib.factory.CreateFontFace(
+-        .TRUETYPE,
++        face_type,
+         &files,
+         @intCast(@max(index, 0)),
+         &face,
+diff --git a/src/font/face/dwrite/api.zig b/src/font/face/dwrite/api.zig
+index b7683661b..1f831c75a 100644
+--- a/src/font/face/dwrite/api.zig
++++ b/src/font/face/dwrite/api.zig
+@@ -1283,9 +1283,32 @@ pub const IDWriteFontFile = extern struct {
+         // in-memory or otherwise custom loader has no GetFilePathFromKey, and
+         // calling it anyway would run off the end of that object's vtable.
+         GetLoader: *const fn (*IDWriteFontFile, *?*IUnknown) callconv(.winapi) HRESULT,
+-        Analyze: Reserved,
++        // 5
++        Analyze: *const fn (
++            *IDWriteFontFile,
++            *i32, // isSupportedFontType (BOOL)
++            *u32, // DWRITE_FONT_FILE_TYPE
++            *DWRITE_FONT_FACE_TYPE,
++            *u32, // numberOfFaces
++        ) callconv(.winapi) HRESULT,
+     };
+ 
++    /// The face type this file actually contains.
++    ///
++    /// Guessing TRUETYPE works for a plain .ttf and fails for everything else:
++    /// CFF-flavoured .otf and, more importantly here, .ttc collections, which
++    /// is how Windows ships several of the CJK fonts the system fallback
++    /// chain hands back.
++    pub inline fn Analyze(
++        self: *IDWriteFontFile,
++        supported: *i32,
++        file_type: *u32,
++        face_type: *DWRITE_FONT_FACE_TYPE,
++        num_faces: *u32,
++    ) HRESULT {
++        return self.vtable.Analyze(self, supported, file_type, face_type, num_faces);
++    }
++
+     pub inline fn GetReferenceKey(
+         self: *IDWriteFontFile,
+         key: *?*const anyopaque,
+diff --git a/src/font/library.zig b/src/font/library.zig
+index b7f1ab24b..02d6e6120 100644
+--- a/src/font/library.zig
++++ b/src/font/library.zig
+@@ -356,3 +356,90 @@ test "system font fallback" {
+         };
+     }
+ }
++
++test "fallback glyphs rasterize" {
++    if (comptime options.backend != .directwrite_harfbuzz) return error.SkipZigTest;
++
++    // The end of the chain the fallback exists for: a codepoint no Latin font
++    // covers is resolved by DirectWrite, opened from its file, and rasterized
++    // into the atlas. Runs headless - no window, no swap chain, no compositing
++    // desktop - so it works in CI and on a detached RDP session.
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var lib = try Library.init(alloc);
++    defer lib.deinit();
++
++    const opts: font.face.Options = .{ .size = .{ .points = 16, .xdpi = 96, .ydpi = 96 } };
++
++    // CJK into a grayscale atlas: coverage is all we need.
++    {
++        const dw_face = (try lib.fallbackFace('中')) orelse return error.TestUnexpectedResult;
++        defer _ = dw_face.Release();
++
++        var path_buf: [512]u8 = undefined;
++        const path = (try lib.facePath(dw_face, path_buf[0 .. path_buf.len - 1])) orelse
++            return error.TestUnexpectedResult;
++        path_buf[path.len] = 0;
++
++        var face = try font.Face.initFile(lib, path_buf[0..path.len :0], 0, opts);
++        defer face.deinit();
++
++        var atlas = try font.Atlas.init(alloc, 512, .grayscale);
++        defer atlas.deinit(alloc);
++
++        const gi = face.glyphIndex('中') orelse return error.TestUnexpectedResult;
++        const g = try face.renderGlyph(alloc, &atlas, gi, .{
++            .grid_metrics = font.Metrics.calc(face.getMetrics()),
++        });
++
++        var ink: usize = 0;
++        for (0..g.height) |y| {
++            for (0..g.width) |x| {
++                if (atlas.data[(g.atlas_y + y) * atlas.size + (g.atlas_x + x)] != 0) ink += 1;
++            }
++        }
++        try testing.expect(ink > 0);
++    }
++
++    // Emoji into a colour atlas. Asserting *chromatic* pixels rather than just
++    // opaque ones is what distinguishes the colour path having run from a
++    // monochrome outline being drawn in its place.
++    {
++        const dw_face = (try lib.fallbackFace('🥸')) orelse return error.TestUnexpectedResult;
++        defer _ = dw_face.Release();
++
++        var path_buf: [512]u8 = undefined;
++        const path = (try lib.facePath(dw_face, path_buf[0 .. path_buf.len - 1])) orelse
++            return error.TestUnexpectedResult;
++        path_buf[path.len] = 0;
++
++        var face = try font.Face.initFile(lib, path_buf[0..path.len :0], 0, opts);
++        defer face.deinit();
++
++        var atlas = try font.Atlas.init(alloc, 512, .bgra);
++        defer atlas.deinit(alloc);
++
++        const gi = face.glyphIndex('🥸') orelse return error.TestUnexpectedResult;
++        try testing.expect(face.isColorGlyph(gi));
++
++        const g = try face.renderGlyph(alloc, &atlas, gi, .{
++            .grid_metrics = font.Metrics.calc(face.getMetrics()),
++        });
++
++        var chromatic: usize = 0;
++        for (0..g.height) |y| {
++            for (0..g.width) |x| {
++                const i = ((g.atlas_y + y) * atlas.size + (g.atlas_x + x)) * 4;
++                if (atlas.data[i + 3] == 0) continue;
++                const b = atlas.data[i];
++                const gr = atlas.data[i + 1];
++                const r = atlas.data[i + 2];
++                const hi = @max(r, @max(gr, b));
++                const lo = @min(r, @min(gr, b));
++                if (hi - lo > 24) chromatic += 1;
++            }
++        }
++        try testing.expect(chromatic > 0);
++    }
++}

@@ -1,0 +1,168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Sat, 1 Aug 2026 21:07:33 -0700
+Subject: [PATCH] font: offset_y is relative to the cell bottom, not the
+ baseline
+
+Glyphs rendered by the DirectWrite face sat too high by the descent. Visible
+live as a block cursor riding high and as top's reverse-video column header
+looking wrong; invisible in ordinary text, because nothing there is aligned
+against the cell box.
+
+renderGlyph computed
+
+    offset_y = ceil(ascent_px - top_px + pad)
+
+which is baseline-relative: it references the ascent and never cell_baseline or
+cell_height, so it could not have been cell-bottom-relative whatever the
+numbers said. freetype.zig defines the contract as
+
+    px_y     = bitmap_top + cell_baseline - bitmap.rows
+    offset_y = px_y + px_height          == bitmap_top + cell_baseline
+
+i.e. the bearing above the baseline plus the baseline's own height above the
+cell bottom. cell_text.hlsl depends on exactly that, since
+`offset.y = cell_size.y - offset.y` only yields a top-relative offset if the
+input was measured from the bottom. The shader is shared with Metal and OpenGL
+and is correct; only the D3D11 face was wrong.
+
+Measured with Inconsolata 12pt @96dpi (cap_px 9.97, cell_baseline 3): offset_y
+was 13 and is now 16, a difference of exactly cell_baseline.
+
+offset_x was checked at the same time and is right: left_px - pad correctly
+describes the padded bitmap's left edge, matching FreeType's bitmap_left.
+
+The test took three attempts to become meaningful. The first two passed with
+the bug present - one used +/-3.5px of slack against a cell_baseline of 3, the
+other a lower bound that sat below the buggy value. Mutation testing caught
+both, and the bounds are now tight enough that removing the cell_baseline term
+fails with a diagnostic naming the cause. A green test proves nothing until it
+has been shown to go red.
+
+  directwrite_harfbuzz : 3089 pass, 56 skip, 0 fail
+  default              : 3085 pass, 58 skip, 0 fail
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/font/face/directwrite.zig | 90 +++++++++++++++++++++++++++++++++--
+ 1 file changed, 85 insertions(+), 5 deletions(-)
+
+diff --git a/src/font/face/directwrite.zig b/src/font/face/directwrite.zig
+index fd259aae6..854db313a 100644
+--- a/src/font/face/directwrite.zig
++++ b/src/font/face/directwrite.zig
+@@ -576,8 +576,6 @@ pub fn renderGlyph(
+     glyph_index: u32,
+     opts: font.Glyph.RenderOptions,
+ ) !Glyph {
+-    _ = opts;
+-
+     self.lib.mutex.lockUncancelable(global.io());
+     defer self.lib.mutex.unlock(global.io());
+ 
+@@ -799,13 +797,26 @@ pub fn renderGlyph(
+         else => return Error.CannotRenderGlyph,
+     }
+ 
++    // `offset_y` is the distance from the **bottom of the cell** to the top of
++    // the bitmap, not from the baseline. That is FreeType's contract, and
++    // `cell_text.hlsl` depends on it: `offset.y = cell_size.y - offset.y` only
++    // yields a top-relative offset if the input was measured from the bottom.
++    //
++    // freetype.zig arrives at the same quantity as
++    //     px_y + px_height == bitmap_top + cell_baseline
++    // i.e. the bearing above the baseline plus the baseline's own height above
++    // the cell bottom. Omitting `cell_baseline` renders every glyph high by
++    // the descent, which is invisible in ordinary text and obvious the moment
++    // anything aligns against the cell box - a block cursor, or reverse video.
++    const bearing_y = ascent_px - top_px; // baseline -> top of the ink
+     return .{
+         .width = w,
+         .height = h,
+-        // offset_x is the left bearing; offset_y is measured from the baseline
+-        // up to the top of the ink box, which is where the padding lives too.
++        // The bitmap extends `pad` beyond the ink on every side, so both
++        // offsets describe the padded bitmap's edge rather than the ink's.
+         .offset_x = @intFromFloat(@floor(left_px) - pad_f(pad)),
+-        .offset_y = @intFromFloat(@ceil(ascent_px - top_px + pad_f(pad))),
++        .offset_y = @as(i32, @intFromFloat(@ceil(bearing_y + pad_f(pad)))) +
++            @as(i32, @intCast(opts.grid_metrics.cell_baseline)),
+         .atlas_x = region.x,
+         .atlas_y = region.y,
+     };
+@@ -853,6 +864,75 @@ test "undefined ex/cap heights stay null" {
+     try testing.expect(sm.cap_height == null or sm.cap_height.? <= 0);
+ }
+ 
++test "glyph baseline placement" {
++    // Locks the offset_y contract: it is the distance from the BOTTOM OF THE
++    // CELL to the top of the bitmap, matching freetype.zig
++    // (offset_y == bitmap_top + cell_baseline) because cell_text.hlsl converts
++    // it with `cell_size.y - offset.y` and is shared with the other backends.
++    //
++    // Dropping the cell_baseline term renders every glyph high by the descent.
++    // That is invisible in ordinary text and obvious as soon as anything is
++    // aligned against the cell box - a block cursor, or reverse video.
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var lib = try Library.init(alloc);
++    defer lib.deinit();
++
++    var atlas = try font.Atlas.init(alloc, 512, .grayscale);
++    defer atlas.deinit(alloc);
++
++    var face = try Face.init(
++        lib,
++        font.embedded.inconsolata,
++        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
++    );
++    defer face.deinit();
++
++    const fm = face.getMetrics();
++    const m = font.Metrics.calc(fm);
++    const upem: f64 = @floatFromInt(face.design.designUnitsPerEm);
++    const scale = fm.px_per_em / upem;
++
++    // 'A' rests on the baseline, so its ink top is exactly cap height above it
++    // and the arithmetic has no bearing subtleties to hide behind.
++    const cap_px = @as(f64, @floatFromInt(face.design.capHeight)) * scale;
++
++    const g = try face.renderGlyph(
++        alloc,
++        &atlas,
++        face.glyphIndex('A').?,
++        .{ .grid_metrics = m },
++    );
++
++    const baseline = @as(f64, @floatFromInt(m.cell_baseline));
++    const actual = @as(f64, @floatFromInt(g.offset_y));
++
++    // The bounds must straddle the bug, not merely bracket the right answer.
++    // Measured with Inconsolata 12pt @96dpi (cap_px=9.97, cell_baseline=3,
++    // pad=2): correct offset_y is 16, and dropping the cell_baseline term
++    // gives 13. So the tolerance has to be tighter than cell_baseline, or it
++    // swallows the very difference under test.
++    //
++    // Two earlier versions of this test failed to discriminate - one with
++    // +/-3.5px of slack, one with a lower bound of cap_px + baseline - and
++    // both passed with the bug present. Mutation testing caught both.
++    const pad_allowance: f64 = 2.0; // the bitmap's padding, per renderGlyph
++    const expected = cap_px + baseline + pad_allowance;
++    const lower = expected - 1.5;
++    const upper = expected + 1.5;
++
++    if (actual < lower or actual > upper) {
++        std.debug.print(
++            "offset_y={d} outside [{d:.2}, {d:.2}] " ++
++                "(cap_height={d:.2} cell_baseline={d}); " ++
++                "a value near {d:.2} means cell_baseline was omitted\n",
++            .{ g.offset_y, lower, upper, cap_px, m.cell_baseline, cap_px + 2 },
++        );
++        return error.TestUnexpectedResult;
++    }
++}
++
+ test "render ascii" {
+     const testing = std.testing;
+     const alloc = testing.allocator;
