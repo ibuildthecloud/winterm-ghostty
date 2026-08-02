@@ -1,0 +1,6 @@
+Latin baseline: The quick brown fox
+CJK   U+4E2D U+6587: 中文
+Kana  U+3042 U+3044: あい
+Emoji U+1F978: 🥸
+Emoji U+1F600: 😀
+Mixed: ascii 中文 🥸 done
