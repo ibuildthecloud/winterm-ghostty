@@ -66,6 +66,38 @@ benefit to either engine. The existing cascadia `ControlCore` becomes implementa
 `GhosttyControlCore` (wrapping `libghostty.dll`) becomes implementation #2. Both towers
 terminate in a composition swap-chain handle and consume the same `ITerminalConnection`.
 
+## Implementation note (Phase 4, 2026-08-02)
+
+Two of the six promotions could not be a straight copy of the existing signature, because
+the escapes existed precisely *because* those signatures are not projectable:
+
+- **`SearchResultRows`** returned `const std::vector<til::point_span>&`. Its only consumer
+  draws one scrollbar pip per row, so it now returns `IVector<Int32>` of distinct rows and
+  the consecutive-duplicate filtering moved from `TermControl` into the implementation.
+- **The QuickFix viewport query** reached `GetRenderData()->GetViewport()` and read both
+  bounds under one console lock. It is now a single `IsBufferRowInViewport(Int32)`
+  predicate rather than separate accessors, to preserve that atomicity.
+  `ICoreState::ScrollOffset` + `ViewHeight` is **not** a valid substitute:
+  `Terminal::_VisibleStartIndex()` reports `0` in the alt buffer while
+  `GetViewport().Top()` does not, so deriving the bounds would change behaviour.
+
+`ControlCore` is now a marker class (`[default_interface]`, constructor only). MIDL requires
+a default interface on any runtimeclass that is constructed or passed as a parameter, and
+every member has moved to `IControlCore`.
+
+**Deviation — `ControlInteractivity` still holds the concrete type.** This ADR says both
+`TermControl` and `ControlInteractivity` hold the interface. `TermControl` does.
+`ControlInteractivity` makes 58 calls across 34 distinct core methods, and most are
+impl-level rather than part of the projected contract — `AttachUiaEngine`/`DetachUiaEngine`,
+`SendMouseEvent`, `LeftClickOnTerminal`, `SetSelectionAnchor`/`SetEndSelectionPoint`,
+`GetRenderData`, `GetFont`, `GetHyperlink`, `CopySelectionToClipboard`,
+`IsVtMouseModeEnabled`, `ShouldSendAlternateScroll`, `UserScrollViewport`,
+`AnchorContextMenu`, `AttachToNewControl`. Interface-typing it means promoting roughly
+twenty more members — the mouse, selection and UIA surface — which is well beyond the
+"mechanical MIDL promotion plus six call-site fixes" this ADR calls its only invasive
+change. Phase 4's exit criteria do not require it; a second engine in Phase 5 does. Carried
+as a Phase 5 prerequisite pending a decision at the retro.
+
 ## Consequences
 
 - The only invasive change to existing WT code is mechanical MIDL promotion plus six

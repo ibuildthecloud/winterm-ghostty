@@ -116,7 +116,11 @@ if ($RestoreOnly) { return }
 
 # --- Recover from a half-written codegen ----------------------------------
 if ($CleanCodegen) {
-    foreach ($proj in 'TerminalSettingsEditor', 'TerminalApp', 'TerminalControl', 'TerminalSettingsModel') {
+    # TerminalSettingsAppAdapterLib keeps its own cppwinrt projection of
+    # Microsoft.Terminal.Control and consumes ControlProperties.h, so an IDL
+    # change that adds a type breaks *there* first with a wall of
+    # "not a member of winrt::Microsoft::Terminal::Control" - Phase 4, 2026-08-02.
+    foreach ($proj in 'TerminalSettingsEditor', 'TerminalApp', 'TerminalControl', 'TerminalSettingsModel', 'TerminalSettingsAppAdapterLib') {
         $gen = Join-Path $TerminalRoot "src\cascadia\$proj\Generated Files"
         if (Test-Path $gen) {
             Write-Host "  removing $gen" -ForegroundColor DarkYellow
