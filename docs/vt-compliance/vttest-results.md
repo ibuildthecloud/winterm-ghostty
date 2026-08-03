@@ -63,7 +63,8 @@ Screens are captured with `harness/wgc-shot` (Windows Graphics Capture — needs
 | 4 | Double-sized characters | **not implemented** | not implemented | Matches wintty exactly: double-width and double-height lines render as normal single-size text. A base-Ghostty limitation — `src/terminal/stream.zig` dispatches only `ESC #8` (DECALN); `ESC #3`/`#4`/`#5`/`#6` fall through. Not Windows- or D3D11-specific. |
 | 8 | VT102 Insert/Delete Char/Line | **pass** | *pending* | Assessed here for the first time. The screen-accordion setup fills 80 columns per row correctly; the Delete Character rounds produce the required "right column staggered by one" diagonal and hold it across repeats; the ANSI Insert Character check renders its two `A B C ... Z` lines identically. |
 | 5 | Keyboard | **partly assessed** | pending | The keyboard-layout diagram renders correctly (a dense reverse-video test in its own right). The Cursor Keys sub-test reports `(Unknown cursor key)`, but that is **not** an encoding fault — see below. |
-| 6, 7, 9, 10, 11 | Reports, VT52, known bugs, reset, non-VT100 | not yet run | pending | Reachable here for the first time, since this harness can supply real key input and wintty's could not. |
+| 6 | Terminal reports | **pass** (DA + DSR) | pending | Primary Device Attributes returns `ESC[?61;6;7;21;22;23;24;28;32;42c`, which vttest decodes as VT100 family with selective erase, DRCS, horizontal scrolling, colour, Greek, Turkish, rectangular editing, text macros and ISO Latin-2. Device Status Report 5 returns `ESC[0n` ("TERMINAL OK") and DSR 6 returns `ESC[5;1R`, both marked OK. Secondary/Tertiary DA and DECREQTPARM not yet run. |
+| 7, 9, 10, 11 | VT52, known bugs, reset, non-VT100 | not yet run | pending | |
 
 ## Section 1 must be run at 80 columns
 
@@ -136,9 +137,14 @@ and because the check took one command.
 
 ## Regressions vs wintty
 
-**None.** Sections 1, 3 and 4 match the baseline, section 2 is assessed here for the first
-time and passes the part wintty deferred, and section 8 is assessed here for the first
-time and passes.
+**None.** Sections 1, 3 and 4 match the baseline. Sections 2, 6 and 8 are assessed here
+for the first time and pass — wintty deferred section 2 and left 6 and 8 pending, because
+its auto-feed harness could not drive them.
+
+The query responses in section 6 also agree with wintty's esctest baseline, which
+concluded that "the transport is clean and the only gaps are query types libghostty
+deliberately does not answer". Nothing here contradicts that: the queries vttest asks
+about are all answered, and answered correctly.
 
 ## PTY size — was a defect, now fixed
 
