@@ -57,48 +57,51 @@ Screens are captured with `harness/wgc-shot` (Windows Graphics Capture — needs
 
 | # | Section | This backend | wintty baseline | Notes |
 |---|---|---|---|---|
-| 1 | Cursor movements | **pass, one defect** | pass | Cursor-control characters inside ESC sequences render four identical lines, and the centred E-frame is hollow and correctly placed. **But the bottom `+` border row runs 17 columns too long** (columns 1..96 where every other row of the box correctly stops at 79) — see below. The box being 80 columns wide on a 99-column terminal is *not* a fault: vttest is a VT100 tester, and widening the window left the box at 80, which confirms it. |
+| 1 | Cursor movements | **pass** | pass | Cursor-control characters inside ESC sequences render four identical lines. At an 80-column terminal the border is completely unbroken — top, bottom and both sides edge to edge — with the hollow E-frame centred. **The section must be run at 80 columns**; see below, the bottom border row is not size-independent. |
 | 2 | Screen features | **pass (partial)** | *deferred — harness* | wintty could not assess this. Here the section ran to completion. **DECSCNM verified by pixel measurement**: light background is `#FFFFFF`, dark is `#282C34`. **DECCOLM (132-column) is not honoured** — the ruler wraps, i.e. the terminal stays at its window width. Most modern terminals ignore DECCOLM deliberately. |
 | 3 | Character sets | **pass** | pass | US-ASCII, British (`#` correctly renders as `£`), DEC Special Graphics line drawing, both DEC Alternate ROM sets, and SI/SO G0/G1 switching all correct. |
 | 4 | Double-sized characters | **not implemented** | not implemented | Matches wintty exactly: double-width and double-height lines render as normal single-size text. A base-Ghostty limitation — `src/terminal/stream.zig` dispatches only `ESC #8` (DECALN); `ESC #3`/`#4`/`#5`/`#6` fall through. Not Windows- or D3D11-specific. |
 | 5-11 | Keyboard, reports, VT52, VT102, known bugs, reset, non-VT100 | not yet run | pending | Newly *reachable* here, since keyboard input works. |
 
-## Open defect: section 1's bottom border overruns
+## Section 1 must be run at 80 columns
 
-Measured from a clean capture (terminal 27x99, cell ~10.1px, vttest drawing its usual
-80-column box):
+On a wider terminal, section 1's **bottom `+` row alone** overruns — every other row of
+the box stops correctly. That asymmetry is the clue, and it is vttest's own doing rather
+than a terminal defect. From `tst_movements` in vttest's `main.c`:
 
-| Row | Pixels | Columns | |
-|---|---|---|---|
-| top `*` | 9..800 | 1..79 | correct |
-| top `+` | 9..800 | 1..79 | correct |
-| side borders | 9..800 | 1..79 | correct |
-| **bottom `+`** | **9..971** | **1..96** | **17 columns too long** |
-| bottom `*` | 9..800 | 1..79 | correct |
+```c
+cup(max_lines - 1, inner_r - 1);   /* column 70 */
+cuf(42 + hlfxtra);                 /* forward 42 -> 112, RELIES ON CLAMPING */
+cub(2);
+for (col = width - 2; col >= 3; col--) { tprintf("+"); ... }
+```
 
-The left end is right and the right end overruns, so it is an overrun rather than a
-shift. It also stops at 96 rather than at the real screen edge of 99, which is itself
-worth explaining.
+That `cuf(42)` deliberately overshoots and depends on the cursor clamping at the right
+margin. vttest computes for `width = 80`, so on an 80-column terminal the clamp lands at
+80 and `cub(2)` yields 78 — the correct right end. On a wider terminal the clamp lands at
+the *actual* width, so the row starts further right and overruns. Every other row uses an
+explicit `cup(row, col)` and is unaffected.
 
-**Not diagnosed.** The next step is to capture what vttest actually emits — run it under
-`script` inside WSL with an auto-fed menu choice and inspect the byte stream for the
-bottom-border sequence — rather than guessing. That also settles whether the fault is
-ours or vttest's. Tracked as a task; candidates to check first are `CSI Ps b` (REP) run
-lengths and pending-wrap handling after a last-column write.
+Confirmed by measurement — the overrun endpoint tracks the terminal width, not the box:
 
-This was initially recorded here as a clean pass. It was not; the overrun was spotted by
-eye afterwards. Noted because it is the third defect this session that a human found by
-looking and no automated check covered.
+| Terminal width | Bottom `+` row ends at |
+|---|---|
+| ~99 columns | column 96 |
+| ~122 columns | column 115 |
+| **80 columns** | **unbroken, edge to edge** |
+
+Our clamping is correct: the cursor clamps at the real right margin. Clamping at 80
+regardless of terminal width — which is what vttest implicitly wants — would be wrong.
+
+This matches wintty's advice from the other direction; their notes call for "a
+size-matched launch (fixed window on the primary monitor, no post-draw resize)" for
+size-dependent sections. At the default DPI here, `--font-size=8` with a ~541px client
+gives 80 columns.
 
 ## Regressions vs wintty
 
-Sections 3 and 4 match the baseline exactly, and section 2 is assessed here for the first
-time and passes the part wintty deferred.
-
-Section 1 is a partial: everything wintty assessed (cursor positioning, the E-frame, the
-box redrawing) is correct, but the bottom-border overrun above is a defect wintty's
-recorded run does not show. Until it is diagnosed, **section 1 should be treated as a
-possible regression against wintty**, not a match.
+**None.** Sections 1, 3 and 4 match the baseline, and section 2 is assessed here for the
+first time and passes the part wintty deferred.
 
 ## PTY size — was a defect, now fixed
 
