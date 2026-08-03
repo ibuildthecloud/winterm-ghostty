@@ -20,31 +20,46 @@ Run with `scripts/bench-throughput.ps1`.
 
 ## Results — 2026-08-02
 
-8 MB corpus (8,389,452 bytes), best of 2-3 runs.
+8 MB corpus (8,389,452 bytes), best of 3 runs, **RDP session connected**.
 
 | Terminal | Best | Throughput | Relative |
 |---|---|---|---|
-| Windows Terminal | 216 ms | **37.0 MB/s** | 2.4x faster |
-| **this backend (D3D11 + DirectWrite)** | 522 ms | **15.3 MB/s** | baseline |
-| conhost | 2947 ms | 2.7 MB/s | 5.6x slower |
+| Windows Terminal | 187 ms | **42.8 MB/s** | 2.9x faster |
+| **this backend (D3D11 + DirectWrite)** | 538 ms | **14.9 MB/s** | baseline |
+| conhost | 3026 ms | 2.6 MB/s | 5.7x slower |
 
-**We are roughly 2.4x slower than Windows Terminal.** That is the number worth
+**We are roughly 2.9x slower than Windows Terminal.** That is the number worth
 carrying, and it is consistent with the "input is a little laggy" observation
 from the interactive sessions.
 
 Faster than conhost by a wide margin, but conhost is not the bar — Windows
 Terminal is what this work would have to replace.
 
-## Caveats, which are load-bearing here
+### The detached measurement understated the gap
 
-- **The session was detached** (RDP disconnected), so DWM was not compositing.
-  That affects presentation for all three terminals, but not necessarily
-  equally, and a terminal that throttles when nothing is visible would look
-  artificially good. **Re-run connected before treating the ratio as settled.**
+The first run of this benchmark was taken on a **detached** RDP session, where
+DWM stops compositing. Re-measuring connected changed the answer:
+
+| Terminal | Detached | Connected |
+|---|---|---|
+| Windows Terminal | 37.0 MB/s | **42.8 MB/s** |
+| this backend | 15.3 MB/s | 14.9 MB/s |
+| conhost | 2.7 MB/s | 2.6 MB/s |
+
+Windows Terminal got materially faster when the session was live; we did not.
+So the detached figures flattered us, and the gap is 2.9x rather than 2.4x.
+Worth recording because the intuition would have been the opposite — that a
+terminal doing real presentation work would look *worse* once it had to
+present.
+
+## Caveats
+
 - Our build was `ReleaseFast`. Worth stating because
   `scripts/build-ghostty.ps1` defaults to `Debug`, and a Debug number is
   meaningless — full safety checks on every index and integer op.
 - One machine, one corpus, one size. No claim about scaling.
+- Measured over RDP, which is not a local display. The ratio between terminals
+  is the useful part, not the absolute numbers.
 - **wintty was not measured.** The Phase 3 plan asks for a comparison against
   it as well; it is not built in this tree.
 
