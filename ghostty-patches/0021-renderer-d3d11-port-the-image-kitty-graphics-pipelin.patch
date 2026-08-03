@@ -1,0 +1,408 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Sun, 2 Aug 2026 18:05:52 -0700
+Subject: [PATCH] renderer/d3d11: port the image (kitty graphics) pipeline to
+ HLSL
+
+Adds image.hlsl and wires the pipeline, leaving bg_image as the only one still
+without shaders.
+
+The image step passes a texture but NO sampler - the other backends rely on a
+default existing in their pipeline state - so Pipeline carries one, borrowed
+from Shaders, and RenderPass.step binds it when the step supplies none.
+Without it the shader samples through a null sampler and reads black.
+
+One real difference from the GLSL, found by the test rather than by reading:
+the GLSL passes z = 1.0 into the projection, and ortho2d's z row is
+{0, 0, -1, 0}, so z_clip becomes -1. OpenGL's NDC depth range is [-1, 1] where
+that is just the near plane; D3D's is [0, 1], so the entire quad was clipped
+and nothing drew. z is 0 here. I had originally copied the 1.0 across with a
+comment claiming it kept the backends clipping alike, which was exactly
+backwards.
+
+The test renders a placement offscreen and asserts both that the inside is
+opaque white AND that a pixel outside the destination rect is untouched. The
+second half is what makes it a test of the *rect* rather than of something
+having been drawn at all - the source_rect to texture-coordinate mapping and
+the projection both have to be right to pass.
+
+  default: 3086 pass, 58 skip, 0 fail
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/build/SharedDeps.zig              |   2 +
+ src/renderer/directx11/RenderPass.zig |   6 +
+ src/renderer/directx11/shaders.zig    | 190 +++++++++++++++++++++++++-
+ src/renderer/shaders/hlsl/image.hlsl  |  70 ++++++++++
+ 4 files changed, 266 insertions(+), 2 deletions(-)
+ create mode 100644 src/renderer/shaders/hlsl/image.hlsl
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index a25f90cf8..7bd586dc4 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -23,6 +23,8 @@ const hlsl_shaders = [_]HlslShader{
+     .{ .import = "ghostty_hlsl_cell_bg_ps", .file = "cell_bg", .entry = "ps_main", .profile = "ps_5_0" },
+     .{ .import = "ghostty_hlsl_cell_text_vs", .file = "cell_text", .entry = "vs_main", .profile = "vs_5_0" },
+     .{ .import = "ghostty_hlsl_cell_text_ps", .file = "cell_text", .entry = "ps_main", .profile = "ps_5_0" },
++    .{ .import = "ghostty_hlsl_image_vs", .file = "image", .entry = "vs_main", .profile = "vs_5_0" },
++    .{ .import = "ghostty_hlsl_image_ps", .file = "image", .entry = "ps_main", .profile = "ps_5_0" },
+ };
+ const UnicodeTables = @import("UnicodeTables.zig");
+ const GhosttyFrameData = @import("GhosttyFrameData.zig");
+diff --git a/src/renderer/directx11/RenderPass.zig b/src/renderer/directx11/RenderPass.zig
+index b1d44a96f..3217e8582 100644
+--- a/src/renderer/directx11/RenderPass.zig
++++ b/src/renderer/directx11/RenderPass.zig
+@@ -197,6 +197,12 @@ pub fn step(self: *Self, s: Step) void {
+             if (maybe) |sm| samplers[i] = sm.sampler;
+         }
+         ctx.PSSetSamplers(0, samplers[0..@min(s.samplers.len, samplers.len)]);
++    } else if (s.pipeline.sampler) |sm| {
++        // The image step supplies a texture but no sampler; the pipeline
++        // carries one so the shader does not sample through a null and read
++        // black.
++        const samplers = [_]?*d3d11.ID3D11SamplerState{sm};
++        ctx.PSSetSamplers(0, &samplers);
+     }
+ 
+     ctx.OMSetBlendState(s.pipeline.blend);
+diff --git a/src/renderer/directx11/shaders.zig b/src/renderer/directx11/shaders.zig
+index 07b215077..db85f9321 100644
+--- a/src/renderer/directx11/shaders.zig
++++ b/src/renderer/directx11/shaders.zig
+@@ -20,6 +20,7 @@ const Allocator = std.mem.Allocator;
+ const math = @import("../../math.zig");
+ const com = @import("com.zig");
+ const d3d11 = @import("d3d11.zig");
++const Sampler = @import("Sampler.zig");
+ 
+ const log = std.log.scoped(.directx11);
+ 
+@@ -36,6 +37,11 @@ pub const Pipeline = struct {
+     /// `Shaders`, so this is borrowed and not released here.
+     blend: ?*d3d11.ID3D11BlendState = null,
+ 
++    /// Sampler this pipeline needs when the step does not supply one. Also
++    /// borrowed from `Shaders`. Only the texture-sampling pipelines set it;
++    /// the cell pipelines read their atlas with `Load` and need no sampler.
++    sampler: ?*d3d11.ID3D11SamplerState = null,
++
+     pub fn init(
+         device: *d3d11.ID3D11Device,
+         vs_bytecode: []const u8,
+@@ -102,6 +108,13 @@ pub const Shaders = struct {
+     /// Shared by every pipeline; the individual pipelines borrow it.
+     blend: ?*d3d11.ID3D11BlendState = null,
+ 
++    /// Bound at s0 whenever a step supplies no sampler of its own.
++    ///
++    /// The image step passes textures but no sampler - the other backends rely
++    /// on a default sampler existing in their pipeline state - so without this
++    /// the image shader would sample through a null sampler and read black.
++    default_sampler: ?*d3d11.ID3D11SamplerState = null,
++
+     pub fn init(
+         alloc: Allocator,
+         device: *d3d11.ID3D11Device,
+@@ -139,6 +152,10 @@ pub const Shaders = struct {
+         }
+         errdefer _ = blend.?.Release();
+ 
++        // Linear/clamp, matching what the other backends use for images.
++        const sampler = try Sampler.init(.{ .device = device });
++        errdefer sampler.deinit();
++
+         var pipelines: PipelineCollection = .{};
+         errdefer {
+             inline for (@typeInfo(PipelineCollection).@"struct".fields) |f| {
+@@ -149,14 +166,19 @@ pub const Shaders = struct {
+         pipelines.bg_color = try .init(device, bg_color_vs, bg_color_ps, blend);
+         pipelines.cell_bg = try .init(device, cell_bg_vs, cell_bg_ps, blend);
+         pipelines.cell_text = try .init(device, cell_text_vs, cell_text_ps, blend);
++        pipelines.image = try .init(device, image_vs, image_ps, blend);
++        // The image step passes a texture but no sampler, so the pipeline
++        // carries one.
++        pipelines.image.sampler = sampler.sampler;
+ 
+-        // image and bg_image still have no HLSL, so they stay empty and their
+-        // steps are skipped rather than drawing garbage.
++        // bg_image still has no HLSL, so it stays empty and its step is
++        // skipped rather than drawing garbage.
+ 
+         return .{
+             .pipelines = pipelines,
+             .post_pipelines = &.{},
+             .blend = blend,
++            .default_sampler = sampler.sampler,
+         };
+     }
+ 
+@@ -166,6 +188,8 @@ pub const Shaders = struct {
+         inline for (@typeInfo(PipelineCollection).@"struct".fields) |f| {
+             @field(self.pipelines, f.name).deinit();
+         }
++        if (self.default_sampler) |s| _ = s.Release();
++        self.default_sampler = null;
+         if (self.blend) |b| _ = b.Release();
+         self.blend = null;
+         self.defunct = true;
+@@ -180,6 +204,8 @@ const cell_bg_vs = @embedFile("ghostty_hlsl_cell_bg_vs");
+ const cell_bg_ps = @embedFile("ghostty_hlsl_cell_bg_ps");
+ const cell_text_vs = @embedFile("ghostty_hlsl_cell_text_vs");
+ const cell_text_ps = @embedFile("ghostty_hlsl_cell_text_ps");
++const image_vs = @embedFile("ghostty_hlsl_image_vs");
++const image_ps = @embedFile("ghostty_hlsl_image_ps");
+ 
+ pub const Uniforms = extern struct {
+     // Note: all of the explicit alignments are copied from the Metal
+@@ -471,6 +497,90 @@ const OffscreenTest = struct {
+         return buf.?;
+     }
+ 
++    /// A sampleable texture prefilled with `pixels` (BGRA), plus its SRV.
++    fn texture2d(
++        self: *OffscreenTest,
++        w: u32,
++        h: u32,
++        pixels: []const u8,
++        srv_out: **d3d11.ID3D11ShaderResourceView,
++    ) !*d3d11.ID3D11Texture2D {
++        const desc: d3d11.D3D11_TEXTURE2D_DESC = .{
++            .Width = w,
++            .Height = h,
++            .MipLevels = 1,
++            .ArraySize = 1,
++            .Format = .B8G8R8A8_UNORM,
++            .SampleDesc = .{ .Count = 1, .Quality = 0 },
++            .Usage = .DEFAULT,
++            .BindFlags = d3d11.D3D11_BIND_SHADER_RESOURCE,
++            .CPUAccessFlags = 0,
++            .MiscFlags = 0,
++        };
++        // One entry per subresource, so this is an array rather than a single
++        // struct: the parameter is a many-pointer.
++        const data = [_]d3d11.D3D11_SUBRESOURCE_DATA{.{
++            .pSysMem = pixels.ptr,
++            .SysMemPitch = w * 4,
++            .SysMemSlicePitch = 0,
++        }};
++        var tex: ?*d3d11.ID3D11Texture2D = null;
++        if (com.FAILED(self.device.CreateTexture2D(&desc, &data, &tex)) or tex == null) {
++            return error.SkipZigTest;
++        }
++        errdefer _ = tex.?.Release();
++
++        var srv: ?*d3d11.ID3D11ShaderResourceView = null;
++        if (com.FAILED(self.device.CreateShaderResourceView(
++            @ptrCast(tex.?),
++            null,
++            &srv,
++        )) or srv == null) return error.SkipZigTest;
++        srv_out.* = srv.?;
++        return tex.?;
++    }
++
++    /// A structured buffer of arbitrary element type, plus its SRV.
++    fn structured(
++        self: *OffscreenTest,
++        comptime T: type,
++        values: []const T,
++        srv_out: **d3d11.ID3D11ShaderResourceView,
++    ) !*d3d11.ID3D11Buffer {
++        const desc: d3d11.D3D11_BUFFER_DESC = .{
++            .ByteWidth = @intCast(values.len * @sizeOf(T)),
++            .Usage = .DEFAULT,
++            .BindFlags = d3d11.D3D11_BIND_SHADER_RESOURCE,
++            .CPUAccessFlags = 0,
++            .MiscFlags = d3d11.D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,
++            .StructureByteStride = @sizeOf(T),
++        };
++        const data: d3d11.D3D11_SUBRESOURCE_DATA = .{
++            .pSysMem = @ptrCast(values.ptr),
++            .SysMemPitch = 0,
++            .SysMemSlicePitch = 0,
++        };
++        var buf: ?*d3d11.ID3D11Buffer = null;
++        if (com.FAILED(self.device.CreateBuffer(&desc, &data, &buf)) or buf == null) {
++            return error.SkipZigTest;
++        }
++        errdefer _ = buf.?.Release();
++
++        const srv_desc: d3d11.D3D11_SHADER_RESOURCE_VIEW_DESC = .{
++            .Format = .UNKNOWN,
++            .ViewDimension = .BUFFER,
++            .u = .{ .Buffer = .{ .FirstElement = 0, .NumElements = @intCast(values.len) } },
++        };
++        var srv: ?*d3d11.ID3D11ShaderResourceView = null;
++        if (com.FAILED(self.device.CreateShaderResourceView(
++            @ptrCast(buf.?),
++            &srv_desc,
++            &srv,
++        )) or srv == null) return error.SkipZigTest;
++        srv_out.* = srv.?;
++        return buf.?;
++    }
++
+     /// Copy the target to a staging texture and hand back the mapped pixels.
+     /// Caller must call `endReadback`.
+     fn readback(self: *OffscreenTest, stage_out: **d3d11.ID3D11Texture2D) ![]const u8 {
+@@ -600,6 +710,82 @@ test "offscreen: cell backgrounds land on the cell grid" {
+     }
+ }
+ 
++test "offscreen: image pipeline draws a placement at the right rect" {
++    // Covers the whole image path headlessly: the Image structured buffer, the
++    // source-rect to texture-coordinate mapping, the sampler the pipeline
++    // carries (the image step supplies none), and the projection.
++    const testing = std.testing;
++
++    var t = OffscreenTest.init(32, 32) catch return error.SkipZigTest;
++    defer t.deinit();
++
++    var shaders = try Shaders.init(testing.allocator, t.device, &.{});
++    defer shaders.deinit(testing.allocator);
++
++    // Opaque white source. White survives both the unlinearize and the
++    // premultiply unchanged, so the assertion does not depend on either.
++    const src = [_]u8{0xFF} ** (4 * 4 * 4); // 4x4 BGRA
++    var tex_srv: *d3d11.ID3D11ShaderResourceView = undefined;
++    const tex = try t.texture2d(4, 4, &src, &tex_srv);
++    defer _ = tex.Release();
++    defer _ = tex_srv.Release();
++
++    var uniforms: Uniforms = std.mem.zeroes(Uniforms);
++    uniforms.projection_matrix = math.ortho2d(0, 32, 32, 0);
++    uniforms.screen_size = .{ 32, 32 };
++    uniforms.cell_size = .{ 8, 16 };
++    uniforms.grid_size = .{ 4, 2 };
++    uniforms.bools.use_linear_blending = false;
++    const cb = try t.constantBuffer(&uniforms);
++    defer _ = cb.Release();
++
++    // One placement at cell (0,0), covering the top-left 16x16 of the target.
++    const placements = [_]Image{.{
++        .grid_pos = .{ 0, 0 },
++        .cell_offset = .{ 0, 0 },
++        .source_rect = .{ 0, 0, 4, 4 },
++        .dest_size = .{ 16, 16 },
++    }};
++    var img_srv: *d3d11.ID3D11ShaderResourceView = undefined;
++    const img_buf = try t.structured(Image, &placements, &img_srv);
++    defer _ = img_buf.Release();
++    defer _ = img_srv.Release();
++
++    t.beginFrame();
++    const cbs = [_]?*d3d11.ID3D11Buffer{cb};
++    t.context.VSSetConstantBuffers(0, &cbs);
++    t.context.PSSetConstantBuffers(0, &cbs);
++    // Convention: buffers at t0/t1, textures from t2.
++    const srvs = [_]?*d3d11.ID3D11ShaderResourceView{ img_srv, null, tex_srv, null };
++    t.context.VSSetShaderResources(0, &srvs);
++    t.context.PSSetShaderResources(0, &srvs);
++    // The sampler the image pipeline carries, exercised as RenderPass.step does.
++    const samplers = [_]?*d3d11.ID3D11SamplerState{shaders.pipelines.image.sampler};
++    t.context.PSSetSamplers(0, &samplers);
++    t.context.VSSetShader(shaders.pipelines.image.vs.?);
++    t.context.PSSetShader(shaders.pipelines.image.ps.?);
++    t.context.IASetPrimitiveTopology(.TRIANGLESTRIP);
++    t.context.OMSetBlendState(shaders.pipelines.image.blend);
++    t.context.Draw(4, 0);
++
++    var stage: *d3d11.ID3D11Texture2D = undefined;
++    const pixels = try t.readback(&stage);
++    defer t.endReadback(stage);
++    const pitch = pixels.len / t.h;
++
++    // Inside the placement: opaque white.
++    const inside = pixels[8 * pitch + 8 * 4 ..][0..4];
++    try testing.expectEqual(@as(u8, 0xFF), inside[0]);
++    try testing.expectEqual(@as(u8, 0xFF), inside[1]);
++    try testing.expectEqual(@as(u8, 0xFF), inside[2]);
++    try testing.expectEqual(@as(u8, 0xFF), inside[3]);
++
++    // Outside it: untouched by the draw. Asserting this is what makes the test
++    // about the *rect* rather than merely about something having been drawn.
++    const outside = pixels[24 * pitch + 24 * 4 ..][0..4];
++    try testing.expectEqual(@as(u8, 0x00), outside[3]);
++}
++
+ test "offscreen: bg_color renders the configured background" {
+     // Renders one frame into an offscreen texture and reads the pixels back.
+     //
+diff --git a/src/renderer/shaders/hlsl/image.hlsl b/src/renderer/shaders/hlsl/image.hlsl
+new file mode 100644
+index 000000000..828015033
+--- /dev/null
++++ b/src/renderer/shaders/hlsl/image.hlsl
+@@ -0,0 +1,70 @@
++// Draws inline images (kitty graphics).
++// Ported from `glsl/image.v.glsl` and `glsl/image.f.glsl`.
++//
++// One instanced quad per image placement. As with cell_text, the per-placement
++// data is a StructuredBuffer indexed by SV_InstanceID rather than instanced
++// vertex attributes, so there is no vertex buffer and no input layout.
++#include "common.hlsli"
++
++// Must match `Image` in `directx11/shaders.zig`: 8 + 8 + 16 + 8 = 40 bytes,
++// which is also the buffer's StructureByteStride.
++struct Image {
++    float2 grid_pos;    //  0  cell coordinates of the top-left
++    float2 cell_offset; //  8  pixel offset within that cell
++    float4 source_rect; // 16  x, y, w, h in the source texture, pixels
++    float2 dest_size;   // 32  on-screen size, pixels
++};
++
++StructuredBuffer<Image> images : register(t0);
++
++// Textures start at t2 by this backend's convention; see RenderPass.step.
++Texture2D<float4> image_tex : register(t2);
++SamplerState image_sampler   : register(s0);
++
++struct VSOut {
++    float4 pos       : SV_Position;
++    float2 tex_coord : TEXCOORD0;
++};
++
++VSOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
++    Image img = images[iid];
++
++    // Same 4-vertex triangle strip corner mapping as cell_text.
++    float2 corner;
++    corner.x = (vid == 1u || vid == 3u) ? 1.0 : 0.0;
++    corner.y = (vid == 2u || vid == 3u) ? 1.0 : 0.0;
++
++    // Texture coordinates run from the source origin across the source size,
++    // then normalize. GetDimensions is HLSL's textureSize.
++    float2 tex = img.source_rect.xy + img.source_rect.zw * corner;
++    uint tw, th;
++    image_tex.GetDimensions(tw, th);
++    VSOut o;
++    o.tex_coord = tex / float2(tw, th);
++
++    // The placement starts at the top-left of its grid cell, shifts by the
++    // in-cell offset, and spans dest_size.
++    float2 image_pos = (cell_size * img.grid_pos) + img.cell_offset;
++    image_pos += img.dest_size * corner;
++
++    // `Mat` stores columns, so this matches the GLSL `projection_matrix * v`.
++    //
++    // z is 0 here where the GLSL passes 1. That is not a gratuitous difference:
++    // ortho2d's z row is {0, 0, -1, 0}, so z = 1 becomes z_clip = -1. OpenGL's
++    // NDC depth range is [-1, 1], where that is simply the near plane, but
++    // D3D's is [0, 1], so the whole quad is clipped away and nothing draws.
++    o.pos = mul(projection_matrix, float4(image_pos, 0.0, 1.0));
++    return o;
++}
++
++float4 ps_main(VSOut input) : SV_Target {
++    float4 rgba = image_tex.Sample(image_sampler, input.tex_coord);
++
++    // Images arrive linear; re-encode when the target is not doing linear
++    // blending, then premultiply, matching the GLSL exactly.
++    if (!get_bool(BOOL_USE_LINEAR_BLENDING)) {
++        rgba = unlinearize(rgba);
++    }
++    rgba.rgb *= rgba.a;
++    return rgba;
++}

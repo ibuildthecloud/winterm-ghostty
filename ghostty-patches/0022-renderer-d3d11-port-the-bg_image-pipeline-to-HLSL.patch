@@ -1,0 +1,346 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Sun, 2 Aug 2026 18:33:31 -0700
+Subject: [PATCH] renderer/d3d11: port the bg_image pipeline to HLSL
+
+Completes the shader set. Every pipeline in PipelineCollection now has shaders,
+so RenderPass.step no longer skips any of them.
+
+bg_image resolves fit (contain/cover/stretch/none) and the nine position anchors
+in the vertex shader, handing the fragment shader an offset and a scale to map
+each pixel back through. SV_Position is already upper-left origin in D3D, which
+is what the GLSL has to request with layout(origin_upper_left). fmod stands in
+for GLSL mod, keeping the double-wrap the repeat path needs because both return
+a negative for a negative input.
+
+z is 0 where the GLSL uses 1, for the same reason as the image shader: D3D's NDC
+depth range is [0, 1] and OpenGL's is [-1, 1], so the GL value sits on the far
+plane rather than harmlessly inside it.
+
+The test anchors a small unscaled image top-left and asserts BOTH that the
+corner is the image AND that a pixel well outside it is the opaque background.
+The second assertion is what pins the destination rect - a stretch or a centred
+anchor would put image where the background belongs. Verified by mutation:
+making the TL case fall through to the centred offset fails it.
+
+  directwrite_harfbuzz : 3091 pass, 56 skip, 0 fail
+  default              : 3087 pass, 58 skip, 0 fail
+
+Not covered by a test: the contain/cover scale factors, repeat wrapping, and
+the opacity/background compositing. The structure is shared with the path that
+is tested, but those branches are unexercised and should be treated as such.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/build/SharedDeps.zig                |   2 +
+ src/renderer/directx11/shaders.zig      |  89 +++++++++++-
+ src/renderer/shaders/hlsl/bg_image.hlsl | 172 ++++++++++++++++++++++++
+ 3 files changed, 258 insertions(+), 5 deletions(-)
+ create mode 100644 src/renderer/shaders/hlsl/bg_image.hlsl
+
+diff --git a/src/build/SharedDeps.zig b/src/build/SharedDeps.zig
+index 7bd586dc4..f49fdb0fc 100644
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -25,6 +25,8 @@ const hlsl_shaders = [_]HlslShader{
+     .{ .import = "ghostty_hlsl_cell_text_ps", .file = "cell_text", .entry = "ps_main", .profile = "ps_5_0" },
+     .{ .import = "ghostty_hlsl_image_vs", .file = "image", .entry = "vs_main", .profile = "vs_5_0" },
+     .{ .import = "ghostty_hlsl_image_ps", .file = "image", .entry = "ps_main", .profile = "ps_5_0" },
++    .{ .import = "ghostty_hlsl_bg_image_vs", .file = "bg_image", .entry = "vs_main", .profile = "vs_5_0" },
++    .{ .import = "ghostty_hlsl_bg_image_ps", .file = "bg_image", .entry = "ps_main", .profile = "ps_5_0" },
+ };
+ const UnicodeTables = @import("UnicodeTables.zig");
+ const GhosttyFrameData = @import("GhosttyFrameData.zig");
+diff --git a/src/renderer/directx11/shaders.zig b/src/renderer/directx11/shaders.zig
+index db85f9321..ac9ce0b15 100644
+--- a/src/renderer/directx11/shaders.zig
++++ b/src/renderer/directx11/shaders.zig
+@@ -167,12 +167,11 @@ pub const Shaders = struct {
+         pipelines.cell_bg = try .init(device, cell_bg_vs, cell_bg_ps, blend);
+         pipelines.cell_text = try .init(device, cell_text_vs, cell_text_ps, blend);
+         pipelines.image = try .init(device, image_vs, image_ps, blend);
+-        // The image step passes a texture but no sampler, so the pipeline
+-        // carries one.
++        pipelines.bg_image = try .init(device, bg_image_vs, bg_image_ps, blend);
++        // Both image steps pass a texture but no sampler, so the pipelines
++        // carry one.
+         pipelines.image.sampler = sampler.sampler;
+-
+-        // bg_image still has no HLSL, so it stays empty and its step is
+-        // skipped rather than drawing garbage.
++        pipelines.bg_image.sampler = sampler.sampler;
+ 
+         return .{
+             .pipelines = pipelines,
+@@ -206,6 +205,8 @@ const cell_text_vs = @embedFile("ghostty_hlsl_cell_text_vs");
+ const cell_text_ps = @embedFile("ghostty_hlsl_cell_text_ps");
+ const image_vs = @embedFile("ghostty_hlsl_image_vs");
+ const image_ps = @embedFile("ghostty_hlsl_image_ps");
++const bg_image_vs = @embedFile("ghostty_hlsl_bg_image_vs");
++const bg_image_ps = @embedFile("ghostty_hlsl_bg_image_ps");
+ 
+ pub const Uniforms = extern struct {
+     // Note: all of the explicit alignments are copied from the Metal
+@@ -786,6 +787,84 @@ test "offscreen: image pipeline draws a placement at the right rect" {
+     try testing.expectEqual(@as(u8, 0x00), outside[3]);
+ }
+ 
++test "offscreen: bg_image honours fit and position" {
++    // Exercises the half of bg_image that is easy to get wrong: the fit mode
++    // and position anchor decide a destination rect in the vertex shader, and
++    // the fragment shader maps each pixel back through it. Placing a small
++    // image top-left with no scaling means a correct implementation covers
++    // exactly one corner and leaves the rest as the background colour - which
++    // a stretch or a centre anchor would both fail.
++    const testing = std.testing;
++
++    var t = OffscreenTest.init(32, 32) catch return error.SkipZigTest;
++    defer t.deinit();
++
++    var shaders = try Shaders.init(testing.allocator, t.device, &.{});
++    defer shaders.deinit(testing.allocator);
++
++    // Opaque white 8x8 source.
++    const src = [_]u8{0xFF} ** (8 * 8 * 4);
++    var tex_srv: *d3d11.ID3D11ShaderResourceView = undefined;
++    const tex = try t.texture2d(8, 8, &src, &tex_srv);
++    defer _ = tex.Release();
++    defer _ = tex_srv.Release();
++
++    var uniforms: Uniforms = std.mem.zeroes(Uniforms);
++    uniforms.projection_matrix = math.ortho2d(0, 32, 32, 0);
++    uniforms.screen_size = .{ 32, 32 };
++    uniforms.cell_size = .{ 8, 16 };
++    uniforms.grid_size = .{ 4, 2 };
++    // Opaque black, so anywhere the image does not cover is unambiguous.
++    uniforms.bg_color = .{ 0, 0, 0, 0xFF };
++    uniforms.bools.use_linear_blending = false;
++    const cb = try t.constantBuffer(&uniforms);
++    defer _ = cb.Release();
++
++    const cfg = [_]BgImage{.{
++        .opacity = 1.0,
++        .info = .{ .position = .tl, .fit = .none, .repeat = false },
++    }};
++    var cfg_srv: *d3d11.ID3D11ShaderResourceView = undefined;
++    const cfg_buf = try t.structured(BgImage, &cfg, &cfg_srv);
++    defer _ = cfg_buf.Release();
++    defer _ = cfg_srv.Release();
++
++    t.beginFrame();
++    const cbs = [_]?*d3d11.ID3D11Buffer{cb};
++    t.context.VSSetConstantBuffers(0, &cbs);
++    t.context.PSSetConstantBuffers(0, &cbs);
++    const srvs = [_]?*d3d11.ID3D11ShaderResourceView{ cfg_srv, null, tex_srv, null };
++    t.context.VSSetShaderResources(0, &srvs);
++    t.context.PSSetShaderResources(0, &srvs);
++    const samplers = [_]?*d3d11.ID3D11SamplerState{shaders.pipelines.bg_image.sampler};
++    t.context.PSSetSamplers(0, &samplers);
++    t.context.VSSetShader(shaders.pipelines.bg_image.vs.?);
++    t.context.PSSetShader(shaders.pipelines.bg_image.ps.?);
++    t.context.IASetPrimitiveTopology(.TRIANGLELIST);
++    t.context.OMSetBlendState(shaders.pipelines.bg_image.blend);
++    t.context.Draw(3, 0);
++
++    var stage: *d3d11.ID3D11Texture2D = undefined;
++    const pixels = try t.readback(&stage);
++    defer t.endReadback(stage);
++    const pitch = pixels.len / t.h;
++
++    // Inside the 8x8 image anchored top-left: white.
++    const inside = pixels[3 * pitch + 3 * 4 ..][0..4];
++    try testing.expectEqual(@as(u8, 0xFF), inside[0]);
++    try testing.expectEqual(@as(u8, 0xFF), inside[1]);
++    try testing.expectEqual(@as(u8, 0xFF), inside[2]);
++
++    // Outside it: the background colour, opaque. A stretch or a centred anchor
++    // would put image here instead, so this is the assertion that pins the
++    // destination rect.
++    const outside = pixels[20 * pitch + 20 * 4 ..][0..4];
++    try testing.expectEqual(@as(u8, 0x00), outside[0]);
++    try testing.expectEqual(@as(u8, 0x00), outside[1]);
++    try testing.expectEqual(@as(u8, 0x00), outside[2]);
++    try testing.expectEqual(@as(u8, 0xFF), outside[3]);
++}
++
+ test "offscreen: bg_color renders the configured background" {
+     // Renders one frame into an offscreen texture and reads the pixels back.
+     //
+diff --git a/src/renderer/shaders/hlsl/bg_image.hlsl b/src/renderer/shaders/hlsl/bg_image.hlsl
+new file mode 100644
+index 000000000..8475ab909
+--- /dev/null
++++ b/src/renderer/shaders/hlsl/bg_image.hlsl
+@@ -0,0 +1,172 @@
++// Draws the configured background image.
++// Ported from `glsl/bg_image.v.glsl` and `glsl/bg_image.f.glsl`.
++//
++// A single full-viewport triangle; the fragment shader maps each pixel back
++// into the image, which is why fit/position/repeat are resolved in the vertex
++// shader and handed across as an offset and a scale.
++#include "common.hlsli"
++
++// Must match `BgImage` in `directx11/shaders.zig`: an f32 then a packed u8,
++// which the Zig struct pads to 8 bytes. Only the low byte of `info` matters.
++struct BgImage {
++    float opacity; // 0
++    uint info;     // 4
++};
++
++StructuredBuffer<BgImage> bg_images : register(t0);
++
++// Textures start at t2 by this backend's convention; see RenderPass.step.
++Texture2D<float4> image_tex : register(t2);
++SamplerState image_sampler : register(s0);
++
++// 4 bits of position.
++static const uint BG_IMAGE_POSITION = 15u;
++static const uint BG_IMAGE_TL = 0u;
++static const uint BG_IMAGE_TC = 1u;
++static const uint BG_IMAGE_TR = 2u;
++static const uint BG_IMAGE_ML = 3u;
++static const uint BG_IMAGE_MC = 4u;
++static const uint BG_IMAGE_MR = 5u;
++static const uint BG_IMAGE_BL = 6u;
++static const uint BG_IMAGE_BC = 7u;
++static const uint BG_IMAGE_BR = 8u;
++
++// 2 bits of fit, shifted 4.
++static const uint BG_IMAGE_FIT = 3u << 4;
++static const uint BG_IMAGE_CONTAIN = 0u << 4;
++static const uint BG_IMAGE_COVER = 1u << 4;
++static const uint BG_IMAGE_STRETCH = 2u << 4;
++static const uint BG_IMAGE_NO_FIT = 3u << 4;
++
++// 1 bit of repeat, shifted 6.
++static const uint BG_IMAGE_REPEAT = 1u << 6;
++
++struct VSOut {
++    float4 pos : SV_Position;
++    nointerpolation float4 bg_color : COLOR0;
++    nointerpolation float2 offset : TEXCOORD0;
++    nointerpolation float2 scale : TEXCOORD1;
++    nointerpolation float opacity : TEXCOORD2;
++    nointerpolation uint repeat : TEXCOORD3;
++};
++
++VSOut vs_main(uint vid : SV_VertexID) {
++    BgImage cfg = bg_images[0];
++    const uint info = cfg.info & 0xFFu;
++
++    VSOut o;
++
++    // One oversized triangle clipped to the viewport:
++    //   vid 0 = (-1, -3), vid 1 = (-1, 1), vid 2 = (3, 1)
++    //
++    // z is 0 where the GLSL uses 1. ortho2d is not involved here - these are
++    // already clip coordinates - but D3D's NDC depth range is [0, 1] where
++    // OpenGL's is [-1, 1], so z = 1 sits on the far plane rather than
++    // harmlessly inside it. 0 keeps the triangle unambiguously in range.
++    o.pos = float4(
++        (vid == 2u) ? 3.0 : -1.0,
++        (vid == 0u) ? -3.0 : 1.0,
++        0.0,
++        1.0
++    );
++
++    o.opacity = cfg.opacity;
++    o.repeat = info & BG_IMAGE_REPEAT;
++
++    uint tw, th;
++    image_tex.GetDimensions(tw, th);
++    const float2 tex_size = float2(tw, th);
++
++    // Fit.
++    float2 dest_size = tex_size;
++    const uint fit = info & BG_IMAGE_FIT;
++    if (fit == BG_IMAGE_CONTAIN) {
++        // Whichever scale is smaller, so the whole image fits.
++        const float s = min(screen_size.x / tex_size.x, screen_size.y / tex_size.y);
++        dest_size = tex_size * s;
++    } else if (fit == BG_IMAGE_COVER) {
++        // Whichever scale is larger, so the screen is fully covered.
++        const float s = max(screen_size.x / tex_size.x, screen_size.y / tex_size.y);
++        dest_size = tex_size * s;
++    } else if (fit == BG_IMAGE_STRETCH) {
++        dest_size = screen_size;
++    } else {
++        // BG_IMAGE_NO_FIT: the texture's own size.
++        dest_size = tex_size;
++    }
++
++    // Position.
++    const float2 start = float2(0.0, 0.0);
++    const float2 mid = (screen_size - dest_size) / 2.0;
++    const float2 end = screen_size - dest_size;
++
++    float2 dest_offset = mid;
++    switch (info & BG_IMAGE_POSITION) {
++    case BG_IMAGE_TL: dest_offset = float2(start.x, start.y); break;
++    case BG_IMAGE_TC: dest_offset = float2(mid.x, start.y); break;
++    case BG_IMAGE_TR: dest_offset = float2(end.x, start.y); break;
++    case BG_IMAGE_ML: dest_offset = float2(start.x, mid.y); break;
++    case BG_IMAGE_MC: dest_offset = float2(mid.x, mid.y); break;
++    case BG_IMAGE_MR: dest_offset = float2(end.x, mid.y); break;
++    case BG_IMAGE_BL: dest_offset = float2(start.x, end.y); break;
++    case BG_IMAGE_BC: dest_offset = float2(mid.x, end.y); break;
++    case BG_IMAGE_BR: dest_offset = float2(end.x, end.y); break;
++    default: dest_offset = mid; break;
++    }
++
++    o.offset = dest_offset;
++    o.scale = tex_size / dest_size;
++
++    // A fully opaque version of the background colour, carrying its alpha
++    // separately, because the fragment shader needs the two apart.
++    const uint4 u_bg = unpack4u8(bg_color_packed);
++    const float4 opaque_bg = load_color(
++        uint4(u_bg.rgb, 255),
++        get_bool(BOOL_USE_LINEAR_BLENDING)
++    );
++    o.bg_color = float4(opaque_bg.rgb, float(u_bg.a) / 255.0);
++
++    return o;
++}
++
++float4 ps_main(VSOut input) : SV_Target {
++    uint tw, th;
++    image_tex.GetDimensions(tw, th);
++    const float2 tex_size = float2(tw, th);
++
++    // SV_Position is already upper-left origin in D3D, which is what the GLSL
++    // has to ask for with `layout(origin_upper_left)`.
++    float2 tex_coord = (input.pos.xy - input.offset) * input.scale;
++
++    if (input.repeat != 0u) {
++        // fmod can return a negative for a negative input, hence the double
++        // wrap - the same reason the GLSL does mod(mod(x, s) + s, s).
++        tex_coord = fmod(fmod(tex_coord, tex_size) + tex_size, tex_size);
++    }
++
++    float4 rgba;
++    if (any(tex_coord < float2(0.0, 0.0)) || any(tex_coord > tex_size)) {
++        // Outside the destination rect contributes nothing.
++        rgba = float4(0.0, 0.0, 0.0, 0.0);
++    } else {
++        rgba = image_tex.Sample(image_sampler, tex_coord / tex_size);
++        if (!get_bool(BOOL_USE_LINEAR_BLENDING)) {
++            rgba = unlinearize(rgba);
++        }
++        rgba.rgb *= rgba.a;
++    }
++
++    // Cap the configured opacity so the result cannot exceed full opacity
++    // relative to the background alpha, which would overexpose it.
++    rgba *= min(input.opacity, 1.0 / input.bg_color.a);
++
++    // Composite over a fully opaque background colour, then scale everything
++    // by the background alpha.
++    rgba += max(
++        float4(0.0, 0.0, 0.0, 0.0),
++        float4(input.bg_color.rgb, 1.0) * (1.0 - rgba.a)
++    );
++    rgba *= input.bg_color.a;
++
++    return rgba;
++}

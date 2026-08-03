@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Claude (agent session)" <darren@obot.ai>
+Date: Sat, 1 Aug 2026 22:33:04 -0700
+Subject: [PATCH] apprt/embedded: take the initial surface size from the HWND
+
+The embedded surface started at a hardcoded 800x600 regardless of the window it
+was handed. On Windows that is 80 columns at a 10px cell, so a child spawned
+into a wider window drew for 80 columns: vttest put its right-hand border at
+column ~79 on a ~100 column surface.
+
+Pushing a size afterwards does not help, because the pty is sized and the child
+spawned *during* surface init - by the time ghostty_surface_set_size arrives the
+child has already read the wrong value. Within a single vttest screen the bottom
+row extended to column ~98 while the right border sat at 79, which is exactly
+what a late resize looks like.
+
+Platform.Win32.initialSize() answers with GetClientRect when the surface is in
+hwnd mode. Composition and shared-texture modes return null and keep the 800x600
+placeholder: those are sized by the embedder, which supplies its own size, and
+guessing on their behalf would be worse than a placeholder.
+
+Verified by asking the child rather than by looking: a WSL probe running
+`stty size` in the harness now reports `28 100`, matching the window. It
+reported 80 columns before.
+
+  directwrite_harfbuzz : 3089 pass, 56 skip, 0 fail
+  default              : 3085 pass, 58 skip, 0 fail
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/apprt/embedded.zig | 48 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 46 insertions(+), 2 deletions(-)
+
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index dd504a5d1..0c3fcd467 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -382,6 +382,30 @@ pub const Platform = union(PlatformTag) {
+             width: u32,
+             height: u32,
+         };
++
++        const RECT = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
++        extern "user32" fn GetClientRect(hWnd: *anyopaque, lpRect: *RECT) callconv(.winapi) i32;
++
++        /// The size this surface should start at, when the platform can say.
++        ///
++        /// Worth asking rather than leaving the embedder to push a size after
++        /// creation: the pty is sized and the child spawned *during* surface
++        /// init, so a size arriving afterwards is already too late for whatever
++        /// the child has read. That showed up as vttest drawing its border at
++        /// 80 columns in a ~100 column window.
++        ///
++        /// Only the hwnd mode can answer. Composition and shared-texture modes
++        /// are sized by the embedder, which supplies a size of its own.
++        pub fn initialSize(self: Win32) ?struct { width: u32, height: u32 } {
++            const hwnd = self.hwnd orelse return null;
++            var rc: RECT = undefined;
++            if (GetClientRect(hwnd, &rc) == 0) return null;
++            const w = rc.right - rc.left;
++            const h = rc.bottom - rc.top;
++            // A window not yet laid out reports 0x0, which says nothing useful.
++            if (w <= 0 or h <= 0) return null;
++            return .{ .width = @intCast(w), .height = @intCast(h) };
++        }
+     } else void;
+ 
+     // The C ABI compatible version of this union. The tag is expected
+@@ -525,16 +549,36 @@ pub const Surface = struct {
+     };
+ 
+     pub fn init(self: *Surface, app: *App, opts: Options) !void {
++        const platform: Platform = try .init(opts.platform_tag, opts.platform);
++
++        // Prefer a size the platform can tell us over the placeholder below.
++        // The pty is sized and the child spawned during this init, so a size
++        // pushed afterwards arrives too late for whatever the child already
++        // read - which is how a program ends up drawing for 80 columns in a
++        // wider window.
++        const initial_size: apprt.SurfaceSize = size: {
++            switch (platform) {
++                .win32 => |v| if (Platform.Win32 != void) {
++                    if (v.initialSize()) |s| break :size .{
++                        .width = s.width,
++                        .height = s.height,
++                    };
++                },
++                else => {},
++            }
++            break :size .{ .width = 800, .height = 600 };
++        };
++
+         self.* = .{
+             .app = app,
+-            .platform = try .init(opts.platform_tag, opts.platform),
++            .platform = platform,
+             .userdata = opts.userdata,
+             .core_surface = undefined,
+             .content_scale = .{
+                 .x = @floatCast(opts.scale_factor),
+                 .y = @floatCast(opts.scale_factor),
+             },
+-            .size = .{ .width = 800, .height = 600 },
++            .size = initial_size,
+             .cursor_pos = .{ .x = -1, .y = -1 },
+         };
+ 
