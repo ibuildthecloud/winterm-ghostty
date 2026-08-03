@@ -62,7 +62,8 @@ Screens are captured with `harness/wgc-shot` (Windows Graphics Capture — needs
 | 3 | Character sets | **pass** | pass | US-ASCII, British (`#` correctly renders as `£`), DEC Special Graphics line drawing, both DEC Alternate ROM sets, and SI/SO G0/G1 switching all correct. |
 | 4 | Double-sized characters | **not implemented** | not implemented | Matches wintty exactly: double-width and double-height lines render as normal single-size text. A base-Ghostty limitation — `src/terminal/stream.zig` dispatches only `ESC #8` (DECALN); `ESC #3`/`#4`/`#5`/`#6` fall through. Not Windows- or D3D11-specific. |
 | 8 | VT102 Insert/Delete Char/Line | **pass** | *pending* | Assessed here for the first time. The screen-accordion setup fills 80 columns per row correctly; the Delete Character rounds produce the required "right column staggered by one" diagonal and hold it across repeats; the ANSI Insert Character check renders its two `A B C ... Z` lines identically. |
-| 5, 6, 7, 9, 10, 11 | Keyboard, reports, VT52, known bugs, reset, non-VT100 | not yet run | pending | Reachable here for the first time — section 5 in particular needs real key input, which this harness can supply and wintty's could not. |
+| 5 | Keyboard | **partly assessed** | pending | The keyboard-layout diagram renders correctly (a dense reverse-video test in its own right). The Cursor Keys sub-test reports `(Unknown cursor key)`, but that is **not** an encoding fault — see below. |
+| 6, 7, 9, 10, 11 | Reports, VT52, known bugs, reset, non-VT100 | not yet run | pending | Reachable here for the first time, since this harness can supply real key input and wintty's could not. |
 
 ## Section 1 must be run at 80 columns
 
@@ -98,6 +99,29 @@ This matches wintty's advice from the other direction; their notes call for "a
 size-matched launch (fixed window on the primary monitor, no post-draw resize)" for
 size-dependent sections. At the default DPI here, `--font-size=8` with a ~541px client
 gives 80 columns.
+
+## Cursor keys encode correctly; vttest's cursor test is inconclusive here
+
+Section 5's Cursor Keys sub-test reports `<27>   (Unknown cursor key)`, i.e. it saw a
+bare `ESC` rather than a full sequence. That reads like a key-encoding bug, and it is not.
+
+Echoing the raw bytes instead — a shell running `stty raw -echo; cat -v` in the harness,
+driven with the same synthetic Up/Down/Left/Right — produces:
+
+```
+^[[A^[[B^[[D^[[C
+```
+
+`ESC[A`, `ESC[B`, `ESC[D`, `ESC[C`: exactly the right ANSI cursor sequences, in the right
+order. This is the first direct verification of the extended-key (`0xE0`) path in
+`harness/hwnd-host/winkeys.c`, which nothing had exercised before.
+
+vttest distinguishes a standalone `ESC` from an escape sequence with a short
+inter-character timeout. The synthetic-input → ConPTY → WSL path evidently delivers the
+`ESC` far enough ahead of the `[A` to defeat it. So the sub-test result is an artifact of
+*how the keys are injected*, not of what the terminal sends, and it should not be recorded
+as a pass or a failure. Assessing it properly needs real hardware key input, or a driver
+that delivers the whole sequence within vttest's window.
 
 ## A false alarm worth recording
 
