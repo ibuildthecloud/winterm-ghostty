@@ -1,6 +1,6 @@
 # 0001 — Replace the terminal engine at the ControlCore seam
 
-Status: Proposed (2026-07-31)
+Status: Accepted (2026-08-02, at the Phase 3→4 readiness step)
 
 ## Context
 
@@ -18,7 +18,8 @@ cut points for swapping in libghostty:
    `ICoreState.idl`) is the complete contract the shell consumes, and the boundary was
    designed to be process-crossable (unshipped Process Model 2.0 spec, `doc/specs/#5000`).
    Everything above it (TermControl XAML, tabs, panes, profiles, settings) is
-   engine-agnostic through this contract, except six `get_self<ControlCore>` escapes.
+   engine-agnostic through this contract, except seven `get_self<ControlCore>` escapes —
+   six of them IDL-promotable, plus one TSF coupling (see below).
 3. **`IPaneContent`** (`src/cascadia/TerminalApp/IPaneContent.idl`) — the shell's pane
    abstraction (~10 members; `SnippetsPaneContent` is precedent). Cutting here loses every
    terminal-aware action in `AppActionHandlers.cpp` (copy/search/marks/scroll/font-size),
@@ -31,8 +32,37 @@ primitive wintty's ghostty fork already exports (`ghostty_surface_get_swap_chain
 ## Decision
 
 Promote `ControlCore.idl` + `ICoreState.idl` into an **`IControlCore`** WinRT interface.
-`TermControl` and `ControlInteractivity` hold the interface; the six `get_self` leaks are
-replaced with IDL members. The existing cascadia `ControlCore` becomes implementation #1;
+`TermControl` and `ControlInteractivity` hold the interface; the `get_self` leaks are
+replaced with IDL members.
+
+**The escapes, enumerated (verified against pin `ca7996296`, 2026-08-02).** There are
+*seven* `get_self<ControlCore>` call sites in `TermControl.cpp`, not six. Six are
+straightforward IDL promotions:
+
+| Line | Escape |
+|---|---|
+| 650 | `SearchResultRows` (+ `ForegroundColor`) for the search pips |
+| 1468 | `RestoreFromPath` |
+| 2640 | `PersistTo` |
+| 3747 | `UpdateQuickFixes` |
+| 3867 | `PreviewInput` |
+| 4040 | `GetRenderData` — the QuickFix viewport query |
+
+The seventh, `TsfDataProvider::_getCore()` at line 256, is **not** IDL-promotable: it exists
+to reach `core->GetRenderer()` and hand out WT's internal `Renderer*`, for which a
+libghostty-backed engine has no equivalent. It is the TSF/IME coupling already listed under
+Consequences, and it is reimplemented per engine rather than promoted. Phase 4 keeps
+cascadia's behaviour here unchanged; Phase 5+ supplies the ghostty path
+(`ghostty_surface_preedit` + `_ime_point`, with ghostty rendering preedit inline).
+
+**Shape (decided at the Phase 3→4 readiness step, 2026-08-02):** a *single*
+`IControlCore` carrying both members and events, alongside the existing `ICoreState` —
+`runtimeclass ControlCore : IControlCore, ICoreState`. `ICoreState` is already a WinRT
+`interface` that `ControlCore` implements, so this follows a precedent the codebase has
+established rather than inventing one. Splitting the 27 events onto a separate
+`IControlCoreEvents` was rejected: it adds a second `QueryInterface` and complicates
+`TermControl`'s event-revoker plumbing, which is written against a single object, for no
+benefit to either engine. The existing cascadia `ControlCore` becomes implementation #1;
 `GhosttyControlCore` (wrapping `libghostty.dll`) becomes implementation #2. Both towers
 terminate in a composition swap-chain handle and consume the same `ITerminalConnection`.
 

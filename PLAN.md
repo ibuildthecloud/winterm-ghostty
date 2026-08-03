@@ -18,7 +18,7 @@ follow 5.
 | 0 — Toolchain + baselines | **complete** (retro done) | [0001](docs/sessions/0001-phase-0.md): repo + pins + #11886 archived (incl. binary shaders); wintty runs a shell; **WT builds from source on VS2026/v145 and launches as a deployed dev package** (no VS2022 needed — PLAN text is stale). Criterion 2's premise is falsified, not outstanding: it asserts *unpatched* upstream builds, which is false at pin `4d605bf0` and only an upstream merge can change. Fixed in-session at the gate's direction: branch `windows`, patch 0 `75c31f2c` → **`ghostty-internal.dll` links, x64 PE, 231 C-API exports**, tests unchanged at 3061/55/0. Retro: amend that criterion's wording, and ratify the ADR 0004 patch-list change (§5.1). |
 | 1 — Fork bootstrap + first pixels | 3/4 criteria met | [0002](docs/sessions/0002-phase-1.md): **libghostty renders on Windows.** 4-patch series exported; harness shows a `#282C34` surface tracking config, resizable, DPI-correct, identical on hardware and forced WARP. Appcontainer answered (WT is `runFullTrust`; DLL ships in-package). Unmet: **ARM64 cross-build blocked by a Zig 0.16.0 stdlib bug** (`SelfInfo/Windows.zig:670`, `@ptrCast` alignment on aarch64) — not our code. One DECISION-NEEDED. |
 | 2 — SwapChainPanel proof | **complete** | [0003](docs/sessions/0003-phase-2.md): **the WT integration primitive works.** libghostty's dcomp handle bound into a system-XAML `SwapChainPanel` via `ISwapChainPanelNative2::SetSwapChainHandle` — the same call WT already makes. Resize clean 540×430→1400×900; `CompositionScale 1.50`. Device loss → rebuild → re-attach, handle `0x179C`→`0x21D0`, no restart. Added a `swap_chain_changed` action (§4 dev 2). Clear colour static, not animated (§4 dev 1). |
-| 3 — Real terminal rendering | **3/3 criteria met** — ready for gate | [0004](docs/sessions/0004-phase-3.md): **the harness is an interactive terminal.** `cmd.exe` runs, keyboard works, `dir` renders a correctly aligned scrolling listing — DirectWrite glyphs, CPU atlas, HLSL `cell_text` instanced draws, ConPTY. DirectWrite face + colour emoji (CBDT via `IDWriteFactory4`, full format set) + HLSL set (`fxc`→DXBC at build time) landed; all `phase1_skeleton` markers gone. Root cause of "nothing renders" was a **missing viewport** — `RSSetViewports` had no callers, and `Clear` ignores the viewport while draws are clipped entirely by it, so it presented as a healthy cleared surface with no D3D error. **Criterion 3 (forced WARP) MET**: `driver=warp feature_level=11_1`, output pixel-equivalent to hardware including CJK and colour emoji. DirectWrite discovery landed and verified live — `MapCharacters` + on-disk path resolution, with `IDWriteTextAnalysisSource` implemented as a COM callback; CJK/kana/colour-emoji all render. Two rendering bugs the user found by looking and no test covered: a missing viewport (`RSSetViewports` had no callers — `Clear` ignores it while draws are clipped by it, so it looked like a healthy cleared surface) and `offset_y` being baseline-relative rather than cell-bottom-relative, which put every glyph high by the descent. Both now have mutation-verified regression tests. **Criterion 1 MET**: PowerShell reaches a prompt with PSReadLine syntax-colouring live per keystroke, `Get-Process` tables align, `top` renders; JetBrains Mono ligatures shape (`->`→`→`, `<=>`→`⟺`) while a space-separated control line stays unligated, proving real HarfBuzz shaping; CJK/kana/colour emoji fall back correctly; **kitty keyboard protocol verified end to end** — `CSI ? u` → `ESC[?0u`, `CSI > 15 u` → `ESC[?15u`, then `a` reports as `ESC[97u`. Recorded in `docs/interactive-verification.md`. Testing it with `CSI > 1 u` alone is misleading — level 1 only disambiguates, so printable keys still send their plain byte. **Criterion 2 MET**: every vttest section visited except 11; sections 2, 6, 8, 9, 10 assessed for the first time and pass (6 now includes Secondary/Tertiary DA and DECREQTPARM); **no regressions vs wintty**. Section 7 (VT52) renders wrong but is **ConPTY's, not ours** — libghostty has no VT52 code at all and Windows Terminal on the same ConPTY path clamps out-of-range `ESC Y` identically. §6 records three instrumentation traps that each produced a retracted conclusion; the VT52 investigation added three more (escape sequences swallowed by `$( )` command substitution, VT52 state bleeding between un-exited probe arms, and an "out-of-range" column that wasn't because the terminal was wider than assumed). Open: occasional wrong character from the synthetic input driver, unattributed. |
+| 3 — Real terminal rendering | **complete** (gate passed 2026-08-02) | [0004](docs/sessions/0004-phase-3.md): **the harness is an interactive terminal.** `cmd.exe` runs, keyboard works, `dir` renders a correctly aligned scrolling listing — DirectWrite glyphs, CPU atlas, HLSL `cell_text` instanced draws, ConPTY. DirectWrite face + colour emoji (CBDT via `IDWriteFactory4`, full format set) + HLSL set (`fxc`→DXBC at build time) landed; all `phase1_skeleton` markers gone. Root cause of "nothing renders" was a **missing viewport** — `RSSetViewports` had no callers, and `Clear` ignores the viewport while draws are clipped entirely by it, so it presented as a healthy cleared surface with no D3D error. **Criterion 3 (forced WARP) MET**: `driver=warp feature_level=11_1`, output pixel-equivalent to hardware including CJK and colour emoji. DirectWrite discovery landed and verified live — `MapCharacters` + on-disk path resolution, with `IDWriteTextAnalysisSource` implemented as a COM callback; CJK/kana/colour-emoji all render. Two rendering bugs the user found by looking and no test covered: a missing viewport (`RSSetViewports` had no callers — `Clear` ignores it while draws are clipped by it, so it looked like a healthy cleared surface) and `offset_y` being baseline-relative rather than cell-bottom-relative, which put every glyph high by the descent. Both now have mutation-verified regression tests. **Criterion 1 MET**: PowerShell reaches a prompt with PSReadLine syntax-colouring live per keystroke, `Get-Process` tables align, `top` renders; JetBrains Mono ligatures shape (`->`→`→`, `<=>`→`⟺`) while a space-separated control line stays unligated, proving real HarfBuzz shaping; CJK/kana/colour emoji fall back correctly; **kitty keyboard protocol verified end to end** — `CSI ? u` → `ESC[?0u`, `CSI > 15 u` → `ESC[?15u`, then `a` reports as `ESC[97u`. Recorded in `docs/interactive-verification.md`. Testing it with `CSI > 1 u` alone is misleading — level 1 only disambiguates, so printable keys still send their plain byte. **Criterion 2 MET**: every vttest section visited except 11; sections 2, 6, 8, 9, 10 assessed for the first time and pass (6 now includes Secondary/Tertiary DA and DECREQTPARM); **no regressions vs wintty**. Section 7 (VT52) renders wrong but is **ConPTY's, not ours** — libghostty has no VT52 code at all and Windows Terminal on the same ConPTY path clamps out-of-range `ESC Y` identically. §6 records three instrumentation traps that each produced a retracted conclusion; the VT52 investigation added three more (escape sequences swallowed by `$( )` command substitution, VT52 state bleeding between un-exited probe arms, and an "out-of-range" column that wasn't because the terminal was wider than assumed). Open: occasional wrong character from the synthetic input driver, unattributed. |
 | 4 — WT seam (IControlCore) | not started | |
 | 5 — Ghostty pane MVP | not started | |
 | 6 — Interaction parity | not started | |
@@ -306,8 +306,22 @@ Escalation triggers (stop the item, report DECISION-NEEDED, per PROCESS.md):
 - Benchmark methodology: pick the throughput/latency harness now (vtebench? plain
   `cat`+timer? termbench?) so Phase 3 and Phase 7 numbers are comparable.
 
-Re-evaluate: renderer perf acceptable enough to defer Phase 7 polish? COLRv1 emoji — fix
-now or ship-gate later?
+Re-evaluate — **answered at the gate (2026-08-02)**:
+- ~~Renderer perf acceptable enough to defer Phase 7 polish?~~ **Yes, defer.** Measured
+  14.9 MB/s vs Windows Terminal's 42.8 MB/s on the same corpus and transport — **2.9x
+  slower**. Accepted as a Phase 7 item rather than a Phase 3 blocker; the candidates are
+  already recorded in `docs/perf/throughput.md` (`Present(sync_interval=1)` with no
+  frame-latency wait object, no damage tracking, redraw-on-`WM_PAINT`). Phase 7 must reuse
+  the identical script and corpus or its targets are not comparable.
+- ~~COLRv1 emoji — fix now or ship-gate later?~~ **Later.** DirectWrite renders the COLR
+  v0 layer set, which is parity with Windows Terminal's AtlasEngine, so there is no user-
+  visible gap to close. `COLR_PAINT_TREE` via `IDWriteFactory8` remains a separable upgrade
+  that would put us *ahead* of WT rather than level with it.
+
+Carried into Phase 7 (not blocking the gate): the occasional wrong character from the
+synthetic input driver (`7`→`^_`, `0`→`^[`) is unattributed — plausibly `vt.ps1` outrunning
+the message pump, but a terminal delivering the wrong key would be serious. Reproduce
+against `stty raw -echo; cat -v` to take vttest out of the loop.
 
 ## Phase 4 — WT seam: IControlCore (ADR 0001; parallel track)
 
@@ -326,16 +340,32 @@ Exit criteria:
 - [ ] WT test suites pass at pre-fork levels.
 - [ ] `"engine": "cascadia"` parses; unknown values warn and fall back.
 
-Open questions (resolve at readiness):
-- ADRs 0001 and 0007 flipped to `Accepted`?
-- Which WT test suites are actually runnable locally (unit vs the UI/feature suites that
-  need special infra)? Sets what "pass at pre-fork levels" concretely means — establish
-  the baseline *before* the seam change lands.
-- Interface naming/shape: single `IControlCore` vs splitting the event surface
-  (`IControlCoreEvents`)? WinRT versioning conventions in the WT codebase may force a
-  choice — inspect first, then delegate the rest.
-- Fork base: track the Phase-0 pin or advance to current main before branching? (WT moves
-  slower than ghostty; a fresh pin here is probably cheap and right.)
+Open questions — **all resolved at the Phase 3→4 readiness step (2026-08-02)**:
+- ~~ADRs 0001 and 0007 flipped to `Accepted`?~~ **Both Accepted 2026-08-02.** ADR 0001 also
+  gained an enumerated escape table: there are **seven** `get_self<ControlCore>` call sites
+  in `TermControl.cpp`, not six. Six are straightforward IDL promotions; the seventh
+  (`TsfDataProvider::_getCore()`, line 256) exists only to reach `core->GetRenderer()` and
+  hand out WT's internal `Renderer*`, which a libghostty engine has no equivalent for. It
+  is the TSF/IME coupling ADR 0001 already lists under Consequences — reimplemented per
+  engine, not promoted. Phase 4 leaves cascadia's behaviour there unchanged.
+- ~~**Which WT test suites are runnable locally?**~~ **Answered empirically.** The Phase 0
+  build left the conhost-side suites built but the cascadia ones absent; all four cascadia
+  unit-test projects now build (`UnitTests_TerminalCore`, `UnitTests_SettingsModel`,
+  `UnitTests_Control`, `ut_app`). Baseline recorded in the Phase 4 session report. Two
+  traps found: `nuget restore` needs `-SolutionDirectory` unless invoked from the repo
+  root, and `Invoke-OpenConsoleTests` with no `-Test` runs *every* unit suite in one
+  `te.exe` and **hangs partway through the conhost `ScreenBufferTests`** — run the suites
+  individually with a timeout. The conhost/UIA/feature suites are out of scope for this
+  phase: an `IControlCore` promotion cannot reach them.
+- ~~Interface naming/shape?~~ **Single `IControlCore` carrying members *and* events,
+  alongside the existing `ICoreState`** — `runtimeclass ControlCore : IControlCore,
+  ICoreState`. `ICoreState` is already a WinRT `interface` that `ControlCore` implements,
+  so this follows the codebase's own precedent. Splitting the 27 events onto an
+  `IControlCoreEvents` was rejected (second QI; complicates `TermControl`'s revoker
+  plumbing, which is written against a single object). Recorded in ADR 0001.
+- ~~Fork base?~~ **Stay on the Phase-0 pin `ca7996296`.** The `terminal/` clone is already
+  checked out there and is only two days older than this readiness step, so advancing buys
+  nothing and costs a re-baseline.
 
 Re-evaluate: is the interface promotion clean enough to PR upstream now? (If yes, open it
 — it shrinks the fork permanently.)

@@ -1,6 +1,6 @@
 # 0007 — Per-profile `engine` setting; cascadia stays the default
 
-Status: Proposed (2026-07-31)
+Status: Accepted (2026-08-02, at the Phase 3→4 readiness step)
 
 ## Context
 
