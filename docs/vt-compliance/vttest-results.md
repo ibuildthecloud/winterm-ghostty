@@ -61,7 +61,8 @@ Screens are captured with `harness/wgc-shot` (Windows Graphics Capture — needs
 | 2 | Screen features | **pass (partial)** | *deferred — harness* | wintty could not assess this. Here the section ran to completion. **DECSCNM verified by pixel measurement**: light background is `#FFFFFF`, dark is `#282C34`. **DECCOLM (132-column) is not honoured** — the ruler wraps, i.e. the terminal stays at its window width. Most modern terminals ignore DECCOLM deliberately. |
 | 3 | Character sets | **pass** | pass | US-ASCII, British (`#` correctly renders as `£`), DEC Special Graphics line drawing, both DEC Alternate ROM sets, and SI/SO G0/G1 switching all correct. |
 | 4 | Double-sized characters | **not implemented** | not implemented | Matches wintty exactly: double-width and double-height lines render as normal single-size text. A base-Ghostty limitation — `src/terminal/stream.zig` dispatches only `ESC #8` (DECALN); `ESC #3`/`#4`/`#5`/`#6` fall through. Not Windows- or D3D11-specific. |
-| 5-11 | Keyboard, reports, VT52, VT102, known bugs, reset, non-VT100 | not yet run | pending | Newly *reachable* here, since keyboard input works. |
+| 8 | VT102 Insert/Delete Char/Line | **pass** | *pending* | Assessed here for the first time. The screen-accordion setup fills 80 columns per row correctly; the Delete Character rounds produce the required "right column staggered by one" diagonal and hold it across repeats; the ANSI Insert Character check renders its two `A B C ... Z` lines identically. |
+| 5, 6, 7, 9, 10, 11 | Keyboard, reports, VT52, known bugs, reset, non-VT100 | not yet run | pending | Reachable here for the first time — section 5 in particular needs real key input, which this harness can supply and wintty's could not. |
 
 ## Section 1 must be run at 80 columns
 
@@ -98,10 +99,22 @@ size-matched launch (fixed window on the primary monitor, no post-draw resize)" 
 size-dependent sections. At the default DPI here, `--font-size=8` with a ~541px client
 gives 80 columns.
 
+## A false alarm worth recording
+
+Section 8's final screen prints `Push <RETURN>^[%^[`, which looks like our terminal
+failing to consume `ESC %` (the ISO-2022 character-set designator) and leaking it to the
+screen. It is not. Feeding `ESC % G` and `ESC % @` directly through the harness renders
+`BEGINAFTER-GAFTER-AT|` with no escape characters visible, so both are consumed
+correctly — vttest was printing its own caret notation to show the reader what it sent.
+
+Recorded because the failure mode is plausible enough to be worth not re-investigating,
+and because the check took one command.
+
 ## Regressions vs wintty
 
-**None.** Sections 1, 3 and 4 match the baseline, and section 2 is assessed here for the
-first time and passes the part wintty deferred.
+**None.** Sections 1, 3 and 4 match the baseline, section 2 is assessed here for the first
+time and passes the part wintty deferred, and section 8 is assessed here for the first
+time and passes.
 
 ## PTY size — was a defect, now fixed
 
