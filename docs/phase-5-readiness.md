@@ -47,7 +47,7 @@ flow control, and it is orthogonal to the question here.
 
 | | Design | Verdict |
 |---|---|---|
-| **A** | `ghostty_surface_write_pty_output` blocks while the ring is full | **Recommended** |
+| **A** | `ghostty_surface_write_pty_output` blocks while the ring is full | **DECIDED 2026-08-03** |
 | B | Partial consume, returns bytes accepted; embedder buffers the rest | Rejected |
 | C | Credit / callback flow control | Rejected for MVP |
 
