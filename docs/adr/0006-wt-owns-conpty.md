@@ -1,6 +1,6 @@
 # 0006 — Windows Terminal keeps ConPTY; ghostty gets an external-stream termio backend
 
-Status: Proposed (2026-07-31)
+Status: Accepted (2026-08-03, at the Phase 4→5 readiness step)
 
 ## Context
 
