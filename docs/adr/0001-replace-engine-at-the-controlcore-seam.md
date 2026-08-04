@@ -76,10 +76,18 @@ the escapes existed precisely *because* those signatures are not projectable:
   the consecutive-duplicate filtering moved from `TermControl` into the implementation.
 - **The QuickFix viewport query** reached `GetRenderData()->GetViewport()` and read both
   bounds under one console lock. It is now a single `IsBufferRowInViewport(Int32)`
-  predicate rather than separate accessors, to preserve that atomicity.
-  `ICoreState::ScrollOffset` + `ViewHeight` is **not** a valid substitute:
-  `Terminal::_VisibleStartIndex()` reports `0` in the alt buffer while
-  `GetViewport().Top()` does not, so deriving the bounds would change behaviour.
+  predicate rather than separate accessors, to preserve that atomicity — two property
+  reads would take two locks.
+
+  **Correction (2026-08-03):** this note first claimed `ICoreState::ScrollOffset` +
+  `ViewHeight` was *not* a valid substitute, because `Terminal::_VisibleStartIndex()`
+  short-circuits to `0` in the alt buffer. That was reasoned from the source and never
+  measured, and it is **wrong**. `Terminal::GetViewport()` returns the *visible* viewport,
+  and `ScrollOffset` tracks its `Top()` in every case tested — main buffer at the bottom
+  (21/21), main buffer scrolled back (5/5), and alt buffer (0/0). The derivation would
+  have worked; atomicity is the real and sufficient justification.
+  `ControlCoreTests::TestIsBufferRowInViewportAltBuffer` now pins the agreement, so a
+  future divergence surfaces as a failing test rather than folklore.
 
 `ControlCore` is now a marker class (`[default_interface]`, constructor only). MIDL requires
 a default interface on any runtimeclass that is constructed or passed as a parameter, and
