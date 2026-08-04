@@ -148,6 +148,46 @@ Rationale: the MVP criterion is "a fully interactive shell in a WT tab", and the
 proposed fields are the ones without which a pane is visibly wrong rather than merely
 unstyled. Everything else is parity work, which is what Phase 6 is for.
 
+## The `ControlInteractivity` promotion — inventory
+
+Measured 2026-08-03 against `ControlInteractivity.cpp`. Of the 34 distinct core methods it
+calls, **14 are already on `IControlCore`/`ICoreState`** and 20 are not. Of those 20:
+
+**17 promote cleanly** — either already-projectable signatures, or `til::point` parameters
+that become the already-projected `Core::Point`:
+
+> `AnchorContextMenu`, `AttachToNewControl`, `Close`, `CopyOnSelect`,
+> `CopySelectionToClipboard`, `Detach`, `GetHyperlink`, `GotFocus`, `IsVtMouseModeEnabled`,
+> `LeftClickOnTerminal`, `LostFocus`, `SendMouseEvent`, `SetEndSelectionPoint`,
+> `SetSelectionAnchor`, `ShouldSendAlternateScroll`, `UserScrollViewport`, plus the
+> `GetFont` replacement below.
+
+**1 does not need promoting at all.** `GetFont()` is called in exactly one place
+(`_getTerminalPosition`, line 756) and only for `.GetSize()`, to convert pixels to cells.
+`IControlCore::FontSize` already returns precisely that as a `Windows.Foundation.Size`.
+Swap the call; do not widen the interface.
+
+**2 are genuinely not projectable, and they are both UIA:**
+
+| Member | Why |
+|---|---|
+| `AttachUiaEngine` / `DetachUiaEngine` | take `Microsoft::Console::Render::UiaEngine*` — a raw pointer to WT's own render engine |
+| `GetRenderData` | returns `IRenderData*`; `ControlInteractivity::GetRenderData()` is a pass-through that hands WT internals to its own callers (the automation peer) |
+
+These are one cluster, not three problems: **accessibility**. `DESIGN.md` already scopes it
+that way — *"UIA text provider (over engine buffer read-back)"* is listed among the
+cross-cutting couplings that "must be reimplemented per engine". So they get the same
+treatment as Phase 4's seventh escape (`TsfDataProvider::_getCore`): left on the concrete
+type, reimplemented per engine later, **not** forced through the interface.
+
+That makes the promotion tractable: 17 mechanical promotions, 1 deletion, and an
+accessibility cluster deferred to Phase 8 (Accessibility & packaging), which is where it
+belongs anyway.
+
+**Consequence for the MVP:** a ghostty pane will be able to take mouse and selection input
+— which is what Phase 5 needs — while its Narrator/UIA story stays cascadia-only until
+Phase 8. Worth stating in the Phase 5 exit criteria rather than discovering later.
+
 ## Prerequisite carried from Phase 4
 
 **`ControlInteractivity` must be interface-typed before a second engine can work.** It
