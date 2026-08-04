@@ -389,6 +389,12 @@ Exit criteria:
 - [ ] Tab title, resize, scrollback via scrollbar, close-confirmation all work.
 - [ ] Defterm handoff and an Azure-connection profile still work (on cascadia AND ghostty
       profiles — proves ADR 0006).
+- **Explicitly out of scope:** screen-reader support on ghostty panes. `AttachUiaEngine`/
+  `DetachUiaEngine`/`GetRenderData` hand out pointers to cascadia's own renderer objects, so
+  they stay on the concrete type and UIA remains cascadia-only until Phase 8 (which harvests
+  winghostty's MIT `win32_uia/`). Cascadia panes are unaffected, and since `engine` is
+  per-profile with cascadia the default, a Narrator user simply does not opt in. Stated here
+  so it is a known limitation rather than a discovery.
 
 Open questions — **resolved at the Phase 4→5 readiness step (2026-08-03)**; full
 research in `docs/phase-5-readiness.md`:

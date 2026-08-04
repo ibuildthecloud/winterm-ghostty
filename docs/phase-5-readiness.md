@@ -184,6 +184,34 @@ That makes the promotion tractable: 17 mechanical promotions, 1 deletion, and an
 accessibility cluster deferred to Phase 8 (Accessibility & packaging), which is where it
 belongs anyway.
 
+### Outcome — done 2026-08-04, in two commits
+
+1. `4493f27d8` put the 17 members on `IControlCore` (and dropped `GetFont`).
+2. `_core` itself is now `Control::IControlCore` rather than `com_ptr<ControlCore>`, so the
+   constructor's engine switch is the only place that names a concrete engine.
+
+Control unit tests 32/32 after each. Three things the inventory did not predict:
+
+- **How to reach the concrete core safely.** The UIA cluster needs cascadia's
+  implementation, so `_cascadiaCore()` QIs for it — and it must QI for the **`ControlCore`
+  class** interface, not `IControlCore`. Since Phase 4 made `ControlCore` a marker class,
+  `[default_interface]` gave it its own class-specific interface (visible in
+  `ControlCore.g.h`: `implements<D, Control::ControlCore, ICoreState, IControlCore, …>`),
+  which only cascadia exposes. Testing for `IControlCore` would succeed for *every* engine
+  and hand a ghostty core to `get_self<ControlCore>` — a silent wrong-type cast. This is
+  the one genuinely dangerous line in the change, and it is guarded by a comment.
+- **A null automation peer is already a supported outcome.** `OnCreateAutomationPeer`
+  returns `nullptr` for a non-cascadia engine, and `TermControl::OnCreateAutomationPeer`
+  has always treated a null interactivity peer as "no custom peer, give XAML the default
+  one". So the UIA deferral needed no new plumbing above the control.
+- **`AdjustOpacity` had two overloads, and only the two-argument one is projected.** The
+  call site bound the internal one-argument (relative) overload; it now passes
+  `relative: true` explicitly and dispatches to the same code.
+
+The unit tests reach into cascadia internals (`_terminal`, `_inUnitTests`), so their
+helper takes the concrete core through `_cascadiaCore()` too — the same path, which means
+the tests exercise it on every run.
+
 **Consequence for the MVP:** a ghostty pane will be able to take mouse and selection input
 — which is what Phase 5 needs — while its Narrator/UIA story stays cascadia-only until
 Phase 8. Worth stating in the Phase 5 exit criteria rather than discovering later.
