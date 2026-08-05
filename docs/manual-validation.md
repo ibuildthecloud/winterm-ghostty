@@ -85,10 +85,21 @@ the dispatcher and re-raise the swap chain to the new control.
 
 ## 6. Close confirmation
 
-1. Run something long-lived in a ghostty pane (`ping -t localhost`).
-2. Close the tab.
+Windows Terminal has no "a process is still running" prompt - `_ShouldWarnOnClose`
+keys off `confirmOnClose` plus the tab and pane counts, and never asks the
+core anything. So this is engine-independent by construction, and the only
+part a ghostty pane participates in is the read-only dialog, which reads
+`IControlCore::IsInReadOnlyMode`.
 
-**Pass:** the "still running" confirmation appears, as it does for cascadia.
+1. Set `"confirmOnClose": "always"`, or open two panes in one tab.
+2. Close the window. The confirmation should appear as it does with cascadia
+   panes only.
+3. Toggle read-only on the ghostty pane (`toggleReadOnlyMode`), then close the
+   pane.
+
+**Pass:** step 2 warns; step 3 shows the read-only close dialog.
+**Fail on step 3 only** would mean the ghostty core's read-only flag is not
+reaching the app.
 
 ---
 
@@ -100,6 +111,7 @@ Do not re-test these by hand unless one of them is what you are changing.
 | --- | --- |
 | Settings -> ghostty config: font quoting, infinite vs finite scrollback, zero padding, scheme and full palette | `UnitTests_Control` / `GhosttySettingsTests.cpp` |
 | `"engine": "ghostty"` parses and warns only on genuinely unknown names | `UnitTests_SettingsModel` / `ProfileTests.cpp` |
+| Engine factory: cascadia is the default, and a ghostty profile falls back to cascadia when libghostty will not start | `UnitTests_Control` / `GhosttyEngineSelectionTests.cpp` |
 | Non-ASCII output does not crash a host process | `scripts\smoke-harness.ps1` check 1 |
 | Input reaches the child over the external backend | `scripts\smoke-harness.ps1` check 2 |
 | Child output reaches the screen at all | `scripts\smoke-harness.ps1` check 3 |
