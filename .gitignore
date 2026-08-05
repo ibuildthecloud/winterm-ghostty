@@ -52,3 +52,6 @@ harness/xaml-host/*.txt
 
 harness/hwnd-host/ghostty.pdb
 harness/hwnd-host/crash.dmp
+
+# Crash dumps from debugging sessions are artifacts, not deliverables.
+*.dmp
