@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 4 Aug 2026 19:56:26 -0700
+Subject: [PATCH] windows: run the module's static initializers in DllMain
+
+Any non-ASCII byte of terminal output crashed the process with an access
+violation reading 0x78, deep inside simdutf's
+convert_utf8_to_utf32_with_errors. That address is a vtable slot off a
+null vptr: simdutf's dispatch singleton had never been constructed.
+
+Zig's DLL entry point does not run the module's static initializers, and
+the DllMain here only brought up vcrt and acrt. Neither can help - the
+.CRT$XI* and .CRT$XC* tables live in *this image*, not in the CRT. So
+every namespace-scope C++ global in libghostty.dll was left zeroed:
+simdutf's, and five glslang/SPIRV constructors besides.
+
+Run them, in MSVC's own order, using the markers and helpers the static
+CRT already links into the image rather than synthesizing our own.
+
+The order is load-bearing. An earlier attempt that walked the tables
+without __scrt_dllmain_before_initialize_c died in LoadLibrary with heap
+corruption: that call is what initializes the module's onexit tables, and
+the very first C++ initializer in the table (the standard library's
+`initlocks`) calls atexit. Without it the CRT reallocs a garbage pointer
+out of an uninitialized _onexit_table_t. cdb named all of this precisely;
+guessing at it did not.
+
+Verified: `wsl aptitude` (the original report), `printf` of box-drawing
+characters, and CJK all run without crashing, on both the exec and the
+external backends. zig build test: 3089 pass, 58 skip, 0 fail.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ee27Fih3vSPYsqrUBpUoc
+---
+ src/main_c.zig | 43 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 43 insertions(+)
+
+diff --git a/src/main_c.zig b/src/main_c.zig
+index 0125676d1..2b12391a1 100644
+--- a/src/main_c.zig
++++ b/src/main_c.zig
+@@ -260,6 +260,48 @@ pub const DllMain = if (builtin.os.tag == .windows) struct {
+     const __acrt_initialize = @extern(*const fn () callconv(.c) c_int, .{ .name = "__acrt_initialize" });
+     const __acrt_uninitialize = @extern(*const fn (c_int) callconv(.c) c_int, .{ .name = "__acrt_uninitialize" });
+ 
++    // Bringing the two CRTs up is not the whole job. A module's *static
++    // initializers* - the C++ constructors for every global in this image -
++    // live in this image, in the .CRT$XI* (C) and .CRT$XC* (C++) tables, so
++    // no amount of CRT bootstrapping runs them. MSVC's own
++    // __scrt_dllmain_crt_process_attach runs them right after the CRTs are
++    // up; Zig's DLL entry point does not, and nothing else will.
++    //
++    // Skipping them leaves every such global zeroed, which reads as a null
++    // vtable pointer at the first virtual call. simdutf is where this
++    // surfaced: its dispatch singleton is constructed this way, so the first
++    // non-ASCII byte of terminal output faulted reading 0x78 - a vtable slot
++    // off a null vptr - inside convert_utf8_to_utf32_with_errors. glslang has
++    // five more constructors in the same table.
++    //
++    // Everything below is already linked into the image by the static CRT, so
++    // this reuses the CRT's own table markers and helpers rather than
++    // synthesizing new ones. The order is MSVC's, and the order matters:
++    // __scrt_dllmain_before_initialize_c is what initializes the module's
++    // onexit tables, and an initializer that calls atexit before that (the
++    // C++ standard library's `initlocks` does, first thing) hands the CRT an
++    // uninitialized table and it reallocs a garbage pointer.
++    const PVFV = *const fn () callconv(.c) void;
++    const PIFV = *const fn () callconv(.c) c_int;
++
++    extern var __xi_a: [1]?PIFV;
++    extern var __xi_z: [1]?PIFV;
++    extern var __xc_a: [1]?PVFV;
++    extern var __xc_z: [1]?PVFV;
++
++    const _initterm = @extern(*const fn ([*]?PVFV, [*]?PVFV) callconv(.c) void, .{ .name = "_initterm" });
++    const _initterm_e = @extern(*const fn ([*]?PIFV, [*]?PIFV) callconv(.c) c_int, .{ .name = "_initterm_e" });
++    const before_initialize_c = @extern(*const fn () callconv(.c) bool, .{ .name = "__scrt_dllmain_before_initialize_c" });
++    const after_initialize_c = @extern(*const fn () callconv(.c) void, .{ .name = "__scrt_dllmain_after_initialize_c" });
++
++    fn runStaticInitializers() bool {
++        if (!before_initialize_c()) return false;
++        if (_initterm_e(&__xi_a, &__xi_z) != 0) return false;
++        after_initialize_c();
++        _initterm(&__xc_a, &__xc_z);
++        return true;
++    }
++
+     pub fn handler(_: HINSTANCE, fdwReason: DWORD, _: LPVOID) callconv(.winapi) BOOL {
+         // Only MSVC needs to bootstrap the CRT; MinGW handles it via dllcrt2.obj.
+         if (builtin.abi != .msvc) return TRUE;
+@@ -267,6 +309,7 @@ pub const DllMain = if (builtin.os.tag == .windows) struct {
+             DLL_PROCESS_ATTACH => {
+                 if (__vcrt_initialize() < 0) return FALSE;
+                 if (__acrt_initialize() < 0) return FALSE;
++                if (!runStaticInitializers()) return FALSE;
+                 return TRUE;
+             },
+             DLL_PROCESS_DETACH => {

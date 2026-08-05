@@ -1,9 +1,8 @@
 # libghostty.dll never runs its C++ static initializers
 
 Found 2026-08-04, during Phase 5, from a user report that `wsl aptitude` crashed the
-harness. Status: **root cause established, fix not landed.** This is a defect in the
-current fork (and, as far as the evidence goes, in upstream's Windows DLL story), not in
-anything Phase 5 added.
+harness. Status: **fixed** — patch 0024, `1fe550675`. This was a defect in upstream's
+Windows DLL startup, not in anything Phase 5 added.
 
 ## Symptom
 
@@ -66,7 +65,56 @@ Bracket markers in `.CRT$XCA`/`.CRT$XCZ`, walking between them:
 15 non-null entries in a 136-byte range. The markers bracket a real, plausibly-sized
 table — the walk is not wandering through unrelated `.rdata`.
 
-## Why the obvious fix does not work yet
+## The fix
+
+MSVC's `__scrt_dllmain_crt_process_attach` does five things; upstream's `DllMain` did the
+first two:
+
+1. `__vcrt_initialize()`
+2. `__acrt_initialize()`
+3. **`__scrt_dllmain_before_initialize_c()`** — initializes the module's onexit tables
+4. `_initterm_e(__xi_a, __xi_z)`, then `__scrt_dllmain_after_initialize_c()`
+5. `_initterm(__xc_a, __xc_z)` — the C++ constructors
+
+Step 3 is the one that makes the difference, and none of this needed inventing: the static
+CRT already links `__xi_a`/`__xi_z`/`__xc_a`/`__xc_z`, `_initterm`, `_initterm_e` and both
+`__scrt_dllmain_*_initialize_c` helpers into the image. The fix references them instead of
+synthesizing markers.
+
+Verified against `wsl aptitude`, box-drawing `printf`, and CJK, on both the exec and the
+external backends. `zig build test`: 3089 pass, 58 skip, 0 fail.
+
+## Why the first two attempts failed (and what actually told us)
+
+Both hand-rolled walks died in `LoadLibrary` with `STATUS_HEAP_CORRUPTION`. The reason was
+step 3, not double-initialization:
+
+```
+_DllMainCRTStartup → handler → runInitTable → atexit → _register_onexit_function
+  → _recalloc_base(block = 0x0000000050000061)  ← garbage
+     → ntdll!RtlSetUserValueHeap → access violation
+```
+
+The first C++ entry in the table is the standard library's `initlocks`, and it calls
+`atexit` immediately. With `module_local_atexit_table_initialized = false`, the CRT
+reallocs an uninitialized `_onexit_table_t`.
+
+**The static-CRT double-init theory recorded here earlier was wrong.** It was plausible —
+the `.CRT$XI*` table really is five `__acrt_initialize_*` entries — but it was reasoned
+from the link command, never measured, and it sent the investigation the wrong way. What
+settled it was installing a debugger (`winget install Microsoft.WinDbg`, which ships
+`cdb.exe`, no admin required) and asking:
+
+```
+dps ghostty_internal!crt_xc_a L12     # every entry, by name
+x ghostty_internal!*onexit*           # module_local_atexit_table_initialized = false
+x ghostty_internal!__scrt_dllmain*    # the helper that was missing
+kp 30                                 # the stack the fast-fail had been hiding
+```
+
+Fifteen minutes of debugger beat two hours of hypothesis. That is the lesson worth keeping.
+
+## What the failed attempts looked like
 
 Calling those 15 entries at `DLL_PROCESS_ATTACH`, right after `__acrt_initialize()`:
 
@@ -75,43 +123,43 @@ Calling those 15 entries at `DLL_PROCESS_ATTACH`, right after `__acrt_initialize
 | Walk `.CRT$XI*` then `.CRT$XC*` (the CRT's own order) | `STATUS_HEAP_CORRUPTION` at DLL load |
 | Walk `.CRT$XC*` only | `STATUS_HEAP_CORRUPTION` at DLL load |
 
-Both die during `LoadLibrary`, before `main` runs — nothing is printed at all. Note the
-access violation *is* gone, so the constructors do run; something in running them is
-unsafe.
+Both died during `LoadLibrary`, before `main` ran — nothing printed at all. The access
+violation *was* gone, so the constructors were running; the missing onexit-table step is
+what made running them unsafe. Neither attempt was wrong about *what* to run, only about
+what has to happen first.
 
-The likely reason is in the link command: this build links the **static** CRT
-(`-llibvcruntime -llibucrt`), so the CRT's *own* initializer entries live in the same
-table. `__acrt_initialize()` has already performed that work, and running the table then
-initializes the CRT a second time. Heap corruption at load is consistent with that.
+For the record, the table the debugger printed:
 
-Unverified — it is the leading hypothesis, not a measured conclusion.
+| `.CRT$XC*` entry | Owner |
+|---|---|
+| `std::…'initlocks'` ×2, `'init_atexit'`, `std::'_Fac_tidy_reg'`, `std::'classic_locale'`, four `std::…::id` facets | C++ standard library |
+| `_GLOBAL__sub_I_simdutf.cpp` | **simdutf — the one whose absence caused the crash** |
+| `_GLOBAL__sub_I_{GlslangToSpv,Initialize,SpvBuilder,SpvPostProcess,InReadableOrder}.cpp` | glslang / SPIRV |
 
-## Where to pick up
-
-1. Identify which of the 15 entries belong to the CRT (compare addresses against
-   `libucrt`/`libvcruntime` contributions in the map file; `zig build` can emit one).
-   If the CRT's entries can be skipped, the walk becomes safe.
-2. Or drop `__vcrt_initialize`/`__acrt_initialize` and let the tables do all of it — the
-   static CRT's own initializers are present, which is the arrangement `_initterm`
-   expects. Cheap to test, one build.
-3. Or side-step the CRT question by making the simdutf dispatch object function-local
-   (compiler-emitted lazy guard, no `.CRT$XC*` entry). Narrower, but only fixes the
-   globals we know about, and there are 15.
-4. A debugger would end this quickly. There is no `cdb` on this machine — only
-   `dbghelp.dll`. Installing the Debugging Tools for Windows feature of the SDK is
-   probably worth it before attempt 1.
-
-The attempted patch is saved outside the repo (session scratchpad,
-`crt-init-attempt.patch`); it is small enough to retype from this document.
+`.CRT$XI*` is five entries, all `__acrt_initialize_{stdio,fma3,fmode,timeset}` and
+`initialize_multibyte`.
 
 ## Consequences to fold in at the retro
 
-- **Phase 3's record needs checking.** `PLAN.md` states CJK, kana and colour emoji were
-  verified rendering in this harness on 2026-08-02. That cannot be simultaneously true
-  with "the first non-ASCII byte faults", so either the verification is misrecorded or
-  the defect appeared after it. Whether the crash reproduces at the Phase 3 commit is the
-  test; nothing in the patch series touches `src/simd/`, `pkg/` or `build.zig`, which
-  argues for the former.
+- **Phase 3's record is still unreconciled, and it is not a documentation slip.** The
+  claim is that CJK, kana and colour emoji rendered live on 2026-08-02, and the fixture
+  it used — `harness/hwnd-host/fallback-test.bat`, `chcp 65001` then `type` of a UTF-8
+  file — pushes non-ASCII through the pty, i.e. straight through the code path that
+  faulted. So it genuinely exercised the crash and reported a pass.
+
+  Re-run of that same fixture after the fix: passes, with
+  `found codepoint 0x4E2D in fallback face=Malgun Gothic` in the log.
+
+  What is *not* established is how it passed in August. Nothing in the patch series
+  touches `src/simd/`, `pkg/` or `build.zig`, and the `DllMain` shim predates Phase 3, so
+  "the defect was always there" and "Phase 3 really did render CJK" cannot both hold as
+  stated. The most plausible reconciliation is build mode — an optimized build can
+  constant-initialize what a Debug build leaves to a dynamic initializer, and Phase 3 did
+  not record which optimize level it verified under. **That is a hypothesis, deliberately
+  not asserted; it is the same reasoning-from-source that this file already caught once.**
+  Settling it costs one rebuild at the Phase 3 commit in each of Debug and ReleaseFast.
+  Worth doing at the retro, because the answer determines whether other Phase 3 results
+  carry an unrecorded build-mode dependency.
 - **The harness now has a crash handler** (`crashinfo.c`) and `build.ps1` copies the
   matching `ghostty.pdb` out of the Zig cache. Without both, this crash reports as
   `ghostty_init+0x1395` — the nearest *export*, which is actively misleading.
