@@ -50,3 +50,5 @@ harness/xaml-host/*.ilk
 harness/xaml-host/*.dll
 harness/xaml-host/*.txt
 
+harness/hwnd-host/ghostty.pdb
+harness/hwnd-host/crash.dmp

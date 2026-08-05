@@ -41,6 +41,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "crashinfo.h"
 #include "extpty.h"
 #include "ghostty.h"
 #include "winkeys.h"
@@ -225,6 +226,7 @@ static void trace(const char *msg) {
 }
 
 int main(void) {
+    crashinfo_install();
     trace("start");
     {
         char buf[8];

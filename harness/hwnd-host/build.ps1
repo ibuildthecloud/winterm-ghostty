@@ -94,11 +94,28 @@ Write-Host 'cl main.c' -ForegroundColor Cyan
 # The reserve is address space, not committed memory, so it costs nothing at
 # runtime. Note this was measured against a Debug libghostty; a Release build
 # may well fit in 1 MB (untested).
-cmd /c "`"$vcvars`" >nul 2>&1 && cd /d `"$here`" && cl /nologo /W4 /Zi /I`"$include`" /Fe:hwnd-host.exe main.c winkeys.c extpty.c /link /STACK:16777216 ghostty.lib user32.lib shcore.lib"
+cmd /c "`"$vcvars`" >nul 2>&1 && cd /d `"$here`" && cl /nologo /W4 /Zi /I`"$include`" /Fe:hwnd-host.exe main.c winkeys.c extpty.c crashinfo.c /link /STACK:16777216 ghostty.lib user32.lib shcore.lib dbghelp.lib"
 if ($LASTEXITCODE -ne 0) { throw "compile failed ($LASTEXITCODE)" }
 
 # The DLL has to sit next to the exe (or on PATH) at load time.
 Copy-Item $dll (Join-Path $here 'ghostty-internal.dll') -Force
+
+# --- Symbols ------------------------------------------------------------------
+# Without the PDB, crashinfo.c can only name the nearest *export*, which for a
+# fault deep inside libghostty is actively misleading ("ghostty_init+0x1395"
+# for a crash in simdutf). The DLL's debug directory names the PDB but zig
+# does not install it, so fish it out of the build cache. dbghelp verifies the
+# GUID, so a stale copy is ignored rather than believed - but we match on the
+# recorded name and take the newest, which in practice is the right one.
+$pdbName = 'ghostty.pdb'
+$cachePdbs = Get-ChildItem (Join-Path $RepoRoot 'ghostty\.zig-cache') -Recurse -Filter $pdbName -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending
+if ($cachePdbs) {
+    Copy-Item $cachePdbs[0].FullName (Join-Path $here $pdbName) -Force
+    Write-Host "symbols: $($cachePdbs[0].FullName)" -ForegroundColor DarkGray
+} else {
+    Write-Host "symbols: no $pdbName in the zig cache; crash stacks will be export-only" -ForegroundColor Yellow
+}
 
 Write-Host "built $exe" -ForegroundColor Green
 if ($NoRun) { return }
