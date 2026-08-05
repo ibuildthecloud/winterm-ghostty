@@ -83,6 +83,21 @@ The one that only appears if you do something odd with the window.
 **Fail:** blank pane, or input goes nowhere. Detach/attach has to re-capture
 the dispatcher and re-raise the swap chain to the new control.
 
+## 7. Keyboard input
+
+The unit tests pin the translation rules, but nothing automated presses a key.
+
+1. In a ghostty pane, type `dir` and Enter. Then `cd ..` and Enter.
+2. Backspace over some text. Use the arrow keys, Home and End.
+3. Try ctrl+c on a running command.
+
+**Pass:** what you typed is what arrives, and nothing extra happens.
+**Fail:** characters go missing, or a letter behaves like a different key -
+`d` acting like Delete, or `cd` opening cmd's "Enter command number:" prompt.
+That is the virtual key being sent where ghostty wants the native keycode.
+Steps 2 and 3 matter most: the extended keys carry a 0xE000 prefix, and
+control characters must reach ghostty as *keys*, never as text.
+
 ## 6. Close confirmation
 
 Windows Terminal has no "a process is still running" prompt - `_ShouldWarnOnClose`
@@ -112,6 +127,7 @@ Do not re-test these by hand unless one of them is what you are changing.
 | Settings -> ghostty config: font quoting, infinite vs finite scrollback, zero padding, scheme and full palette | `UnitTests_Control` / `GhosttySettingsTests.cpp` |
 | `"engine": "ghostty"` parses and warns only on genuinely unknown names | `UnitTests_SettingsModel` / `ProfileTests.cpp` |
 | Engine factory: cascadia is the default, and a ghostty profile falls back to cascadia when libghostty will not start | `UnitTests_Control` / `GhosttyEngineSelectionTests.cpp` |
+| Key translation: native keycode not virtual key, the 0xE000 extended prefix, control characters never sent as text | `UnitTests_Control` / `GhosttyKeyTests.cpp` |
 | Non-ASCII output does not crash a host process | `scripts\smoke-harness.ps1` check 1 |
 | Input reaches the child over the external backend | `scripts\smoke-harness.ps1` check 2 |
 | Child output reaches the screen at all | `scripts\smoke-harness.ps1` check 3 |
