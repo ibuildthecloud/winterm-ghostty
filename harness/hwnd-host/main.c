@@ -41,6 +41,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "extpty.h"
 #include "ghostty.h"
 #include "winkeys.h"
 
@@ -95,6 +96,26 @@ static void write_clipboard_cb(void *userdata, ghostty_clipboard_e loc,
 static void close_surface_cb(void *userdata, bool process_alive) {
     (void)userdata; (void)process_alive;
     PostQuitMessage(0);
+}
+
+// --- external termio (ADR 0006) ----------------------------------------------
+//
+// Set GHOSTTY_HARNESS_EXTERNAL=1 to run the surface on the external backend:
+// this harness owns the ConPTY and the child, exactly as Windows Terminal's
+// connection layer does, and libghostty spawns nothing. An environment
+// variable rather than a flag because ghostty_config_load_cli_args parses our
+// command line and would reject an argument it does not know.
+static bool g_external = false;
+
+// Both of these arrive on libghostty's IO thread.
+static void write_pty_cb(void *userdata, const uint8_t *data, size_t len) {
+    (void)userdata;
+    extpty_write(data, len);
+}
+
+static void resize_pty_cb(void *userdata, uint16_t cols, uint16_t rows) {
+    (void)userdata;
+    extpty_resize(cols, rows);
 }
 
 // --- Window ------------------------------------------------------------------
@@ -205,6 +226,12 @@ static void trace(const char *msg) {
 
 int main(void) {
     trace("start");
+    {
+        char buf[8];
+        g_external = GetEnvironmentVariableA("GHOSTTY_HARNESS_EXTERNAL", buf, sizeof(buf)) > 0 &&
+                     buf[0] == '1';
+        if (g_external) trace("io_backend=external (this host owns the ConPTY)");
+    }
     // Must precede window creation, or GetDpiForWindow reports 96 forever and
     // the DPI-correctness criterion is untestable.
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -237,6 +264,8 @@ int main(void) {
         .confirm_read_clipboard_cb = confirm_read_clipboard_cb,
         .write_clipboard_cb = write_clipboard_cb,
         .close_surface_cb = close_surface_cb,
+        .write_pty_cb = write_pty_cb,
+        .resize_pty_cb = resize_pty_cb,
     };
 
     g_state.app = ghostty_app_new(&runtime, config);
@@ -269,6 +298,7 @@ int main(void) {
     surface_config.platform.windows.composition = false;
     surface_config.platform.windows.shared_texture.enabled = false;
     surface_config.scale_factor = scale_for_window(g_state.hwnd);
+    if (g_external) surface_config.io_backend = GHOSTTY_IO_BACKEND_EXTERNAL;
 
     trace("calling ghostty_surface_new");
     g_state.surface = ghostty_surface_new(g_state.app, &surface_config);
@@ -279,7 +309,36 @@ int main(void) {
     trace("ghostty_surface_new ok");
 
     push_size();
+
+    // After the surface exists, so the reader thread has something to feed,
+    // and after push_size, so the grid size resize_pty_cb recorded is the one
+    // the surface actually ended up with rather than its initial guess.
+    if (g_external && !extpty_start(g_state.surface, L"cmd.exe", 0, 0)) {
+        fprintf(stderr, "extpty_start failed\n");
+        return 1;
+    }
+
     ShowWindow(g_state.hwnd, SW_SHOW);
+
+    // Unattended round-trip check: GHOSTTY_HARNESS_INPUT=dir\r drives text
+    // through the terminal's own encoder and out the write path, so an
+    // automated run can prove input reaches the child without a keyboard.
+    {
+        char input[256];
+        const DWORD n = GetEnvironmentVariableA("GHOSTTY_HARNESS_INPUT", input, sizeof(input));
+        if (n > 0 && n < sizeof(input)) {
+            // Let the child get to a prompt first; typing into cmd.exe before
+            // it is reading only proves the pipe buffers.
+            Sleep(1500);
+            // Two-character "\r" in the environment is easier to pass than a
+            // literal carriage return.
+            char *cr = strstr(input, "\\r");
+            if (cr) { cr[0] = '\r'; cr[1] = '\0'; }
+            fprintf(stderr, "[hwnd-host] sending %zu bytes of synthetic input\n", strlen(input));
+            fflush(stderr);
+            ghostty_surface_text(g_state.surface, input, strlen(input));
+        }
+    }
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
@@ -287,6 +346,8 @@ int main(void) {
         DispatchMessageW(&msg);
     }
 
+    // Before the surface, because the reader thread calls into it.
+    extpty_stop();
     ghostty_surface_free(g_state.surface);
     ghostty_app_free(g_state.app);
     return 0;
