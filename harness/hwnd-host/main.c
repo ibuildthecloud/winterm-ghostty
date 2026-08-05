@@ -141,8 +141,29 @@ static void push_size(void) {
     ghostty_surface_set_size(g_state.surface, w, h);
 }
 
+// GHOSTTY_HARNESS_EXIT_MS's and GHOSTTY_HARNESS_INPUT's timers.
+#define EXIT_TIMER_ID 1
+#define INPUT_TIMER_ID 2
+
+static char g_input[256] = {0};
+
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_TIMER:
+        if (wp == EXIT_TIMER_ID) {
+            KillTimer(hwnd, EXIT_TIMER_ID);
+            PostQuitMessage(0);
+        }
+        else if (wp == INPUT_TIMER_ID) {
+            KillTimer(hwnd, INPUT_TIMER_ID);
+            if (g_state.surface && g_input[0]) {
+                fprintf(stderr, "[hwnd-host] sending %zu bytes of synthetic input\n", strlen(g_input));
+                fflush(stderr);
+                ghostty_surface_text(g_state.surface, g_input, strlen(g_input));
+            }
+        }
+        return 0;
+
     case WM_GHOSTTY_WAKEUP:
         if (g_state.app) ghostty_app_tick(g_state.app);
         return 0;
@@ -315,30 +336,86 @@ int main(void) {
     // After the surface exists, so the reader thread has something to feed,
     // and after push_size, so the grid size resize_pty_cb recorded is the one
     // the surface actually ended up with rather than its initial guess.
-    if (g_external && !extpty_start(g_state.surface, L"cmd.exe", 0, 0)) {
+    // GHOSTTY_HARNESS_CMD overrides the child, so an unattended run can use
+    // something that prints and exits rather than an interactive shell.
+    wchar_t child[512] = L"cmd.exe";
+    {
+        wchar_t buf[512];
+        const DWORD n = GetEnvironmentVariableW(L"GHOSTTY_HARNESS_CMD", buf, 512);
+        if (n > 0 && n < 512) wcsncpy_s(child, 512, buf, _TRUNCATE);
+    }
+    if (g_external && !extpty_start(g_state.surface, child, 0, 0)) {
         fprintf(stderr, "extpty_start failed\n");
         return 1;
     }
 
     ShowWindow(g_state.hwnd, SW_SHOW);
 
+    // Unattended crash check: GHOSTTY_HARNESS_FEED=<file> pushes the file's
+    // bytes straight down the path Windows Terminal uses - the parser, the
+    // grapheme tables, the renderer - without needing a child that can be
+    // persuaded to emit them. This is how a smoke run reproduces the
+    // non-ASCII crash (see docs/sessions, patch 0024) without a keyboard.
+    {
+        char path[MAX_PATH];
+        const DWORD n = GetEnvironmentVariableA("GHOSTTY_HARNESS_FEED", path, sizeof(path));
+        if (n > 0 && n < sizeof(path)) {
+            if (!g_external) {
+                fprintf(stderr, "[hwnd-host] GHOSTTY_HARNESS_FEED needs GHOSTTY_HARNESS_EXTERNAL=1\n");
+                return 2;
+            }
+            FILE *f = fopen(path, "rb");
+            if (!f) {
+                fprintf(stderr, "[hwnd-host] cannot open feed file %s\n", path);
+                return 2;
+            }
+            static char feed[1 << 20];
+            const size_t got = fread(feed, 1, sizeof(feed), f);
+            fclose(f);
+            fprintf(stderr, "[hwnd-host] feeding %zu bytes of pty output\n", got);
+            fflush(stderr);
+            ghostty_surface_write_pty_output(g_state.surface, (const uint8_t *)feed, got);
+            ghostty_surface_render_now(g_state.surface);
+            fprintf(stderr, "[hwnd-host] feed survived\n");
+            fflush(stderr);
+        }
+    }
+
+    // Unattended runs need to end by themselves. A timer rather than a sleep
+    // so the message loop keeps running: the bugs worth catching here happen
+    // on the render and IO paths, which need the loop pumping to reach.
+    {
+        char ms[32];
+        const DWORD n = GetEnvironmentVariableA("GHOSTTY_HARNESS_EXIT_MS", ms, sizeof(ms));
+        if (n > 0 && n < sizeof(ms)) {
+            const UINT delay = (UINT)atoi(ms);
+            if (delay > 0) SetTimer(g_state.hwnd, EXIT_TIMER_ID, delay, NULL);
+        }
+    }
+
     // Unattended round-trip check: GHOSTTY_HARNESS_INPUT=dir\r drives text
     // through the terminal's own encoder and out the write path, so an
     // automated run can prove input reaches the child without a keyboard.
     {
-        char input[256];
-        const DWORD n = GetEnvironmentVariableA("GHOSTTY_HARNESS_INPUT", input, sizeof(input));
-        if (n > 0 && n < sizeof(input)) {
-            // Let the child get to a prompt first; typing into cmd.exe before
-            // it is reading only proves the pipe buffers.
-            Sleep(1500);
+        const DWORD n = GetEnvironmentVariableA("GHOSTTY_HARNESS_INPUT",
+                                                g_input, sizeof(g_input));
+        if (n > 0 && n < sizeof(g_input)) {
             // Two-character "\r" in the environment is easier to pass than a
             // literal carriage return.
-            char *cr = strstr(input, "\\r");
+            char *cr = strstr(g_input, "\\r");
             if (cr) { cr[0] = '\r'; cr[1] = '\0'; }
-            fprintf(stderr, "[hwnd-host] sending %zu bytes of synthetic input\n", strlen(input));
-            fflush(stderr);
-            ghostty_surface_text(g_state.surface, input, strlen(input));
+
+            // On a timer rather than a sleep, and after the message loop is
+            // running: typing into cmd.exe before it reaches a prompt only
+            // proves the pipe buffers, and a sleep here would stop the loop -
+            // which would hide exactly the repaint bugs this exists to catch.
+            // GHOSTTY_HARNESS_INPUT_DELAY_MS moves it, so a capture can be
+            // taken before the output it causes.
+            UINT delay = 1500;
+            char ms[32];
+            const DWORD dn = GetEnvironmentVariableA("GHOSTTY_HARNESS_INPUT_DELAY_MS", ms, sizeof(ms));
+            if (dn > 0 && dn < sizeof(ms) && atoi(ms) > 0) delay = (UINT)atoi(ms);
+            SetTimer(g_state.hwnd, INPUT_TIMER_ID, delay, NULL);
         }
     }
 

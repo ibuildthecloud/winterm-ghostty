@@ -27,6 +27,18 @@ static void trace(const char *msg) {
     fflush(stderr);
 }
 
+// GHOSTTY_HARNESS_TRACE_PTY=1 logs every write to the child. Off by default
+// because it is one line per keystroke.
+static bool trace_writes(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        char buf[8];
+        cached = GetEnvironmentVariableA("GHOSTTY_HARNESS_TRACE_PTY", buf, sizeof(buf)) > 0 &&
+                 buf[0] == '1';
+    }
+    return cached != 0;
+}
+
 // The whole point of the exercise: pty bytes in, on our thread, blocking for
 // as long as libghostty needs them. When it blocks, we stop calling ReadFile,
 // the ConPTY buffer fills, and the child throttles. No flow control of our own.
@@ -40,7 +52,18 @@ static DWORD WINAPI reader_main(LPVOID param) {
             break;
         }
         if (InterlockedCompareExchange(&g_pty.stopping, 0, 0)) break;
+        if (trace_writes()) {
+            fprintf(stderr, "[extpty] read %lu bytes from child\n", (unsigned long)n);
+            fflush(stderr);
+        }
         ghostty_surface_write_pty_output(g_pty.surface, buf, (size_t)n);
+
+        // Deliberately no render call here. Windows Terminal's control does
+        // render after every write, because libghostty's wakeup coalesces and
+        // a pane there could hold a stale frame; this harness does not, so it
+        // keeps showing what libghostty does on its own. If the two ever
+        // disagree - the harness repainting where WT does not - that
+        // difference is the finding, and compensating here would hide it.
     }
     trace("reader thread exiting");
     return 0;
@@ -54,18 +77,6 @@ void extpty_resize(uint16_t cols, uint16_t rows) {
     const COORD size = {(SHORT)cols, (SHORT)rows};
     const HRESULT hr = ResizePseudoConsole(g_pty.pc, size);
     if (FAILED(hr)) fprintf(stderr, "[extpty] ResizePseudoConsole 0x%08lx\n", (unsigned long)hr);
-}
-
-// GHOSTTY_HARNESS_TRACE_PTY=1 logs every write to the child. Off by default
-// because it is one line per keystroke.
-static bool trace_writes(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        char buf[8];
-        cached = GetEnvironmentVariableA("GHOSTTY_HARNESS_TRACE_PTY", buf, sizeof(buf)) > 0 &&
-                 buf[0] == '1';
-    }
-    return cached != 0;
 }
 
 void extpty_write(const uint8_t *data, size_t len) {
@@ -149,7 +160,11 @@ bool extpty_start(ghostty_surface_t surface, const wchar_t *cmdline,
     g_pty.reader = CreateThread(NULL, 0, reader_main, NULL, 0, NULL);
     if (!g_pty.reader) { trace("CreateThread failed"); return false; }
 
-    fprintf(stderr, "[extpty] started %ux%u\n", cols, rows);
+    // The pid is worth printing: if the child dies straight away, the pty is
+    // still there rendering an empty screen, which looks exactly like a
+    // renderer bug until you go looking for the process.
+    fprintf(stderr, "[extpty] started %ux%u, child pid %lu\n", cols, rows,
+            (unsigned long)g_pty.pi.dwProcessId);
     fflush(stderr);
     return true;
 }

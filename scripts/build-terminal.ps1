@@ -109,7 +109,12 @@ Write-Host "MSBuild: $msbuild" -ForegroundColor DarkGray
 if (-not $NoRestore) {
     $nuget = Join-Path $TerminalRoot 'dep\nuget\nuget.exe'
     Write-Host 'nuget restore dep\nuget\packages.config' -ForegroundColor Cyan
-    & $nuget restore (Join-Path $TerminalRoot 'dep\nuget\packages.config') -Verbosity quiet
+    # -PackagesDirectory is not optional: given only a packages.config, nuget
+    # derives the packages folder from the *current* directory, so restoring
+    # from anywhere but terminal/ fails with "Cannot determine the packages
+    # folder". The projects look for terminal\packages, so name it.
+    & $nuget restore (Join-Path $TerminalRoot 'dep\nuget\packages.config') `
+        -PackagesDirectory (Join-Path $TerminalRoot 'packages') -Verbosity quiet
     if ($LASTEXITCODE -ne 0) { throw "nuget restore failed ($LASTEXITCODE)" }
 }
 if ($RestoreOnly) { return }
