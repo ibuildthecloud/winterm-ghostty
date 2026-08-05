@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 4 Aug 2026 22:49:18 -0700
+Subject: [PATCH] renderer/d3d11: undo the SwapChainPanel's scale transform
+
+A swap chain bound to a XAML SwapChainPanel is always scaled by the
+display scale. On a 150% display that magnified a correctly-rendered
+surface by 1.5 and cropped it: 14px cells drew as 21px, and 119 columns
+became about 80 visible. Nothing was wrong with the sizing or the font -
+the compositor was transforming what we had already got right.
+
+The remedy is the documented one, an inverse matrix on the swap chain.
+Windows Terminal's own renderer does exactly this, and its comment says
+why better than I can: "XAML's SwapChainPanel combines the worst of both
+worlds and always applies a transform to the swap chain to make it match
+the display scale. This undoes the damage."
+
+Composition mode only; an HWND swap chain is not transformed, which is
+why the Phase 1-3 harness never saw this. Re-applied on size sync as well
+as at creation, so moving a window between monitors of different DPI, or
+a swap chain rebuilt after device loss, cannot come back untransformed.
+
+The IDXGISwapChain2 binding and the SetMatrixTransform slot were added in
+Phase 2 and never called. This calls them.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ee27Fih3vSPYsqrUBpUoc
+---
+ src/renderer/D3D11.zig            | 16 +++++++-
+ src/renderer/directx11/device.zig | 61 +++++++++++++++++++++++++++++++
+ 2 files changed, 76 insertions(+), 1 deletion(-)
+
+diff --git a/src/renderer/D3D11.zig b/src/renderer/D3D11.zig
+index a95749e65..ccfac38db 100644
+--- a/src/renderer/D3D11.zig
++++ b/src/renderer/D3D11.zig
+@@ -107,13 +107,18 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
+     };
+ 
+     const size = opts.rt_surface.size;
+-    const device = try Device.init(
++    var device = try Device.init(
+         target,
+         @max(size.width, 1),
+         @max(size.height, 1),
+         forced_driver,
+     );
+ 
++    // A SwapChainPanel scales whatever swap chain is bound to it by the
++    // display scale, so a surface rendered at native resolution is magnified
++    // and cropped unless that is undone. See Device.applyCompositionScale.
++    device.applyCompositionScale(@floatCast(opts.rt_surface.content_scale.x));
++
+     return .{
+         .alloc = alloc,
+         .blending = opts.config.blending,
+@@ -222,6 +227,15 @@ pub fn drawFrameStart(self: *D3D11) void {
+         .composition => {
+             const size = self.rt_surface.size;
+             self.device.syncToSize(size.width, size.height);
++
++            // The embedder can change the display scale without changing the
++            // size - dragging a window to a monitor at a different DPI does
++            // exactly that - so the transform is re-checked here rather than
++            // only at creation.
++            const scale: f32 = @floatCast(self.rt_surface.content_scale.x);
++            if (scale != self.device.composition_scale) {
++                self.device.applyCompositionScale(scale);
++            }
+         },
+     }
+ }
+diff --git a/src/renderer/directx11/device.zig b/src/renderer/directx11/device.zig
+index 92ce6f843..d04ff3354 100644
+--- a/src/renderer/directx11/device.zig
++++ b/src/renderer/directx11/device.zig
+@@ -105,6 +105,10 @@ pub const Device = struct {
+     width: u32,
+     height: u32,
+ 
++    /// The scale last handed to `applyCompositionScale`, so a swap chain
++    /// rebuilt after device loss can have it re-applied. 1 means untransformed.
++    composition_scale: f32 = 1.0,
++
+     /// Create a device and swap chain for `target`.
+     ///
+     /// `force_driver` pins the rasterizer instead of walking the ladder, which
+@@ -351,6 +355,58 @@ pub const Device = struct {
+ 
+     /// Resize the swap chain. No-op when the size is unchanged, and ignores
+     /// zero dimensions, which Windows sends on minimize.
++    /// Cancel the scaling XAML applies to a composition swap chain.
++    ///
++    /// A `SwapChainPanel` always scales the swap chain bound to it by the
++    /// display scale, so a surface rendered at native resolution comes out
++    /// magnified by that factor and cropped. The documented remedy is an
++    /// inverse matrix on the swap chain, and it is what Windows Terminal's own
++    /// renderer does (AtlasEngine::_updateMatrixTransform, whose comment on the
++    /// subject is worth reading).
++    ///
++    /// Only meaningful in composition mode: an HWND swap chain is not
++    /// transformed, and asking for the interface there would just fail.
++    ///
++    /// `scale` is the content scale the surface was told about - 1.5 on a 150%
++    /// display. Must be re-applied after the swap chain is replaced, since the
++    /// transform belongs to the swap chain and not to us.
++    pub fn applyCompositionScale(self: *Device, scale: f32) void {
++        switch (self.target) {
++            .hwnd => return,
++            .composition => {},
++        }
++        if (scale <= 0) return;
++
++        var sc2: ?*dxgi.IDXGISwapChain2 = null;
++        const hr = self.swap_chain.vtable.QueryInterface(
++            self.swap_chain,
++            &dxgi.IDXGISwapChain2.IID,
++            @ptrCast(&sc2),
++        );
++        if (com.FAILED(hr) or sc2 == null) {
++            log.warn("IDXGISwapChain2 unavailable; panel scaling stays uncorrected", .{});
++            return;
++        }
++        defer _ = sc2.?.Release();
++
++        const inverse = 1.0 / scale;
++        const matrix: dxgi.DXGI_MATRIX_3X2_F = .{
++            ._11 = inverse,
++            ._12 = 0,
++            ._21 = 0,
++            ._22 = inverse,
++            ._31 = 0,
++            ._32 = 0,
++        };
++        const mhr = sc2.?.SetMatrixTransform(&matrix);
++        if (com.FAILED(mhr)) {
++            log.warn("SetMatrixTransform failed: hr=0x{x}", .{@as(u32, @bitCast(mhr))});
++            return;
++        }
++
++        self.composition_scale = scale;
++    }
++
+     pub fn resize(self: *Device, width: u32, height: u32) Error!void {
+         if (width == 0 or height == 0) return;
+         if (width == self.width and height == self.height) return;
+@@ -372,6 +428,11 @@ pub const Device = struct {
+         self.width = width;
+         self.height = height;
+         try self.createRenderTarget();
++
++        // ResizeBuffers keeps the swap chain, and with it the transform - but
++        // re-applying is cheap and means a rebuilt swap chain (device loss)
++        // cannot come back untransformed.
++        self.applyCompositionScale(self.composition_scale);
+     }
+ 
+     /// Re-sync the swap chain to the window's current client size.

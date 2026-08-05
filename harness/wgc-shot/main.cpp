@@ -82,10 +82,19 @@ static int savePng(const wchar_t *path, BYTE *data, UINT w, UINT h, UINT stride)
 
 int wmain(int argc, wchar_t **argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: wgc-shot <pid> <out.png>\n");
+        fprintf(stderr, "usage: wgc-shot <pid|hwnd:N> <out.png>\n");
         return 2;
     }
-    const DWORD pid = _wtoi(argv[1]);
+    // A process can own several visible top-level windows - Windows Terminal
+    // has one per window plus the settings UI - and "whichever EnumWindows
+    // reaches first" is then a coin toss. hwnd:N targets one exactly.
+    HWND explicitHwnd = nullptr;
+    DWORD pid = 0;
+    if (wcsncmp(argv[1], L"hwnd:", 5) == 0) {
+        explicitHwnd = reinterpret_cast<HWND>(static_cast<intptr_t>(_wtoi64(argv[1] + 5)));
+    } else {
+        pid = _wtoi(argv[1]);
+    }
 
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
 
@@ -94,8 +103,10 @@ int wmain(int argc, wchar_t **argv) {
         return 1;
     }
 
-    FindCtx ctx{ pid, nullptr };
-    EnumWindows(findProc, reinterpret_cast<LPARAM>(&ctx));
+    FindCtx ctx{ pid, explicitHwnd };
+    if (!ctx.hwnd) {
+        EnumWindows(findProc, reinterpret_cast<LPARAM>(&ctx));
+    }
     if (!ctx.hwnd) { fprintf(stderr, "FAIL no visible window for pid %lu\n", pid); return 1; }
 
     wchar_t title[256] = {};
