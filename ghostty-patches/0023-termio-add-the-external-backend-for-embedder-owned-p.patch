@@ -1,0 +1,865 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 4 Aug 2026 17:04:04 -0700
+Subject: [PATCH] termio: add the external backend for embedder-owned ptys (ADR
+ 0006)
+
+Some hosts already own a pty and a process lifecycle they cannot give up.
+Windows Terminal is the case that motivated this: its ITerminalConnection
+layer owns ConPTY, and its default-terminal handoff receives an already
+running ConPTY from conhost, so there is no child left to spawn.
+
+termio.External is the second backend variant. It spawns nothing. The
+embedder pushes output in through ghostty_surface_write_pty_output and
+receives the terminal's input through two runtime callbacks, write_pty
+and resize_pty. Surfaces opt in with io_backend = external in the surface
+config; everything else keeps the exec backend and is untouched.
+
+Flow control: writePtyOutput parses on the calling thread and returns
+when the bytes are consumed. That is the backpressure. A host that cannot
+hand off its next read stops reading its pty, the pty buffer fills, and
+the child blocks on write - the same end state Exec reaches by blocking
+its gather stage when the batch ring is full, without a ring, a second
+thread, or a copy of every byte. Parsing off the io thread is not new:
+Exec's parse stage is its own thread and takes the same lock for the same
+duration. The obligation this puts on the embedder is documented at both
+the Zig and C entry points: blocking in the call is safe, blocking while
+holding a lock the terminal needs is a deadlock.
+
+resize passes the grid size out rather than letting the embedder compute
+it. The embedder's pixel-to-cell arithmetic and ours must agree exactly
+or the child is told a size the terminal is not using.
+
+The core surface asks the apprt for an external config before building
+the termio environment, since that environment exists only for a child we
+are not going to have. A surface asking for external IO without a
+write_pty callback fails at creation rather than coming up as a terminal
+that renders but cannot be typed into.
+
+zig build test: 3089 pass, 58 skip, 0 fail. Both new tests were verified
+by mutation.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ee27Fih3vSPYsqrUBpUoc
+---
+ include/ghostty.h       |  37 +++++
+ src/Surface.zig         |  74 +++++----
+ src/apprt/embedded.zig  | 119 +++++++++++++++
+ src/termio.zig          |   1 +
+ src/termio/External.zig | 324 ++++++++++++++++++++++++++++++++++++++++
+ src/termio/backend.zig  |  23 ++-
+ 6 files changed, 549 insertions(+), 29 deletions(-)
+ create mode 100644 src/termio/External.zig
+
+diff --git a/include/ghostty.h b/include/ghostty.h
+index 5019cc2a2..878e88782 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -492,6 +492,18 @@ typedef enum {
+   GHOSTTY_SURFACE_CONTEXT_SPLIT = 2,
+ } ghostty_surface_context_e;
+ 
++// Where a surface's terminal IO comes from.
++typedef enum {
++  // Ghostty spawns the child process and owns its pty. The default.
++  GHOSTTY_IO_BACKEND_EXEC = 0,
++
++  // The embedder owns the pty: it pushes output in with
++  // ghostty_surface_write_pty_output() and receives input through the
++  // write_pty_cb/resize_pty_cb runtime callbacks. Nothing is spawned, so
++  // command, working_directory and the env options are unused.
++  GHOSTTY_IO_BACKEND_EXTERNAL = 1,
++} ghostty_io_backend_e;
++
+ typedef struct {
+   ghostty_platform_e platform_tag;
+   ghostty_platform_u platform;
+@@ -505,6 +517,7 @@ typedef struct {
+   const char* initial_input;
+   bool wait_after_command;
+   ghostty_surface_context_e context;
++  ghostty_io_backend_e io_backend;
+ } ghostty_surface_config_s;
+ 
+ typedef struct {
+@@ -1048,6 +1061,8 @@ typedef void (*ghostty_runtime_write_clipboard_cb)(void*,
+                                                    size_t,
+                                                    bool);
+ typedef void (*ghostty_runtime_close_surface_cb)(void*, bool);
++typedef void (*ghostty_runtime_write_pty_cb)(void*, const uint8_t*, size_t);
++typedef void (*ghostty_runtime_resize_pty_cb)(void*, uint16_t, uint16_t);
+ typedef bool (*ghostty_runtime_action_cb)(ghostty_app_t,
+                                           ghostty_target_s,
+                                           ghostty_action_s);
+@@ -1061,6 +1076,18 @@ typedef struct {
+   ghostty_runtime_confirm_read_clipboard_cb confirm_read_clipboard_cb;
+   ghostty_runtime_write_clipboard_cb write_clipboard_cb;
+   ghostty_runtime_close_surface_cb close_surface_cb;
++
++  // Required for surfaces created with GHOSTTY_IO_BACKEND_EXTERNAL, ignored
++  // otherwise. Both are called on the surface IO thread, never on the thread
++  // that calls ghostty_surface_write_pty_output().
++  //
++  // write_pty_cb receives bytes destined for the child - key encodings,
++  // pastes, replies to terminal queries - valid only for the call.
++  // resize_pty_cb receives the new grid size (columns, rows); pass it to
++  // whatever resizes your pty, rather than computing cells yourself, so the
++  // child is never told a size the terminal is not using.
++  ghostty_runtime_write_pty_cb write_pty_cb;
++  ghostty_runtime_resize_pty_cb resize_pty_cb;
+ } ghostty_runtime_config_s;
+ 
+ // apprt.ipc.Target.Key
+@@ -1165,6 +1192,16 @@ GHOSTTY_API void* ghostty_surface_get_swap_chain_handle(ghostty_surface_t);
+ // chain object directly. Null under the same conditions as above. The
+ // reference is borrowed; AddRef before retaining it.
+ GHOSTTY_API void* ghostty_surface_get_swap_chain(ghostty_surface_t);
++// Feed pty output into a surface created with GHOSTTY_IO_BACKEND_EXTERNAL.
++//
++// The bytes are parsed before this returns, and that is the flow control: a
++// busy terminal makes the call take longer, the caller stops reading its pty,
++// and the child blocks on write. Call it from the thread that reads the pty,
++// and hold no lock across it that the terminal could need.
++//
++// Splits anywhere - mid-sequence, mid-codepoint - are fine; parser state
++// carries across calls. Does nothing for surfaces that own their own child.
++GHOSTTY_API void ghostty_surface_write_pty_output(ghostty_surface_t, const uint8_t*, size_t);
+ GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);
+ GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
+ GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 8c676b5f0..c61f258df 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -636,37 +636,51 @@ pub fn init(
+     // This separate block ({}) is important because our errdefers must
+     // be scoped here to be valid.
+     {
+-        var env = rt_surface.defaultTermioEnv() catch |err| env: {
+-            // If an error occurs, we don't want to block surface startup.
+-            log.warn("error getting env map for surface err={}", .{err});
+-            break :env global.environMap() catch std.process.Environ.Map.init(alloc);
++        // An apprt may own the pty itself, in which case we spawn nothing and
++        // it feeds us bytes instead; see termio.External. Asked before the
++        // environment is built because that environment exists only for a
++        // child we are not going to have.
++        const external_cfg: ?termio.External.Config = external: {
++            if (!@hasDecl(apprt.Surface, "externalTermio")) break :external null;
++            break :external rt_surface.externalTermio();
+         };
+-        errdefer env.deinit();
+ 
+-        // don't leak GHOSTTY_LOG to any subprocesses
+-        _ = env.orderedRemove("GHOSTTY_LOG");
++        var io_backend: termio.Backend = backend: {
++            if (external_cfg) |cfg| break :backend .{
++                .external = try termio.External.init(alloc, cfg),
++            };
+ 
+-        var buf: [18]u8 = undefined;
+-        try env.put(
+-            "GHOSTTY_SURFACE_ID",
+-            std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
+-        );
++            var env = rt_surface.defaultTermioEnv() catch |err| env: {
++                // If an error occurs, we don't want to block surface startup.
++                log.warn("error getting env map for surface err={}", .{err});
++                break :env global.environMap() catch std.process.Environ.Map.init(alloc);
++            };
++            errdefer env.deinit();
+ 
+-        // Initialize our IO backend
+-        var io_exec = try termio.Exec.init(alloc, .{
+-            .command = command,
+-            .env = env,
+-            .env_override = config.env,
+-            .shell_integration = config.@"shell-integration",
+-            .shell_integration_features = config.@"shell-integration-features",
+-            .cursor_blink = config.@"cursor-style-blink",
+-            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+-            .resources_dir = global.resourcesDir().host(),
+-            .term = config.term,
+-            .rt_pre_exec_info = .init(config),
+-            .rt_post_fork_info = .init(config),
+-        });
+-        errdefer io_exec.deinit();
++            // don't leak GHOSTTY_LOG to any subprocesses
++            _ = env.orderedRemove("GHOSTTY_LOG");
++
++            var buf: [18]u8 = undefined;
++            try env.put(
++                "GHOSTTY_SURFACE_ID",
++                std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
++            );
++
++            break :backend .{ .exec = try termio.Exec.init(alloc, .{
++                .command = command,
++                .env = env,
++                .env_override = config.env,
++                .shell_integration = config.@"shell-integration",
++                .shell_integration_features = config.@"shell-integration-features",
++                .cursor_blink = config.@"cursor-style-blink",
++                .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
++                .resources_dir = global.resourcesDir().host(),
++                .term = config.term,
++                .rt_pre_exec_info = .init(config),
++                .rt_post_fork_info = .init(config),
++            }) };
++        };
++        errdefer io_backend.deinit();
+ 
+         // Initialize our IO mailbox
+         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
+@@ -676,7 +690,7 @@ pub fn init(
+             .size = size,
+             .full_config = config,
+             .config = try termio.Termio.DerivedConfig.init(alloc, config),
+-            .backend = .{ .exec = io_exec },
++            .backend = io_backend,
+             .mailbox = io_mailbox,
+             .renderer_state = &self.renderer_state,
+             .renderer_wakeup = render_thread.wakeup,
+@@ -1333,6 +1347,10 @@ fn childExitedAbnormally(
+     // Build up our command for the error message
+     const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
+         .exec => |*exec| exec.subprocess.args,
++
++        // We did not spawn the child, so we have no command to name. The
++        // message reads "The application ... exited" without one.
++        .external => &.{},
+     });
+     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
+ 
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index 0c3fcd467..7c5bfb53f 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -16,6 +16,7 @@ const input = @import("../input.zig");
+ const internal_os = @import("../os/main.zig");
+ const renderer = @import("../renderer.zig");
+ const terminal = @import("../terminal/main.zig");
++const termio = @import("../termio.zig");
+ const CoreApp = @import("../App.zig");
+ const CoreInspector = @import("../inspector/main.zig").Inspector;
+ const CoreSurface = @import("../Surface.zig");
+@@ -79,6 +80,24 @@ pub const App = struct {
+ 
+         /// Close the current surface given by this function.
+         close_surface: ?*const fn (SurfaceUD, bool) callconv(.c) void = null,
++
++        /// Bytes the terminal wants to send to the child process: key
++        /// encodings, pastes, and replies to terminal queries. Required for
++        /// surfaces created with `io_backend = external`, ignored otherwise.
++        ///
++        /// Called on the surface's IO thread, never the thread that calls
++        /// ghostty_surface_write_pty_output. The data is only valid for the
++        /// duration of the call.
++        write_pty: ?*const fn (SurfaceUD, [*]const u8, usize) callconv(.c) void = null,
++
++        /// The terminal's grid size changed and the embedder, which owns the
++        /// pty, should tell the child. Required for surfaces created with
++        /// `io_backend = external`, ignored otherwise.
++        ///
++        /// Passing the size rather than letting the embedder compute it is
++        /// deliberate: its pixel-to-cell arithmetic and ours must agree
++        /// exactly, or the child is told a size the terminal is not using.
++        resize_pty: ?*const fn (SurfaceUD, u16, u16) callconv(.c) void = null,
+     };
+ 
+     /// This is the key event sent for ghostty_surface_key and
+@@ -501,6 +520,9 @@ pub const Surface = struct {
+     cursor_pos: apprt.CursorPos,
+     inspector: ?*Inspector = null,
+ 
++    /// Where our terminal IO comes from. See Options.io_backend.
++    io_backend: IoBackend = .exec,
++
+     /// The current title of the surface. The embedded apprt saves this so
+     /// that getTitle works without the implementer needing to save it.
+     title: ?[:0]const u8 = null,
+@@ -546,11 +568,39 @@ pub const Surface = struct {
+ 
+         /// Context for the new surface
+         context: apprt.surface.NewSurfaceContext = .window,
++
++        /// Where this surface's terminal IO comes from.
++        io_backend: IoBackend = .exec,
++    };
++
++    /// The source of a surface's terminal IO.
++    pub const IoBackend = enum(c_int) {
++        /// Ghostty spawns the child process and owns its pty. This is the
++        /// default and what a standalone terminal wants.
++        exec = 0,
++
++        /// The embedder owns the pty. It pushes output in with
++        /// ghostty_surface_write_pty_output and receives input through the
++        /// write_pty/resize_pty callbacks in the runtime config. Nothing is
++        /// spawned; `command`, `working_directory` and the environment
++        /// options are unused.
++        ///
++        /// This is for hosts that already have a process and a pty they
++        /// cannot give up - Windows Terminal's connection layer, for one.
++        external = 1,
+     };
+ 
+     pub fn init(self: *Surface, app: *App, opts: Options) !void {
+         const platform: Platform = try .init(opts.platform_tag, opts.platform);
+ 
++        // A surface that does not spawn its own child is useless if we have
++        // no way to hand that child its input. Fail here rather than come up
++        // as a terminal that renders but cannot be typed into.
++        if (opts.io_backend == .external and app.opts.write_pty == null) {
++            log.err("io_backend=external requires the write_pty runtime callback", .{});
++            return error.ExternalIoRequiresWriteCallback;
++        }
++
+         // Prefer a size the platform can tell us over the placeholder below.
+         // The pty is sized and the child spawned during this init, so a size
+         // pushed afterwards arrives too late for whatever the child already
+@@ -580,6 +630,7 @@ pub const Surface = struct {
+             },
+             .size = initial_size,
+             .cursor_pos = .{ .x = -1, .y = -1 },
++            .io_backend = opts.io_backend,
+         };
+ 
+         // Add ourselves to the list of surfaces on the app.
+@@ -1054,6 +1105,43 @@ pub const Surface = struct {
+         };
+     }
+ 
++    /// The external-IO configuration for this surface, or null if ghostty
++    /// should spawn and own the child itself. Read by the core surface while
++    /// it builds its termio backend.
++    pub fn externalTermio(self: *Surface) ?termio.External.Config {
++        if (self.io_backend != .external) return null;
++        return .{ .handler = .{ .ctx = self, .vtable = &external_vtable } };
++    }
++
++    const external_vtable: termio.External.Handler.VTable = .{
++        .write = externalWrite,
++        .resize = externalResize,
++    };
++
++    fn externalWrite(ctx: ?*anyopaque, data: []const u8) void {
++        const self: *Surface = @ptrCast(@alignCast(ctx.?));
++
++        // Checked at surface creation, so this is only reachable if the
++        // embedder mutated its runtime config after the fact.
++        const cb = self.app.opts.write_pty orelse return;
++        cb(self.userdata, data.ptr, data.len);
++    }
++
++    fn externalResize(
++        ctx: ?*anyopaque,
++        grid_size: renderer.GridSize,
++        screen_size: renderer.ScreenSize,
++    ) void {
++        const self: *Surface = @ptrCast(@alignCast(ctx.?));
++
++        // The pixel size is ours to render into; the child only ever learns
++        // the cell grid, which is what every pty resize API takes.
++        _ = screen_size;
++
++        const cb = self.app.opts.resize_pty orelse return;
++        cb(self.userdata, grid_size.columns, grid_size.rows);
++    }
++
+     pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
+         _ = self;
+         var env = try global.environMap();
+@@ -1693,6 +1781,37 @@ pub const CAPI = struct {
+         return null;
+     }
+ 
++    /// Feed pty output into a surface created with `io_backend = external`.
++    ///
++    /// The bytes are parsed before this returns, and that is the flow control:
++    /// a busy terminal makes this call take longer, the caller stops reading
++    /// its pty, and the child blocks on write. Call it from the thread that
++    /// reads the pty, and hold no lock across it that the terminal could need
++    /// - blocking here is safe, blocking here with a lock held is a deadlock.
++    ///
++    /// Bytes must be a UTF-8 (or otherwise 8-bit) stream in pty order. Splits
++    /// anywhere, including mid-escape-sequence and mid-codepoint, are fine:
++    /// the parser holds its state across calls.
++    ///
++    /// Does nothing for surfaces that own their own child process.
++    export fn ghostty_surface_write_pty_output(
++        surface: *Surface,
++        data: [*]const u8,
++        len: usize,
++    ) void {
++        switch (surface.core_surface.io.backend) {
++            .external => |*ext| ext.writePtyOutput(
++                &surface.core_surface.io,
++                data[0..len],
++            ),
++
++            .exec => log.warn(
++                "write_pty_output called on a surface that owns its own pty",
++                .{},
++            ),
++        }
++    }
++
+     /// Returns the userdata associated with the surface.
+     export fn ghostty_surface_userdata(surface: *Surface) ?*anyopaque {
+         return surface.userdata;
+diff --git a/src/termio.zig b/src/termio.zig
+index b16885109..f0dab45bb 100644
+--- a/src/termio.zig
++++ b/src/termio.zig
+@@ -23,6 +23,7 @@ const message = @import("termio/message.zig");
+ pub const backend = @import("termio/backend.zig");
+ pub const mailbox = @import("termio/mailbox.zig");
+ pub const Exec = @import("termio/Exec.zig");
++pub const External = @import("termio/External.zig");
+ pub const Options = @import("termio/Options.zig");
+ pub const Termio = @import("termio/Termio.zig");
+ pub const Thread = @import("termio/Thread.zig");
+diff --git a/src/termio/External.zig b/src/termio/External.zig
+new file mode 100644
+index 000000000..6aad31818
+--- /dev/null
++++ b/src/termio/External.zig
+@@ -0,0 +1,324 @@
++//! External implements a termio backend for embedders that own the pty
++//! themselves. Where `Exec` spawns a child and reads its pty, this backend
++//! spawns nothing: the embedder pushes output bytes in with `writePtyOutput`
++//! and receives the terminal's input bytes through a callback.
++//!
++//! This exists because some hosts already have a pty and a process lifecycle
++//! of their own that they cannot give up. Windows Terminal is the motivating
++//! case: its `ITerminalConnection` layer owns ConPTY, and its default-terminal
++//! handoff receives an *already running* ConPTY from conhost, so there is no
++//! child left for us to spawn.
++//!
++//! ## Flow control
++//!
++//! `writePtyOutput` parses on the calling thread and returns when the bytes
++//! have been consumed. That *is* the backpressure: a host that cannot hand
++//! off its next read stops reading its pty, the pty's buffer fills, and the
++//! child blocks on write. It is the same end state `Exec` reaches by blocking
++//! its gather stage when the batch ring is full, reached without a ring,
++//! a second thread, or a copy of every byte.
++//!
++//! The obligation this puts on the embedder is therefore: **do not call
++//! `writePtyOutput` while holding a lock that the terminal's render or io
++//! threads can need.** Blocking the caller is safe; blocking it while holding
++//! something the engine wants is a deadlock.
++const External = @This();
++
++const std = @import("std");
++const Allocator = std.mem.Allocator;
++const global = @import("../global.zig");
++const renderer = @import("../renderer.zig");
++const terminal = @import("../terminal/main.zig");
++const termio = @import("../termio.zig");
++const ProcessInfo = @import("../pty.zig").ProcessInfo;
++
++const log = std.log.scoped(.io_external);
++
++/// The embedder's side of the pty. All of these are called from the terminal's
++/// threads, never from the thread that calls `writePtyOutput`.
++pub const Handler = struct {
++    ctx: ?*anyopaque,
++    vtable: *const VTable,
++
++    pub const VTable = struct {
++        /// Bytes the terminal wants to send to the child (key encodings,
++        /// paste, terminal report replies). Called on the io thread. The
++        /// slice is only valid for the duration of the call.
++        write: *const fn (ctx: ?*anyopaque, data: []const u8) void,
++
++        /// The terminal's grid was resized. The embedder owns the pty, so it
++        /// owns telling the child. Called on the io thread, and once during
++        /// terminal init before the io thread starts.
++        ///
++        /// The size is passed rather than left for the embedder to compute:
++        /// the embedder's pixel-to-cell arithmetic and ours must agree
++        /// exactly or the child is told a size the terminal is not using.
++        resize: *const fn (
++            ctx: ?*anyopaque,
++            grid_size: renderer.GridSize,
++            screen_size: renderer.ScreenSize,
++        ) void,
++    };
++
++    fn write(self: Handler, data: []const u8) void {
++        self.vtable.write(self.ctx, data);
++    }
++
++    fn resize(
++        self: Handler,
++        grid_size: renderer.GridSize,
++        screen_size: renderer.ScreenSize,
++    ) void {
++        self.vtable.resize(self.ctx, grid_size, screen_size);
++    }
++};
++
++pub const Config = struct {
++    handler: Handler,
++};
++
++/// The embedder's side of the pty.
++handler: Handler,
++
++/// Serializes `writePtyOutput` callers. The embedder is expected to have a
++/// single reader thread, but `ITerminalConnection`-style interfaces do not
++/// promise that, and interleaving two threads' bytes mid-escape-sequence
++/// would corrupt the stream rather than merely reorder it.
++write_mutex: std.Io.Mutex = .init,
++
++pub fn init(_: Allocator, cfg: Config) !External {
++    return .{ .handler = cfg.handler };
++}
++
++pub fn deinit(self: *External) void {
++    _ = self;
++}
++
++/// Call to initialize the terminal state as necessary for this backend.
++/// This is called before any termio begins.
++pub fn initTerminal(self: *External, term: *terminal.Terminal) void {
++    // Tell the embedder the size we start at, the same way Exec sizes its
++    // pty here. Without this the child would run at whatever size the
++    // embedder guessed before the terminal existed.
++    self.resize(.{
++        .columns = term.cols,
++        .rows = term.rows,
++    }, .{
++        .width = term.width_px,
++        .height = term.height_px,
++    }) catch unreachable;
++}
++
++pub fn threadEnter(
++    self: *External,
++    alloc: Allocator,
++    io: *termio.Termio,
++    td: *termio.Termio.ThreadData,
++) !void {
++    _ = self;
++    _ = alloc;
++    _ = io;
++
++    // There is nothing to start: no child, and no read thread, because the
++    // embedder's own reader calls writePtyOutput directly.
++    td.backend = .{ .external = .{} };
++}
++
++pub fn threadExit(self: *External, td: *termio.Termio.ThreadData) void {
++    _ = self;
++    _ = td;
++}
++
++pub fn focusGained(
++    self: *External,
++    td: *termio.Termio.ThreadData,
++    focused: bool,
++) !void {
++    _ = self;
++    _ = td;
++    _ = focused;
++
++    // Exec polls termios here to decide whether the child wants focus
++    // reporting. We have no pty to ask, so focus events are the embedder's
++    // to report if it wants them.
++}
++
++pub fn resize(
++    self: *External,
++    grid_size: renderer.GridSize,
++    screen_size: renderer.ScreenSize,
++) !void {
++    self.handler.resize(grid_size, screen_size);
++}
++
++pub fn queueWrite(
++    self: *External,
++    alloc: Allocator,
++    td: *termio.Termio.ThreadData,
++    data: []const u8,
++    linefeed: bool,
++) !void {
++    _ = alloc;
++    _ = td;
++
++    // Exec chunks into pooled buffers because it hands them to an async
++    // write queue that outlives the call. Our handler writes synchronously,
++    // so the only reason to touch the data at all is the linefeed rewrite.
++    if (!linefeed) {
++        self.handler.write(data);
++        return;
++    }
++
++    var buf: [4096]u8 = undefined;
++    var i: usize = 0;
++    var rest = data;
++    while (rest.len > 0) {
++        const ch = rest[0];
++        rest = rest[1..];
++
++        if (ch != '\r') {
++            buf[i] = ch;
++            i += 1;
++        } else {
++            buf[i] = '\r';
++            buf[i + 1] = '\n';
++            i += 2;
++        }
++
++        // Flush with room to spare for the two bytes a \r can become.
++        if (i >= buf.len - 1) {
++            self.handler.write(buf[0..i]);
++            i = 0;
++        }
++    }
++    if (i > 0) self.handler.write(buf[0..i]);
++}
++
++pub fn childExitedAbnormally(
++    self: *External,
++    gpa: Allocator,
++    t: *terminal.Terminal,
++    exit_code: u32,
++    runtime_ms: u64,
++) !void {
++    _ = self;
++    _ = gpa;
++    _ = t;
++    _ = exit_code;
++    _ = runtime_ms;
++
++    // Unreachable in practice: this is driven by our own child-exit watcher,
++    // and we have no child. The embedder owns the process lifecycle and
++    // whatever it wants to show when it ends.
++}
++
++pub fn getProcessInfo(self: *External, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
++    _ = self;
++
++    // The embedder owns the process and the pty, so it is the one that can
++    // answer these. Everything that consumes them treats null as "unknown".
++    return null;
++}
++
++/// Feed pty output into the terminal.
++///
++/// Called from whatever thread the embedder reads its pty on - NOT the io
++/// thread. That is not a special case: `Exec`'s parse stage is a dedicated
++/// thread too, and this takes the same lock it does, for the same duration.
++///
++/// Returns when the bytes have been parsed. See the flow-control note at the
++/// top of this file for what the caller may not be holding when it calls.
++pub fn writePtyOutput(self: *External, io: *termio.Termio, data: []const u8) void {
++    self.write_mutex.lockUncancelable(global.io());
++    defer self.write_mutex.unlock(global.io());
++
++    io.processOutput(data);
++
++    // Hand the renderer state mutex off if the renderer is waiting on it.
++    // Without this a saturated stream keeps re-acquiring it and the surface
++    // stops painting while the flood runs. See renderer.State.lockDemand.
++    io.renderer_state.yieldToDemand(global.io());
++}
++
++/// The thread local data for the external implementation. There is none:
++/// no child to watch, no write queue to drain, no read thread to join.
++pub const ThreadData = struct {
++    pub fn deinit(self: *ThreadData, alloc: Allocator) void {
++        _ = self;
++        _ = alloc;
++    }
++};
++
++test "queueWrite linefeed rewrites CR to CRLF" {
++    const testing = std.testing;
++
++    const Collect = struct {
++        buf: [64]u8 = undefined,
++        len: usize = 0,
++
++        fn onWrite(ctx: ?*anyopaque, data: []const u8) void {
++            const self: *@This() = @ptrCast(@alignCast(ctx.?));
++            @memcpy(self.buf[self.len..][0..data.len], data);
++            self.len += data.len;
++        }
++
++        fn onResize(_: ?*anyopaque, _: renderer.GridSize, _: renderer.ScreenSize) void {}
++
++        const vtable: Handler.VTable = .{ .write = &onWrite, .resize = &onResize };
++
++        fn items(self: *const @This()) []const u8 {
++            return self.buf[0..self.len];
++        }
++    };
++
++    var collect: Collect = .{};
++
++    var ext: External = try .init(testing.allocator, .{ .handler = .{
++        .ctx = &collect,
++        .vtable = &Collect.vtable,
++    } });
++    defer ext.deinit();
++
++    var td: termio.Termio.ThreadData = undefined;
++    try ext.queueWrite(testing.allocator, &td, "a\rb\r", true);
++    try testing.expectEqualStrings("a\r\nb\r\n", collect.items());
++
++    collect.len = 0;
++    try ext.queueWrite(testing.allocator, &td, "a\rb\r", false);
++    try testing.expectEqualStrings("a\rb\r", collect.items());
++}
++
++test "resize is forwarded to the embedder" {
++    const testing = std.testing;
++
++    const Collect = struct {
++        grid: ?renderer.GridSize = null,
++        screen: ?renderer.ScreenSize = null,
++
++        fn onWrite(_: ?*anyopaque, _: []const u8) void {}
++
++        fn onResize(
++            ctx: ?*anyopaque,
++            grid_size: renderer.GridSize,
++            screen_size: renderer.ScreenSize,
++        ) void {
++            const self: *@This() = @ptrCast(@alignCast(ctx.?));
++            self.grid = grid_size;
++            self.screen = screen_size;
++        }
++
++        const vtable: Handler.VTable = .{ .write = &onWrite, .resize = &onResize };
++    };
++
++    var collect: Collect = .{};
++    var ext: External = try .init(testing.allocator, .{ .handler = .{
++        .ctx = &collect,
++        .vtable = &Collect.vtable,
++    } });
++    defer ext.deinit();
++
++    try ext.resize(.{ .columns = 80, .rows = 24 }, .{ .width = 800, .height = 480 });
++    try testing.expectEqual(@as(u16, 80), collect.grid.?.columns);
++    try testing.expectEqual(@as(u16, 24), collect.grid.?.rows);
++    try testing.expectEqual(@as(u32, 800), collect.screen.?.width);
++}
+diff --git a/src/termio/backend.zig b/src/termio/backend.zig
+index c29009acb..3a8032572 100644
+--- a/src/termio/backend.zig
++++ b/src/termio/backend.zig
+@@ -11,28 +11,35 @@ const ProcessInfo = @import("../pty.zig").ProcessInfo;
+ const WRITE_REQ_PREALLOC = std.math.pow(usize, 2, 5);
+ 
+ /// The kinds of backends.
+-pub const Kind = enum { exec };
++pub const Kind = enum { exec, external };
+ 
+ /// Configuration for the various backend types.
+ pub const Config = union(Kind) {
+     /// Exec uses posix exec to run a command with a pty.
+     exec: termio.Exec.Config,
++
++    /// External has no pty of its own: the embedder owns one and pushes
++    /// output in through Termio.processOutput.
++    external: termio.External.Config,
+ };
+ 
+ /// Backend implementations. A backend is responsible for owning the pty
+ /// behavior and providing read/write capabilities.
+ pub const Backend = union(Kind) {
+     exec: termio.Exec,
++    external: termio.External,
+ 
+     pub fn deinit(self: *Backend) void {
+         switch (self.*) {
+             .exec => |*exec| exec.deinit(),
++            .external => |*ext| ext.deinit(),
+         }
+     }
+ 
+     pub fn initTerminal(self: *Backend, t: *terminal.Terminal) void {
+         switch (self.*) {
+             .exec => |*exec| exec.initTerminal(t),
++            .external => |*ext| ext.initTerminal(t),
+         }
+     }
+ 
+@@ -44,12 +51,14 @@ pub const Backend = union(Kind) {
+     ) !void {
+         switch (self.*) {
+             .exec => |*exec| try exec.threadEnter(alloc, io, td),
++            .external => |*ext| try ext.threadEnter(alloc, io, td),
+         }
+     }
+ 
+     pub fn threadExit(self: *Backend, td: *termio.Termio.ThreadData) void {
+         switch (self.*) {
+             .exec => |*exec| exec.threadExit(td),
++            .external => |*ext| ext.threadExit(td),
+         }
+     }
+ 
+@@ -60,6 +69,7 @@ pub const Backend = union(Kind) {
+     ) !void {
+         switch (self.*) {
+             .exec => |*exec| try exec.focusGained(td, focused),
++            .external => |*ext| try ext.focusGained(td, focused),
+         }
+     }
+ 
+@@ -70,6 +80,7 @@ pub const Backend = union(Kind) {
+     ) !void {
+         switch (self.*) {
+             .exec => |*exec| try exec.resize(grid_size, screen_size),
++            .external => |*ext| try ext.resize(grid_size, screen_size),
+         }
+     }
+ 
+@@ -82,6 +93,7 @@ pub const Backend = union(Kind) {
+     ) !void {
+         switch (self.*) {
+             .exec => |*exec| try exec.queueWrite(alloc, td, data, linefeed),
++            .external => |*ext| try ext.queueWrite(alloc, td, data, linefeed),
+         }
+     }
+ 
+@@ -99,6 +111,12 @@ pub const Backend = union(Kind) {
+                 exit_code,
+                 runtime_ms,
+             ),
++            .external => |*ext| try ext.childExitedAbnormally(
++                gpa,
++                t,
++                exit_code,
++                runtime_ms,
++            ),
+         }
+     }
+ 
+@@ -108,6 +126,7 @@ pub const Backend = union(Kind) {
+     pub fn getProcessInfo(self: *Backend, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
+         return switch (self.*) {
+             .exec => |*exec| exec.getProcessInfo(info),
++            .external => |*ext| ext.getProcessInfo(info),
+         };
+     }
+ };
+@@ -115,10 +134,12 @@ pub const Backend = union(Kind) {
+ /// Termio thread data. See termio.ThreadData for docs.
+ pub const ThreadData = union(Kind) {
+     exec: termio.Exec.ThreadData,
++    external: termio.External.ThreadData,
+ 
+     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
+         switch (self.*) {
+             .exec => |*exec| exec.deinit(alloc),
++            .external => |*ext| ext.deinit(alloc),
+         }
+     }
+ 

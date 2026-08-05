@@ -92,6 +92,31 @@ thread needs. If the handler does nothing but convert bytes and call in, there i
 edge. This belongs in a comment at the call site, because it is invisible at the point
 where someone would later be tempted to take a lock "just for a moment".
 
+### As built (2026-08-04) — A, minus the ring
+
+`ghostty_surface_write_pty_output` **parses on the calling thread** and returns when the
+bytes are consumed, rather than publishing into a ring for a separate parse thread. Still
+design A — the producer blocks, the pty fills, the child throttles — but without the
+intermediate stage.
+
+The ring's purpose is to overlap "read the pty" with "parse the last batch". **WT already
+does exactly that overlap, on its side.** `ConptyConnection::_OutputThread` keeps an
+overlapped `ReadFile` of a 128 KiB buffer in flight *while* it raises `TerminalOutput` on
+the previous string — that is the whole reason the loop is shaped the way it is
+(`ConptyConnection.cpp:761`). A ring inside the backend would be a second copy of the same
+pipelining, costing a thread and a copy of every byte per surface to buy at most one more
+batch of lookahead.
+
+Parsing off the io thread is not a new hazard: `Exec`'s parse stage is its own thread too,
+and `Termio.processOutput` is documented upstream as "the manual API that users can call
+with pty data". The external path takes the same lock, for the same duration, from a
+different thread. `yieldToDemand` is called after each batch, exactly as the parse stage
+does — without it a flood starves the renderer.
+
+If measurement later shows the embedder's thread is the bottleneck, the ring is a strictly
+internal change: the C entry point's contract ("returns when we have taken the bytes")
+already permits it.
+
 ### Open risk to measure in-phase
 
 PLAN's own re-evaluation question — *backpressure under a `yes`/`cat` flood* — stays. The
