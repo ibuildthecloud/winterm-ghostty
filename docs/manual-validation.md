@@ -83,7 +83,7 @@ The one that only appears if you do something odd with the window.
 **Fail:** blank pane, or input goes nowhere. Detach/attach has to re-capture
 the dispatcher and re-raise the swap chain to the new control.
 
-## 7. Keyboard input
+## 6. Keyboard input
 
 The unit tests pin the translation rules, but nothing automated presses a key.
 
@@ -98,7 +98,7 @@ That is the virtual key being sent where ghostty wants the native keycode.
 Steps 2 and 3 matter most: the extended keys carry a 0xE000 prefix, and
 control characters must reach ghostty as *keys*, never as text.
 
-## 6. Close confirmation
+## 7. Close confirmation
 
 Windows Terminal has no "a process is still running" prompt - `_ShouldWarnOnClose`
 keys off `confirmOnClose` plus the tab and pane counts, and never asks the
