@@ -110,7 +110,28 @@ static void confirm_read_clipboard_cb(void *userdata, const char *str,
 static void write_clipboard_cb(void *userdata, ghostty_clipboard_e loc,
                                const ghostty_clipboard_content_s *content,
                                size_t content_len, bool confirm) {
-    (void)userdata; (void)loc; (void)content; (void)content_len; (void)confirm;
+    (void)userdata; (void)loc; (void)confirm;
+
+    // Windows Terminal puts plain text and HTML on the clipboard together, and
+    // this array of {mime, data} is the only place the styled representation
+    // exists - read-back carries no attributes and could never produce it. So
+    // what arrives here *is* the answer to "does HTML copy carry colours".
+    for (size_t i = 0; i < content_len; i++) {
+        fprintf(stderr, "[clip] mime=%s len=%zu", content[i].mime,
+                content[i].data ? strlen(content[i].data) : (size_t)0);
+        if (content[i].data) {
+            // Enough of the payload to see whether it is styled or just text.
+            fprintf(stderr, " head=");
+            for (size_t j = 0; j < 220 && content[i].data[j]; j++) {
+                const unsigned char c = (unsigned char)content[i].data[j];
+                if (c == '\n') fprintf(stderr, "<LF>");
+                else if (c < 0x20) fprintf(stderr, "<%02x>", c);
+                else fputc(c, stderr);
+            }
+        }
+        fputc('\n', stderr);
+    }
+    fflush(stderr);
 }
 
 static void close_surface_cb(void *userdata, bool process_alive) {
@@ -728,6 +749,26 @@ int main(void) {
                     fflush(stderr);
                 }
             }
+
+        // GHOSTTY_HARNESS_COPY=<format> copies what is selected,
+        // through the same binding action Windows Terminal's
+        // CopySelectionToClipboard sends. The representations come
+        // back to write_clipboard_cb, which prints them - that
+        // array of {mime, data} is the only place a styled copy
+        // exists, so it is the only place "does HTML copy carry
+        // colours" can actually be answered.
+        char copyfmt[32];
+        if (GetEnvironmentVariableA("GHOSTTY_HARNESS_COPY", copyfmt, sizeof(copyfmt)) > 0) {
+            char action[64];
+            const int n = snprintf(action, sizeof(action), "copy_to_clipboard:%s", copyfmt);
+            if (n > 0 && (size_t)n < sizeof(action)) {
+                fprintf(stderr, "[clip] copy %s\n", copyfmt);
+                if (!ghostty_surface_binding_action(g_state.surface, action, (size_t)n)) {
+                    fprintf(stderr, "[clip] REJECTED\n");
+                }
+                fflush(stderr);
+            }
+        }
 
             // GHOSTTY_HARNESS_SELECT_SWEEP=press_x,press_y,drag_y,from_x,to_x,step
             // drags from a fixed press position to every pixel in a range and

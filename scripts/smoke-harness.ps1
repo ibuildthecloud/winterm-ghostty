@@ -347,6 +347,59 @@ if (-not $dragFailed) {
     Add-Pass ("{0} drags selected exactly the cells cascadia would" -f $drags.Count)
 }
 
+# --- 1e. Copy carries styles as well as text --------------------------------
+#
+# Windows Terminal puts plain text and HTML on the clipboard together, and the
+# HTML is the only representation that carries colours. It is also the only one
+# read-back cannot produce - ghostty_text_s has no attributes - so this has to
+# go through copy_to_clipboard and be read where the representations arrive, in
+# the runtime's clipboard callback.
+#
+# The fixture is a bold red-on-blue run followed by plain text, so a copy that
+# has really carried the styles looks different from one that has quietly
+# fallen back to text in a wrapper.
+Write-Host 'check: copy carries colours, not just characters' -ForegroundColor Cyan
+$colourFeed = Join-Path $scratch 'colour.bin'
+[System.IO.File]::WriteAllBytes($colourFeed, [System.Text.Encoding]::UTF8.GetBytes(
+    "`e[2J`e[H`e[1;31;44mCOLOURED`e[0m plain`r`n"))
+
+$r = Invoke-Harness -Name 'copy' -TimeoutMs $FeedTimeoutMs -Env @{
+    GHOSTTY_HARNESS_EXTERNAL  = '1'
+    GHOSTTY_HARNESS_FEED      = $colourFeed
+    GHOSTTY_HARNESS_SELECT_WT = '1,120,5'
+    GHOSTTY_HARNESS_COPY      = 'mixed'
+    GHOSTTY_HARNESS_EXIT_MS   = '2500'
+}
+if ($r.TimedOut -or $r.ExitCode -ne 0) {
+    Add-Failure 'harness did not survive the copy'
+}
+elseif ($r.Stderr -match '\[clip\] REJECTED') {
+    Add-Failure 'ghostty rejected copy_to_clipboard'
+}
+else {
+    $mimes = @([regex]::Matches($r.Stderr, '\[clip\] mime=(\S+) len=(\d+) head=(.*)') |
+        ForEach-Object { @{ Mime = $_.Groups[1].Value; Len = [int]$_.Groups[2].Value; Head = $_.Groups[3].Value } })
+    $plain = $mimes | Where-Object { $_.Mime -eq 'text/plain' } | Select-Object -First 1
+    $html = $mimes | Where-Object { $_.Mime -eq 'text/html' } | Select-Object -First 1
+
+    if (-not $plain -or -not $html) {
+        Add-Failure ("a mixed copy produced {0}, expected text/plain and text/html" -f
+            (($mimes | ForEach-Object { $_.Mime }) -join ' + '))
+    }
+    elseif ($plain.Head -notmatch 'COLOURED') {
+        Add-Failure ("the plain representation is '{0}'" -f $plain.Head)
+    }
+    # The styled run has to be styled: a colour and the bold it was printed
+    # with. Without this the check would pass on HTML that is a <div> around
+    # the same characters.
+    elseif ($html.Head -notmatch 'color:' -or $html.Head -notmatch 'font-weight:\s*bold') {
+        Add-Failure ("the HTML carries no colour or weight: '{0}'" -f $html.Head)
+    }
+    else {
+        Add-Pass 'a mixed copy carries text/plain and text/html, with colours and weight'
+    }
+}
+
 # --- 1d. Search finds, counts and navigates ---------------------------------
 #
 # The counts are the difficult part, and not because searching is hard.
