@@ -185,6 +185,76 @@ else {
     Add-Pass 'the whole-screen selection returns exactly what was written'
 }
 
+# --- 1c. A drag selects the same characters cascadia would ------------------
+#
+# The pieces of the selection mapping are pinned on their own sides - what
+# ControlInteractivity rounds a pixel to by UnitTests_Control's
+# SelectionDragGeometryTests, and where ghostty puts a boundary by the sweep in
+# docs/selection-geometry.md - but what a user feels is the two stacked, and
+# stacking them wrongly is exactly what put the selection a character off. Only
+# the real engine can answer this one, so it lives here.
+#
+# The harness does WT's own rounding and then sends what GhosttyControlCore
+# sends for it. The expectation is the ruler line sliced by the cell span
+# cascadia would have selected for the same pixels.
+Write-Host 'check: a pixel drag selects the characters cascadia would' -ForegroundColor Cyan
+$ruler = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+$rulerFeed = Join-Path $scratch 'ruler.bin'
+[System.IO.File]::WriteAllBytes($rulerFeed, [System.Text.Encoding]::UTF8.GetBytes(
+    "`e[2J`e[H$ruler`r`n"))
+
+# Pixel pairs chosen to cover what was broken: the same drag started from the
+# left, middle and right of one character (all three must select identically -
+# the press position is not supposed to matter), and the same run dragged
+# right-to-left (which has to keep the character it started on).
+$drags = @(
+    @{ From = 42; To = 85 },
+    @{ From = 44; To = 85 },
+    @{ From = 46; To = 85 },
+    @{ From = 85; To = 42 },
+    @{ From = 40; To = 49 }
+)
+$dragFailed = $false
+$seen = @()
+foreach ($d in $drags) {
+    $r = Invoke-Harness -Name ("drag-{0}-{1}" -f $d.From, $d.To) -TimeoutMs $FeedTimeoutMs -Env @{
+        GHOSTTY_HARNESS_EXTERNAL  = '1'
+        GHOSTTY_HARNESS_FEED      = $rulerFeed
+        GHOSTTY_HARNESS_SELECT_WT = ("{0},{1},5" -f $d.From, $d.To)
+        GHOSTTY_HARNESS_EXIT_MS   = '2000'
+    }
+    if ($r.TimedOut -or $r.ExitCode -ne 0) {
+        Add-Failure ("harness did not survive the drag {0}->{1}" -f $d.From, $d.To)
+        $dragFailed = $true
+        continue
+    }
+    if ($r.Stderr -notmatch '\[selwt\] cells \[(\d+),(\d+)\) text "([^"]*)"') {
+        Add-Failure ("no selection reported for the drag {0}->{1}" -f $d.From, $d.To)
+        $dragFailed = $true
+        continue
+    }
+    $lo = [int]$Matches[1]
+    $hi = [int]$Matches[2]
+    $actual = $Matches[3]
+    $expected = $ruler.Substring($lo, $hi - $lo)
+    if ($actual -ne $expected) {
+        Add-Failure ("drag {0}->{1} selected '{2}', cascadia would select '{3}' (cells [{4},{5}))" -f
+            $d.From, $d.To, $actual, $expected, $lo, $hi)
+        $dragFailed = $true
+    }
+    $seen += $actual
+}
+# The first three are the same drag from three points inside one character.
+# They differing at all is the original bug, whatever they each selected.
+if (-not $dragFailed -and ($seen[0] -ne $seen[1] -or $seen[1] -ne $seen[2])) {
+    Add-Failure ("where inside a character the press landed changed the selection: '{0}', '{1}', '{2}'" -f
+        $seen[0], $seen[1], $seen[2])
+    $dragFailed = $true
+}
+if (-not $dragFailed) {
+    Add-Pass ("{0} drags selected exactly the cells cascadia would" -f $drags.Count)
+}
+
 # --- 2. External termio carries input to the child --------------------------
 #
 # `dir` typed into cmd.exe: the text goes through the terminal's own encoder

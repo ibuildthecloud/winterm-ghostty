@@ -37,6 +37,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellscalingapi.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -275,6 +276,15 @@ int main(void) {
     // specific configuration without a config file. `--background=ff0000` is
     // the quickest proof that what is on screen really comes from libghostty.
     ghostty_config_load_cli_args(config);
+    // Windows Terminal pins these to zero - it insets the SwapChainPanel
+    // itself - and the surface's left padding is a term in ghostty's
+    // pixel-to-boundary arithmetic. Left at the default, every mouse position
+    // the harness sends lands a third of a cell further left than the same
+    // position would in a WT pane, which makes the harness a measuring
+    // instrument for a geometry nobody ships.
+    ghostty_config_set(config, "window-padding-x = 0");
+    ghostty_config_set(config, "window-padding-y = 0");
+    ghostty_config_set(config, "window-padding-balance = false");
     ghostty_config_finalize(config);
     trace("ghostty_config_finalize ok");
 
@@ -457,6 +467,112 @@ int main(void) {
                     ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
                     fprintf(stderr, "[hwnd-host] after release has_selection=%d\n",
                             ghostty_surface_has_selection(g_state.surface) ? 1 : 0);
+                    fflush(stderr);
+                }
+            }
+
+            // GHOSTTY_HARNESS_SELECT_WT=press_x,drag_x,y drags in pixels the
+            // way a Windows Terminal pane does, all the way through: WT's own
+            // rounding, then the sequence GhosttyControlCore sends for it.
+            //
+            // This is the only check that covers the composition. The pieces
+            // are pinned separately - cascadia's rounding by
+            // UnitTests_Control::SelectionDragGeometryTests, ghostty's
+            // threshold by the sweep below - but what a user feels is the two
+            // of them stacked, and stacking them wrongly is what put the
+            // selection a character off.
+            //
+            // Prints the cell span cascadia would have selected for the same
+            // pixels alongside ghostty's actual text, so a script can compare
+            // them against a known ruler line.
+            char selwt[64];
+            if (GetEnvironmentVariableA("GHOSTTY_HARNESS_SELECT_WT", selwt, sizeof(selwt)) > 0) {
+                double press_x = 0, drag_x = 0, y = 0;
+                if (sscanf(selwt, "%lf,%lf,%lf", &press_x, &drag_x, &y) == 3) {
+                    const ghostty_surface_size_s size = ghostty_surface_size(g_state.surface);
+                    const double cw = (double)size.cell_width_px / scale_for_window(g_state.hwnd);
+
+                    // ControlInteractivity, verbatim: the anchor floors the
+                    // touchdown point and steps one right when the drag runs
+                    // leftwards, and the far end rounds to the nearest edge.
+                    // Both are boundaries, not cells.
+                    const long anchor = (long)floor(press_x / cw) + (drag_x < press_x ? 1 : 0);
+                    const long end = lround(drag_x / cw);
+                    const long lo = anchor < end ? anchor : end;
+                    const long hi = anchor < end ? end : anchor;
+
+                    // GhosttyControlCore, verbatim: clear, press at the anchor
+                    // boundary, then move to the far one.
+                    static const char kClear[] = "clear_selection";
+                    ghostty_surface_binding_action(g_state.surface, kClear, sizeof(kClear) - 1);
+                    ghostty_surface_mouse_pos(g_state.surface, ((double)anchor + 0.25) * cw, y, GHOSTTY_MODS_NONE);
+                    ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+                    ghostty_surface_mouse_pos(g_state.surface, ((double)end + 0.25) * cw, y, GHOSTTY_MODS_NONE);
+
+                    fprintf(stderr, "[selwt] cells [%ld,%ld) text ", lo, hi);
+                    ghostty_text_s got = {0};
+                    if (!ghostty_surface_has_selection(g_state.surface)) {
+                        fprintf(stderr, "(none)\n");
+                    } else if (!ghostty_surface_read_selection(g_state.surface, &got)) {
+                        fprintf(stderr, "READ FAILED\n");
+                    } else {
+                        fprintf(stderr, "\"%.*s\"\n", (int)got.text_len, got.text);
+                        ghostty_surface_free_text(g_state.surface, &got);
+                    }
+                    ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+                    fflush(stderr);
+                }
+            }
+
+            // GHOSTTY_HARNESS_CLEAR_SELECTION=press_x,drag_x,near_x,y checks
+            // the two things Windows Terminal's control needs from the
+            // clear_selection binding action:
+            //
+            //   1. the selection goes away, and
+            //   2. the *click sequence* goes away with it - so the next press
+            //      is a fresh single click and not the second half of a double
+            //      click, which would select by word.
+            //
+            // (2) is the load-bearing half. WT re-presses at the drag anchor
+            // once it knows which direction the drag runs, and a re-press
+            // within one cell of the last one is a double click to ghostty
+            // unless something ended the sequence first.
+            char clearsel[64];
+            if (GetEnvironmentVariableA("GHOSTTY_HARNESS_CLEAR_SELECTION", clearsel, sizeof(clearsel)) > 0) {
+                double press_x = 0, drag_x = 0, near_x = 0, y = 0;
+                if (sscanf(clearsel, "%lf,%lf,%lf,%lf", &press_x, &drag_x, &near_x, &y) == 4) {
+                    static const char kClear[] = "clear_selection";
+
+                    ghostty_surface_mouse_pos(g_state.surface, press_x, y, GHOSTTY_MODS_NONE);
+                    ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+                    ghostty_surface_mouse_pos(g_state.surface, drag_x, y, GHOSTTY_MODS_NONE);
+                    fprintf(stderr, "[clearsel] selected=%d\n",
+                            ghostty_surface_has_selection(g_state.surface) ? 1 : 0);
+
+                    if (!ghostty_surface_binding_action(g_state.surface, kClear, sizeof(kClear) - 1)) {
+                        fprintf(stderr, "[clearsel] action REJECTED\n");
+                    }
+                    fprintf(stderr, "[clearsel] after clear selected=%d\n",
+                            ghostty_surface_has_selection(g_state.surface) ? 1 : 0);
+                    ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+
+                    // Immediately, and at the same place: without the reset
+                    // this is a double click and comes back as a whole word.
+                    ghostty_surface_mouse_pos(g_state.surface, press_x, y, GHOSTTY_MODS_NONE);
+                    ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+                    ghostty_surface_mouse_pos(g_state.surface, near_x, y, GHOSTTY_MODS_NONE);
+
+                    fprintf(stderr, "[clearsel] repress ");
+                    ghostty_text_s again = {0};
+                    if (!ghostty_surface_has_selection(g_state.surface)) {
+                        fprintf(stderr, "(none)\n");
+                    } else if (!ghostty_surface_read_selection(g_state.surface, &again)) {
+                        fprintf(stderr, "READ FAILED\n");
+                    } else {
+                        fprintf(stderr, "\"%.*s\"\n", (int)again.text_len, again.text);
+                        ghostty_surface_free_text(g_state.surface, &again);
+                    }
+                    ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
                     fflush(stderr);
                 }
             }
