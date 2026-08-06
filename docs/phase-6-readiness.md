@@ -164,6 +164,21 @@ was cheap. On that basis:
 
 ## Carried from Phase 5, for the retro
 
+0. **Triple-click highlights only to the last word, not the full row.** Cascadia
+   highlights the *entire width* of the line and then trims the surrounding whitespace on
+   copy; ghostty's line selection ends at the last cell with content, so the highlight
+   stops short. Confirmed by hand against a cascadia pane in the same window.
+
+   Not fixable from the Windows Terminal side: the highlight is drawn from ghostty's own
+   selection extent, so matching cascadia means changing ghostty's line-selection
+   semantics - a patch on the `windows` branch. The copy half is probably already correct,
+   since an extent that stops at the text has no trailing whitespace to trim; that should
+   be confirmed rather than assumed before the patch is written.
+
+   Alternative, if the patch is judged not worth it: this becomes a documented diff under
+   the phase's "documented diffs allowed, each with an issue filed" criterion. The user has
+   asked for parity, so the patch is the default.
+
 0. **`ghostty_config_set` should take a key and a value, not a line.** Patch 25 implemented
    it by reusing ghostty's config-*file* line parser, so every setting is handed over as
    `key = value` text and any value containing quoting metacharacters has to be escaped.
