@@ -378,6 +378,38 @@ int main(void) {
             ghostty_surface_render_now(g_state.surface);
             fprintf(stderr, "[hwnd-host] feed survived\n");
             fflush(stderr);
+
+            // GHOSTTY_HARNESS_READBACK=1 reads the whole screen back out
+            // through ghostty_surface_read_text. This is the exact selection
+            // shape Windows Terminal's ReadEntireBuffer uses - SCREEN with
+            // TOP_LEFT/BOTTOM_RIGHT coords, meaning the whole buffer without
+            // having to know how big it is - so a smoke run can prove that
+            // shape returns what was fed in.
+            char rb[8];
+            if (GetEnvironmentVariableA("GHOSTTY_HARNESS_READBACK", rb, sizeof(rb)) > 0 && rb[0] == '1') {
+                ghostty_selection_s all = {0};
+                all.top_left.tag = GHOSTTY_POINT_SCREEN;
+                all.top_left.coord = GHOSTTY_POINT_COORD_TOP_LEFT;
+                all.bottom_right.tag = GHOSTTY_POINT_SCREEN;
+                all.bottom_right.coord = GHOSTTY_POINT_COORD_BOTTOM_RIGHT;
+                all.rectangle = false;
+
+                ghostty_text_s out = {0};
+                if (!ghostty_surface_read_text(g_state.surface, all, &out)) {
+                    fprintf(stderr, "[hwnd-host] readback FAILED\n");
+                } else {
+                    fprintf(stderr, "[hwnd-host] readback %zu bytes: ", out.text_len);
+                    for (size_t i = 0; i < out.text_len; i++) {
+                        const unsigned char c = (unsigned char)out.text[i];
+                        if (c == '\n') fprintf(stderr, "<LF>");
+                        else if (c < 0x20) fprintf(stderr, "<%02x>", c);
+                        else fputc(c, stderr);
+                    }
+                    fprintf(stderr, "\n");
+                    ghostty_surface_free_text(g_state.surface, &out);
+                }
+                fflush(stderr);
+            }
         }
     }
 

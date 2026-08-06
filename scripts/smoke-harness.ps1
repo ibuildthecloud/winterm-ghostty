@@ -153,6 +153,38 @@ else {
     Add-Pass ("{0} bytes of non-ASCII parsed and rendered" -f $bytes.Length)
 }
 
+# --- 1b. read_text returns the buffer -------------------------------------
+#
+# Windows Terminal's ReadEntireBuffer asks ghostty for the whole screen with a
+# GHOSTTY_POINT_SCREEN selection and TOP_LEFT/BOTTOM_RIGHT coords - "the whole
+# buffer without having to know how big it is". That shape is easy to get
+# subtly wrong (viewport vs screen, exact vs edge coords) and the failure is
+# silent: a wrong selection returns *some* text. Feeding known markers and
+# demanding them back is the cheap way to keep it honest.
+Write-Host 'check: read_text returns the whole buffer' -ForegroundColor Cyan
+$rbFeed = Join-Path $scratch 'readback.bin'
+[System.IO.File]::WriteAllBytes($rbFeed, [System.Text.Encoding]::UTF8.GetBytes(
+    "`e[2J`e[HREADBACK_ALPHA`r`nREADBACK_BETA`r`n"))
+
+$r = Invoke-Harness -Name 'readback' -TimeoutMs $FeedTimeoutMs -Env @{
+    GHOSTTY_HARNESS_EXTERNAL = '1'
+    GHOSTTY_HARNESS_FEED     = $rbFeed
+    GHOSTTY_HARNESS_READBACK = '1'
+    GHOSTTY_HARNESS_EXIT_MS  = '2000'
+}
+if ($r.TimedOut -or $r.ExitCode -ne 0) {
+    Add-Failure 'harness did not survive the read-back feed'
+}
+elseif ($r.Stderr -match 'readback FAILED') {
+    Add-Failure 'ghostty_surface_read_text refused the whole-screen selection'
+}
+elseif ($r.Stderr -notmatch 'READBACK_ALPHA<LF>READBACK_BETA') {
+    Add-Failure 'read_text did not return what was fed - the selection shape is wrong'
+}
+else {
+    Add-Pass 'the whole-screen selection returns exactly what was written'
+}
+
 # --- 2. External termio carries input to the child --------------------------
 #
 # `dir` typed into cmd.exe: the text goes through the terminal's own encoder
