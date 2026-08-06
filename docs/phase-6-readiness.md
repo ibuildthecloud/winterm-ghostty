@@ -20,13 +20,20 @@ entries are:
 | Arbitrary text read-back | `ghostty_surface_read_text` (takes a `ghostty_selection_s`) |
 | Everything else | `ghostty_surface_binding_action` — a *string* action, the route Phase 5 already used for `scroll_to_row` |
 
-There is no C entry point for search, marks, hyperlinks or clipboard formats. Anything not
-in the table above has to go through a binding action, arrive as an *action callback*, or
-be added by a new patch.
+There is no C entry point for search, marks, hyperlinks or clipboard formats — but that is
+not the same as those capabilities being absent. Most of them are reachable through a
+binding action, with the result arriving as an *action* or a *callback*. Read the binding
+list before concluding anything is missing; Q1 below is a worked example of getting that
+wrong.
 
 ## Q1 — Clipboard fidelity: can read-back produce styled (HTML/RTF) copies?
 
-**No. Plain UTF-8 only.** Both read-back functions return `ghostty_text_s`:
+**Corrected 2026-08-05, after this file first said no.** The first answer generalised from
+one API to the whole capability and was wrong. Both statements below are true; only the
+second one answers the question.
+
+**Read-back is plain text.** `ghostty_surface_read_selection` and
+`ghostty_surface_read_text` both return `ghostty_text_s`:
 
 ```c
 typedef struct {
@@ -36,14 +43,39 @@ typedef struct {
 } ghostty_text_s;
 ```
 
-Text and geometry. No colours, no attributes, nothing an HTML or RTF writer could use.
-Cascadia generates its styled copies from its own buffer's attribute runs, and there is no
-equivalent to read here.
+Text and geometry, no attributes. Nothing an HTML writer could consume.
 
-**Recommendation:** plain-text copy is the Phase 6 exit; **styled copy is a tracked gap**,
-not a phase blocker. Attributed read-back is a real libghostty patch (a new `ghostty_text_s`
-variant carrying style runs) and should be its own decision, taken on evidence of how much
-anyone misses HTML copy from a terminal.
+**But copying is not read-back.** `src/input/Binding.zig` has:
+
+```zig
+copy_to_clipboard: CopyToClipboard,   // plain | vt | html | mixed  (default mixed)
+```
+
+and the styled result comes back through the *clipboard* callback, not the read API:
+
+```c
+typedef struct { const char *mime; const char *data; } ghostty_clipboard_content_s;
+typedef void (*ghostty_runtime_write_clipboard_cb)(void*, ghostty_clipboard_e,
+                                                   const ghostty_clipboard_content_s*,
+                                                   size_t, bool);
+```
+
+An **array** of MIME-tagged representations — which is exactly the shape Windows Terminal
+needs to put plain text and HTML on the clipboard together.
+
+**So: HTML copy is available and cheap** (a binding action plus a callback already wired in
+Phase 5). **RTF is not** — ghostty offers `plain`/`vt`/`html`/`mixed` and nothing else,
+while WT's `CopyFormat` includes RTF.
+
+**Recommendation:** HTML copy is in scope, since it falls inside the standing decision of
+"nothing beyond what the engine supports". **RTF is the tracked gap**, not styled copy as a
+whole. `vt` is a bonus WT has no equivalent for and can be ignored.
+
+**Method note.** The wrong answer came from reading the read-back API, finding no
+attributes, and concluding the capability was absent — without checking the other route to
+the same capability. The binding-action surface had already been established as the way
+things get done in this fork (`scroll_to_row` in Phase 5, search below), which is precisely
+why it should have been checked first.
 
 ## Q2 — Search capability mapping
 
@@ -121,6 +153,7 @@ was cheap. On that basis:
 | Item | Cost shape | Recommendation |
 | --- | --- | --- |
 | Selection + copy-on-select | existing read-back API | **graduate** |
+| HTML copy | `copy_to_clipboard:html`/`mixed` + the clipboard callback | **graduate** (see Q1's correction) |
 | Search | existing binding actions, degraded toggles | **graduate**, with Q2's answer |
 | Hyperlinks | needs hover/link read-back; not in the C API | defer |
 | Marks (`scrollToMark`) | prompt-level only | **graduate, prompt-level** |

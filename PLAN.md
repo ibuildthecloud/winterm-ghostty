@@ -449,10 +449,15 @@ Open questions - **all resolved at the Phase 5-6 readiness step (2026-08-05)**, 
 libghostty's API and source rather than from this phase's original hopes. Evidence and
 reasoning in `docs/phase-6-readiness.md`.
 
-- **Clipboard fidelity: plain text only.** Both read-back functions return
-  `ghostty_text_s`, which carries text and geometry and no attributes, so there is nothing
-  an HTML/RTF writer could consume. Plain-text copy is the phase exit; **styled copy is a
-  tracked gap**, and attributed read-back would be its own libghostty patch and decision.
+- **Clipboard fidelity: plain and HTML; RTF is the gap.** Read-back
+  (`ghostty_surface_read_selection`/`read_text`) returns `ghostty_text_s` — text and
+  geometry, no attributes — but *copying is not read-back*. The `copy_to_clipboard` binding
+  action takes `plain`/`vt`/`html`/`mixed`, and the result arrives through
+  `write_clipboard_cb` as an **array** of `{mime, data}` representations, which is the shape
+  WT needs to put plain and HTML on the clipboard together. So **HTML copy is in scope**
+  (it is what the engine supports, and Phase 5 already wired that callback). **RTF is the
+  tracked gap**: ghostty offers no RTF. *This corrects an earlier reading of this question
+  that concluded no styled copy was possible — see `docs/phase-6-readiness.md` Q1.*
 - **Search: drivable, literal and case-sensitive only.** `Binding.zig` provides `search`,
   `search_selection`, `navigate_search`, `start_search`, `end_search`, so WT's search box
   can drive it via `ghostty_surface_binding_action` - the `scroll_to_row` route. Results
@@ -478,7 +483,8 @@ Exit criteria:
 - [ ] Selection works by mouse and keyboard on a ghostty pane, `HasSelection`/`SelectedText`
       are honest, and copy-on-select behaves as it does on cascadia.
 - [ ] Copy produces correct plain text, including a multi-line and a wide-character
-      selection. Styled (HTML/RTF) copy is **out of scope** and reported as a known gap.
+      selection, and **HTML copy carries colours and styles**. RTF is **out of scope** and
+      reported as a known gap.
 - [ ] The search box drives ghostty search: a literal match navigates forwards and
       backwards, the total is reported, and the regex/case toggles are **visibly disabled**
       rather than inert.
