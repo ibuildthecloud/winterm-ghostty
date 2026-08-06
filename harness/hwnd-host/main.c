@@ -197,22 +197,42 @@ static void search_step(void) {
     static const char kNext[] = "navigate_search:next";
     static const char kPrev[] = "navigate_search:previous";
 
+    // The sequence Windows Terminal's search box produces, in ghostty's terms.
+    // The two count from opposite ends of the buffer: ghostty's index 0 is the
+    // *newest* match and grows backwards in time, so WT's "first match" and its
+    // "find next" both map onto ghostty's `previous`. Walking it the way the
+    // control walks it is the only way to see that the mapping holds.
     switch (g_search_step++) {
     case 0:
-        fprintf(stderr, "[search] next\n");
+        // What the control sends when the total arrives with nothing selected.
+        // ghostty's own first pick, the match nearest the bottom - which is the
+        // one cascadia lands on too, and which WT's status box calls N of N.
+        fprintf(stderr, "[search] first\n");
         ghostty_surface_binding_action(g_state.surface, kNext, sizeof(kNext) - 1);
         break;
     case 1:
-        fprintf(stderr, "[search] next\n");
-        ghostty_surface_binding_action(g_state.surface, kNext, sizeof(kNext) - 1);
+        fprintf(stderr, "[search] forward\n");
+        ghostty_surface_binding_action(g_state.surface, kPrev, sizeof(kPrev) - 1);
         break;
     case 2:
-        fprintf(stderr, "[search] previous\n");
-        ghostty_surface_binding_action(g_state.surface, kPrev, sizeof(kPrev) - 1);
+        fprintf(stderr, "[search] backward\n");
+        ghostty_surface_binding_action(g_state.surface, kNext, sizeof(kNext) - 1);
         break;
     default:
         KillTimer(g_state.hwnd, SEARCH_TIMER_ID);
-        break;
+        fflush(stderr);
+        return;
+    }
+
+    // Which match the index actually refers to. The number on its own cannot
+    // say whether index 0 is the topmost match in the buffer or the bottommost,
+    // and Windows Terminal's status box counts from the top.
+    if (ghostty_surface_has_selection(g_state.surface)) {
+        ghostty_text_s at = {0};
+        if (ghostty_surface_read_selection(g_state.surface, &at)) {
+            fprintf(stderr, "[search] at \"%.*s\"\n", (int)at.text_len, at.text);
+            ghostty_surface_free_text(g_state.surface, &at);
+        }
     }
     fflush(stderr);
 }

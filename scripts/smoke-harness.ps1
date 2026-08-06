@@ -436,16 +436,30 @@ elseif ([int]$Matches[1] -ne 3) {
     Add-Failure ("search found {0} matches, the fixture has 3" -f $Matches[1])
 }
 else {
-    # Every index the search reported, in order. Driving next, next, previous
-    # from a fresh search must walk 0, 1 and back to 0 - a total on its own
-    # would not prove navigation moves, or that it moves both ways.
+    # Every index the search reported, in order, for the sequence Windows
+    # Terminal's search box produces: select the first match, then forward,
+    # then backward.
+    #
+    # 0, 2, 0 - and which end those count from is the whole point. ghostty's
+    # index 0 is the *newest* match and grows backwards in time, where WT's
+    # status box means "the Nth from the top". So on a three-match fixture:
+    #
+    #   first    -> idx 0, the bottom-most match, which WT calls 3 of 3
+    #   forward  -> idx 2, because forward is *down* the buffer and there is
+    #               nothing below, so it wraps to the top: WT's 1 of 3
+    #   backward -> idx 0 again, wrapping back
+    #
+    # Forwarded unconverted, "1/3" highlighted what cascadia calls 3 and Enter
+    # moved the highlight the wrong way. The conversion lives in
+    # GhosttyControlCore (_currentMatchFromTop and _navigateSearch); this pins
+    # the engine behaviour it converts from, wrap included.
     $selected = @([regex]::Matches($r.Stderr, '\[search\] selected=(-?\d+)') |
         ForEach-Object { [int]$_.Groups[1].Value })
-    if (($selected -join ',') -ne '0,1,0') {
-        Add-Failure ("search navigation walked {0}, expected 0,1,0" -f ($selected -join ','))
+    if (($selected -join ',') -ne '0,2,0') {
+        Add-Failure ("search navigation walked {0}, expected 0,2,0" -f ($selected -join ','))
     }
     else {
-        Add-Pass 'three matches found, and next/next/previous walked 0, 1, 0'
+        Add-Pass 'three matches found; first/forward/backward walked 0, 2, 0 (top-down 3, 1, 3)'
     }
 }
 
