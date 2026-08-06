@@ -460,6 +460,68 @@ int main(void) {
                     fflush(stderr);
                 }
             }
+
+            // GHOSTTY_HARNESS_SELECT_SWEEP=press_x,press_y,drag_y,from_x,to_x,step
+            // drags from a fixed press position to every pixel in a range and
+            // prints what came back, so ghostty's *sub-cell* rule can be read
+            // off the output rather than off its source.
+            //
+            // Whole cells cannot see this rule at all. Windows Terminal hands
+            // its core a cell index, so everything the control sends lands on
+            // one position per cell - and which position that is decides
+            // whether the cell under the pointer is in the selection or not.
+            char sweep[128];
+            if (GetEnvironmentVariableA("GHOSTTY_HARNESS_SELECT_SWEEP", sweep, sizeof(sweep)) > 0) {
+                double press_x = 0, press_y = 0, drag_y = 0, from_x = 0, to_x = 0, step = 1;
+                if (sscanf(sweep, "%lf,%lf,%lf,%lf,%lf,%lf",
+                           &press_x, &press_y, &drag_y, &from_x, &to_x, &step) == 6 &&
+                    step > 0) {
+                    const ghostty_surface_size_s size = ghostty_surface_size(g_state.surface);
+                    fprintf(stderr, "[sweep] cell %.1fx%.1f px press=(%.1f,%.1f) row_y=%.1f\n",
+                            (double)size.cell_width_px, (double)size.cell_height_px,
+                            press_x, press_y, drag_y);
+
+                    for (double x = from_x; x <= to_x + 1e-9; x += step) {
+                        // Two presses, five cells apart, before each sample.
+                        // ghostty counts a press within one cell of the last
+                        // one as a double click, so repeating the same press
+                        // position would select by word from the second sample
+                        // on. Landing far away first resets the count, and a
+                        // single-click press makes no selection of its own -
+                        // it only clears whatever the last sample left.
+                        const double far_x = press_x + 5.0 * (double)size.cell_width_px;
+                        ghostty_surface_mouse_pos(g_state.surface, far_x, press_y, GHOSTTY_MODS_NONE);
+                        ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+                        ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+
+                        ghostty_surface_mouse_pos(g_state.surface, press_x, press_y, GHOSTTY_MODS_NONE);
+                        ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+                        ghostty_surface_mouse_pos(g_state.surface, x, drag_y, GHOSTTY_MODS_NONE);
+
+                        fprintf(stderr, "[sweep] x=%.1f ", x);
+                        if (!ghostty_surface_has_selection(g_state.surface)) {
+                            fprintf(stderr, "(none)\n");
+                        } else {
+                            ghostty_text_s got = {0};
+                            if (!ghostty_surface_read_selection(g_state.surface, &got)) {
+                                fprintf(stderr, "READ FAILED\n");
+                            } else {
+                                fprintf(stderr, "\"");
+                                for (size_t i = 0; i < got.text_len; i++) {
+                                    const unsigned char c = (unsigned char)got.text[i];
+                                    if (c == '\n') fprintf(stderr, "<LF>");
+                                    else if (c < 0x20) fprintf(stderr, "<%02x>", c);
+                                    else fputc(c, stderr);
+                                }
+                                fprintf(stderr, "\"\n");
+                                ghostty_surface_free_text(g_state.surface, &got);
+                            }
+                        }
+                        ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+                    }
+                    fflush(stderr);
+                }
+            }
         }
     }
 
