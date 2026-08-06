@@ -347,6 +347,55 @@ if (-not $dragFailed) {
     Add-Pass ("{0} drags selected exactly the cells cascadia would" -f $drags.Count)
 }
 
+# --- 1d. Search finds, counts and navigates ---------------------------------
+#
+# The counts are the difficult part, and not because searching is hard.
+# IControlCore::Search is synchronous - Windows Terminal asks and expects the
+# answer in the return value - while ghostty searches on its own thread and
+# reports back through the app tick, after the call has already returned. The
+# WT side handles that by returning what it knows (a negative total, which the
+# search box renders as "Searching...") and raising SearchResultsChanged when
+# the real numbers land.
+#
+# This check exists to prove the numbers land at all, and are right: three
+# occurrences of one needle across three lines, then next/next/previous.
+Write-Host 'check: search counts matches and navigates them' -ForegroundColor Cyan
+$searchFeed = Join-Path $scratch 'search.bin'
+[System.IO.File]::WriteAllBytes($searchFeed, [System.Text.Encoding]::UTF8.GetBytes(
+    "`e[2J`e[Halpha needle beta`r`nneedle gamma`r`ndelta needle`r`n"))
+
+$r = Invoke-Harness -Name 'search' -TimeoutMs $PtyTimeoutMs -Env @{
+    GHOSTTY_HARNESS_EXTERNAL = '1'
+    GHOSTTY_HARNESS_FEED     = $searchFeed
+    GHOSTTY_HARNESS_SEARCH   = 'needle'
+    GHOSTTY_HARNESS_EXIT_MS  = '4000'
+}
+if ($r.TimedOut -or $r.ExitCode -ne 0) {
+    Add-Failure 'harness did not survive the search'
+}
+elseif ($r.Stderr -match '\[search\] REJECTED') {
+    Add-Failure 'ghostty rejected the search binding action'
+}
+elseif ($r.Stderr -notmatch '\[search\] total=(-?\d+)') {
+    Add-Failure 'no total came back - the search never reported anything'
+}
+elseif ([int]$Matches[1] -ne 3) {
+    Add-Failure ("search found {0} matches, the fixture has 3" -f $Matches[1])
+}
+else {
+    # Every index the search reported, in order. Driving next, next, previous
+    # from a fresh search must walk 0, 1 and back to 0 - a total on its own
+    # would not prove navigation moves, or that it moves both ways.
+    $selected = @([regex]::Matches($r.Stderr, '\[search\] selected=(-?\d+)') |
+        ForEach-Object { [int]$_.Groups[1].Value })
+    if (($selected -join ',') -ne '0,1,0') {
+        Add-Failure ("search navigation walked {0}, expected 0,1,0" -f ($selected -join ','))
+    }
+    else {
+        Add-Pass 'three matches found, and next/next/previous walked 0, 1, 0'
+    }
+}
+
 # --- 2. External termio carries input to the child --------------------------
 #
 # `dir` typed into cmd.exe: the text goes through the terminal's own encoder

@@ -71,9 +71,27 @@ static bool action_cb(ghostty_app_t app, ghostty_target_s target,
                       ghostty_action_s action) {
     (void)app;
     (void)target;
+
+    // Search is the one thing the harness has to listen for. ghostty answers a
+    // search on its own thread and reports the counts back here, which is the
+    // whole difficulty on the Windows Terminal side - IControlCore::Search is
+    // synchronous and has to return before these arrive. Printing them is how a
+    // smoke run proves they arrive at all, and with what.
+    switch (action.tag) {
+    case GHOSTTY_ACTION_SEARCH_TOTAL:
+        fprintf(stderr, "[search] total=%zd\n", (ssize_t)action.action.search_total.total);
+        fflush(stderr);
+        return true;
+    case GHOSTTY_ACTION_SEARCH_SELECTED:
+        fprintf(stderr, "[search] selected=%zd\n", (ssize_t)action.action.search_selected.selected);
+        fflush(stderr);
+        return true;
+    default:
+        break;
+    }
+
     // Returning false means "not handled". A real embedder maps these to tab
-    // titles, clipboard, bells and so on; the harness ignores all of them.
-    (void)action;
+    // titles, clipboard, bells and so on; the harness ignores the rest.
     return false;
 }
 
@@ -145,8 +163,38 @@ static void push_size(void) {
 // GHOSTTY_HARNESS_EXIT_MS's and GHOSTTY_HARNESS_INPUT's timers.
 #define EXIT_TIMER_ID 1
 #define INPUT_TIMER_ID 2
+#define SEARCH_TIMER_ID 3
 
 static char g_input[256] = {0};
+
+// GHOSTTY_HARNESS_SEARCH's little state machine. It has to run off the message
+// loop rather than straight through, because the counts come back through the
+// app tick - so each step needs the loop to have pumped since the last one.
+static int g_search_step = 0;
+
+static void search_step(void) {
+    static const char kNext[] = "navigate_search:next";
+    static const char kPrev[] = "navigate_search:previous";
+
+    switch (g_search_step++) {
+    case 0:
+        fprintf(stderr, "[search] next\n");
+        ghostty_surface_binding_action(g_state.surface, kNext, sizeof(kNext) - 1);
+        break;
+    case 1:
+        fprintf(stderr, "[search] next\n");
+        ghostty_surface_binding_action(g_state.surface, kNext, sizeof(kNext) - 1);
+        break;
+    case 2:
+        fprintf(stderr, "[search] previous\n");
+        ghostty_surface_binding_action(g_state.surface, kPrev, sizeof(kPrev) - 1);
+        break;
+    default:
+        KillTimer(g_state.hwnd, SEARCH_TIMER_ID);
+        break;
+    }
+    fflush(stderr);
+}
 
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -154,6 +202,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == EXIT_TIMER_ID) {
             KillTimer(hwnd, EXIT_TIMER_ID);
             PostQuitMessage(0);
+        }
+        else if (wp == SEARCH_TIMER_ID) {
+            search_step();
         }
         else if (wp == INPUT_TIMER_ID) {
             KillTimer(hwnd, INPUT_TIMER_ID);
@@ -497,6 +548,32 @@ int main(void) {
                     fprintf(stderr, "[hwnd-host] after release has_selection=%d\n",
                             ghostty_surface_has_selection(g_state.surface) ? 1 : 0);
                     fflush(stderr);
+                }
+            }
+
+            // GHOSTTY_HARNESS_SEARCH=<needle> runs the search Windows Terminal's
+            // search box drives, and then walks it: next, next, previous.
+            //
+            // The counts never come back from the call. ghostty searches on its
+            // own thread and reports through the app tick, which is why the
+            // navigation runs off a timer rather than straight through here -
+            // each step needs the message loop to have pumped. That asymmetry
+            // is the whole difficulty of putting this behind a synchronous
+            // IControlCore::Search, so the harness reproduces it rather than
+            // hiding it.
+            char needle[128];
+            const DWORD needle_len =
+                GetEnvironmentVariableA("GHOSTTY_HARNESS_SEARCH", needle, sizeof(needle));
+            if (needle_len > 0 && needle_len < sizeof(needle)) {
+                char action[192];
+                const int n = snprintf(action, sizeof(action), "search:%s", needle);
+                if (n > 0 && (size_t)n < sizeof(action)) {
+                    fprintf(stderr, "[search] needle \"%s\"\n", needle);
+                    if (!ghostty_surface_binding_action(g_state.surface, action, (size_t)n)) {
+                        fprintf(stderr, "[search] REJECTED\n");
+                    }
+                    fflush(stderr);
+                    SetTimer(g_state.hwnd, SEARCH_TIMER_ID, 400, NULL);
                 }
             }
 
