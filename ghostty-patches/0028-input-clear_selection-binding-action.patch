@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Wed, 5 Aug 2026 23:39:53 -0700
+Subject: [PATCH] input: clear_selection binding action
+
+There was no way to clear a selection except to imitate one: Windows
+Terminal's control sent a press and a release with no movement, because that
+is what collapses a selection in ghostty's own mouse handling. Behaviour by
+imitation, and it would have broken silently if that handling changed.
+
+The action ends the click gesture along with the selection, and that is part
+of the action rather than a side effect. A selection cleared while the button
+is still held is recreated by the very next pointer movement, and the click
+count left behind makes the next press a double click. mouseButtonCallback
+already pairs the two the same way when mouse reporting takes over mid-press.
+
+Ending the gesture is also what lets an embedder that computes its own
+selection anchors re-press where it means to: ghostty latches the anchor on a
+press and will not re-latch, and a second press within a cell of the first is
+a double click.
+
+zig build test: 3091 passed, 58 skipped, 0 failed.
+
+Verified end to end in harness/hwnd-host (GHOSTTY_HARNESS_CLEAR_SELECTION):
+a drag selects, the action clears it, and an immediate re-press at the same
+pixel yields a fresh two-character selection. Mutation-checked - with the
+gesture reset removed, that re-press comes back as the whole word.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BgDGqEqRBB8L5Ueoq1uuxy
+---
+ src/Surface.zig       | 14 ++++++++++++++
+ src/input/Binding.zig | 10 ++++++++++
+ src/input/command.zig |  6 ++++++
+ 3 files changed, 30 insertions(+)
+
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 4e6bd96eb..32d20d289 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -5524,6 +5524,20 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool
+             }
+         },
+ 
++        .clear_selection => {
++            self.renderer_state.mutex.lockUncancelable(global.io());
++            defer self.renderer_state.mutex.unlock(global.io());
++
++            // The gesture goes with the selection. A selection cleared while
++            // the button is still held would be recreated by the very next
++            // pointer movement, and the click count left behind would make the
++            // next press a double click. This is the same pairing mouseButtonCallback
++            // does when mouse reporting takes over mid-press.
++            try self.setSelection(null);
++            self.mouse.selection_gesture.reset(self.renderer_state.terminal);
++            try self.queueRender();
++        },
++
+         .inspector => |mode| return try self.rt_app.performAction(
+             .{ .surface = self },
+             .inspector,
+diff --git a/src/input/Binding.zig b/src/input/Binding.zig
+index 8c706027a..ef5843470 100644
+--- a/src/input/Binding.zig
++++ b/src/input/Binding.zig
+@@ -438,6 +438,15 @@ pub const Action = union(enum) {
+     /// Select all text on the screen.
+     select_all,
+ 
++    /// Clear the current selection, if there is one, and end any click or
++    /// drag gesture in progress.
++    ///
++    /// Ending the gesture is part of the action rather than a side effect of
++    /// it: a selection cleared while the button is still held would be
++    /// recreated by the very next pointer movement, and the click count left
++    /// behind would make the next press a double click.
++    clear_selection,
++
+     /// Scroll to the top of the screen.
+     scroll_to_top,
+ 
+@@ -1374,6 +1383,7 @@ pub const Action = union(enum) {
+             .set_tab_title,
+             .clear_screen,
+             .select_all,
++            .clear_selection,
+             .scroll_to_top,
+             .scroll_to_bottom,
+             .scroll_to_selection,
+diff --git a/src/input/command.zig b/src/input/command.zig
+index ac048eec0..ea7288ab8 100644
+--- a/src/input/command.zig
++++ b/src/input/command.zig
+@@ -241,6 +241,12 @@ fn actionCommands(action: Action.Key) []const Command {
+             .description = "Select all text on the screen.",
+         }},
+ 
++        .clear_selection => comptime &.{.{
++            .action = .clear_selection,
++            .title = "Clear Selection",
++            .description = "Clear the current selection.",
++        }},
++
+         .scroll_to_top => comptime &.{.{
+             .action = .scroll_to_top,
+             .title = "Scroll to Top",

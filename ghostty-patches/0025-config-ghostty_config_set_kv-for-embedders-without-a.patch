@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 4 Aug 2026 22:49:07 -0700
+Subject: [PATCH] config: ghostty_config_set_kv for embedders without a config
+ file
+
+Some embedders hold their configuration in their own settings system and
+have no file to point us at. Windows Terminal is the case that motivated
+this: a pane's font, colours and scrollback come from a WT profile.
+
+The entry point takes a key and a value, and **the value is not parsed**.
+It reaches the field's own parser exactly as the embedder wrote it - no
+quoting, no escaping, no comment syntax, nothing the caller has to encode.
+Lengths are explicit for the same reason: a value is not obliged to be a C
+string, and nothing about it needs to survive a text format it does not
+otherwise use.
+
+Taking a config-file *line* instead was the cheap implementation, and it
+failed the first time it met a real value. WT's default word delimiters
+contain a backslash and a double quote; unencoded, the value lost its
+meaning on the way in, and it still *parsed*, so nothing reported a
+rejection. The only symptom was a double click selecting one character too
+many. Escaping fixed that instance; the shape kept admitting the class.
+
+Internally the entry goes through the argument form, `--key=value`, because
+that is the form that does not parse the value: cli.args.parse splits at the
+first `=` and hands the remainder to the field untouched, where the
+config-file form first runs the line through the tokenizer that gives quotes
+and `#` their meaning. Going through parse rather than straight to
+parseIntoField is deliberate as well - it is what records the replay step, so
+an entry set this way survives a theme or conditional reload like any other.
+
+Three tests: a plain value; a value carrying quotes and surrounding spaces
+that the file form would have eaten (mutation-verified - it fails against
+that form); and the replay step being recorded.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BgDGqEqRBB8L5Ueoq1uuxy
+---
+ include/ghostty.h     | 19 +++++++++++
+ src/config/CApi.zig   | 30 +++++++++++++++++
+ src/config/Config.zig | 78 +++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 127 insertions(+)
+
+diff --git a/include/ghostty.h b/include/ghostty.h
+index 878e88782..166d93699 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -1148,6 +1148,25 @@ GHOSTTY_API void ghostty_config_load_cli_args(ghostty_config_t);
+ GHOSTTY_API void ghostty_config_load_file(ghostty_config_t, const char*);
+ GHOSTTY_API void ghostty_config_load_default_files(ghostty_config_t);
+ GHOSTTY_API void ghostty_config_load_recursive_files(ghostty_config_t);
++// Apply a single configuration entry from a key and a value. Returns false if
++// it could not be applied (the reason is logged).
++//
++// For embedders whose configuration lives in their own settings system, with
++// no file to point ghostty at. Every config key works.
++//
++// The value is taken verbatim - it is not parsed, unquoted or unescaped on the
++// way in, so an embedder holding a value as a string passes that string.
++// Lengths are explicit for the same reason: a value is not required to be a C
++// string, and nothing about it needs to survive a text format.
++//
++//     ghostty_config_set_kv(cfg, "font-family", 11, "JetBrains Mono", 14);
++//
++// Call before ghostty_config_finalize().
++GHOSTTY_API bool ghostty_config_set_kv(ghostty_config_t,
++                                       const char* key,
++                                       uintptr_t key_len,
++                                       const char* value,
++                                       uintptr_t value_len);
+ GHOSTTY_API void ghostty_config_finalize(ghostty_config_t);
+ GHOSTTY_API bool ghostty_config_get(ghostty_config_t, void*, const char*, uintptr_t);
+ GHOSTTY_API ghostty_input_trigger_s ghostty_config_trigger(ghostty_config_t,
+diff --git a/src/config/CApi.zig b/src/config/CApi.zig
+index f69f48ea4..6a03d4e7b 100644
+--- a/src/config/CApi.zig
++++ b/src/config/CApi.zig
+@@ -75,6 +75,36 @@ export fn ghostty_config_load_file(self: *Config, path: [*:0]const u8) void {
+     };
+ }
+ 
++/// Apply a single configuration entry from a key and a value. Returns false if
++/// it could not be applied; the reason is logged.
++///
++/// For embedders whose configuration lives in their own settings system and
++/// who therefore have no file to point us at. Every config key works.
++///
++/// The value is taken **verbatim** - it is not parsed, unquoted or unescaped
++/// on the way in, so an embedder holding a value as a string passes that
++/// string. Lengths are explicit for the same reason: a value is not required
++/// to be a C string, and nothing about it needs to survive a text format.
++///
++///     ghostty_config_set_kv(cfg, "font-family", 11, "JetBrains Mono", 14);
++///
++/// Call before ghostty_config_finalize, as with any other load.
++export fn ghostty_config_set_kv(
++    self: *Config,
++    key: [*]const u8,
++    key_len: usize,
++    value: [*]const u8,
++    value_len: usize,
++) bool {
++    const key_slice = key[0..key_len];
++    const value_slice = value[0..value_len];
++    self.loadEntry(global.alloc(), key_slice, value_slice) catch |err| {
++        log.err("error applying config entry key={s} err={}", .{ key_slice, err });
++        return false;
++    };
++    return true;
++}
++
+ /// Load the configuration from the user-specified configuration
+ /// file locations in the previously loaded configuration. This will
+ /// recursively continue to load up to a built-in limit.
+diff --git a/src/config/Config.zig b/src/config/Config.zig
+index 9b5982229..3881416f6 100644
+--- a/src/config/Config.zig
++++ b/src/config/Config.zig
+@@ -3957,6 +3957,84 @@ pub fn loadIter(
+     try cli.args.parse(Config, alloc, self, iter);
+ }
+ 
++/// Apply a single configuration entry from a key and a value.
++///
++/// This exists for embedders that hold their configuration somewhere else
++/// entirely - a host application's own settings system - and need to push
++/// values in rather than point ghostty at a file. Windows Terminal is the
++/// motivating case: a pane's font, colours and scrollback come from a WT
++/// profile, and there is no file to hand over.
++///
++/// **The value is not parsed.** It is taken exactly as given, all the way to
++/// the field's own parser - no quoting, no escaping, no comment syntax, and
++/// nothing an embedder has to encode on its way in. An embedder that already
++/// has the value as a string should never have to make it survive a round
++/// trip through a text format it does not otherwise use.
++///
++/// The argument form is what delivers that: `cli.args.parse` splits at the
++/// first `=` and hands the remainder to the field untouched, where the
++/// config-*file* form would first run the line through the tokenizer that
++/// gives quotes and `#` their meaning. Going through `parse` rather than
++/// straight to `parseIntoField` is deliberate too - it is what records the
++/// replay step, so an entry set this way survives a theme or conditional
++/// reload like any other.
++pub fn loadEntry(
++    self: *Config,
++    alloc: Allocator,
++    key: []const u8,
++    value: []const u8,
++) !void {
++    const arg = try std.fmt.allocPrint(alloc, "--{s}={s}", .{ key, value });
++    defer alloc.free(arg);
++
++    var iter = cli.args.sliceIterator(&.{arg});
++    try self.loadIter(alloc, &iter);
++}
++
++test "loadEntry sets a value" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var cfg: Config = try .default(alloc);
++    defer cfg.deinit();
++
++    try cfg.loadEntry(alloc, "scrollback-limit-lines", "12345");
++    try testing.expectEqual(@as(usize, 12345), cfg.@"scrollback-limit-lines".value);
++}
++
++test "loadEntry takes the value verbatim" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var cfg: Config = try .default(alloc);
++    defer cfg.deinit();
++
++    // Quotes and surrounding spaces that belong to the value rather than being
++    // syntax around it. The config-*file* form eats both - it trims the line
++    // and then removes a matching pair of outer quotes - so against that form
++    // a caller has to encode its values first, and encoding them wrongly is
++    // silent: the entry still parses, it just carries something else. That is
++    // how Windows Terminal's word delimiters reached ghostty mangled while the
++    // setting looked forwarded.
++    try cfg.loadEntry(alloc, "font-family", "\"Cascadia Mono\"");
++    try testing.expectEqualStrings("\"Cascadia Mono\"", cfg.@"font-family".list.items[0]);
++
++    try cfg.loadEntry(alloc, "font-family", "  padded  ");
++    try testing.expectEqualStrings("  padded  ", cfg.@"font-family".list.items[1]);
++}
++
++test "loadEntry records a replay step" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var cfg: Config = try .default(alloc);
++    defer cfg.deinit();
++
++    const before = cfg._replay_steps.items.len;
++    try cfg.loadEntry(alloc, "scrollback-limit-lines", "12345");
++    try testing.expectEqual(before + 1, cfg._replay_steps.items.len);
++}
++
+ /// Load configuration from the target config file at `path`.
+ ///
+ /// `path` must be resolved and absolute.

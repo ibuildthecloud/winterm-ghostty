@@ -219,7 +219,7 @@ if ($r.TimedOut -or $r.ExitCode -ne 0) {
 elseif ($r.Stderr -match 'selection-word-chars REJECTED') {
     Add-Failure 'ghostty rejected the word delimiters outright'
 }
-elseif ($r.Stderr -notmatch '\[dclick\] "([^"]*)"') {
+elseif ($r.Stderr -notmatch '\[dclick\] cells \d+\+\d+ text "([^"]*)"') {
     Add-Failure 'no word came back from the double click'
 }
 elseif ($Matches[1] -ne 'Corporation') {
@@ -227,6 +227,54 @@ elseif ($Matches[1] -ne 'Corporation') {
 }
 else {
     Add-Pass 'a double click ends the word where WT says it ends'
+}
+
+# --- 1bc. A triple click reaches the edge but copies no trailing space ------
+#
+# ghostty's triple click stops where the line's content stops; cascadia's runs
+# to the edge of the pane, and the highlight is drawn from ghostty's own
+# selection extent, so parity means asking for the wider one. The risk in doing
+# that is the copy: a wider extent must not start putting the rest of the row's
+# blanks on the clipboard.
+#
+# Both halves are visible here at once. ghostty_text_s carries no bottom-right
+# corner, so the harness prints the selection's cell span next to its text - the
+# span is what is highlighted, the text is what a copy takes, and they are meant
+# to disagree.
+Write-Host 'check: a triple click spans the line but copies only its content' -ForegroundColor Cyan
+$lineFeed = Join-Path $scratch 'line.bin'
+[System.IO.File]::WriteAllBytes($lineFeed, [System.Text.Encoding]::UTF8.GetBytes(
+    "`e[2J`e[HMicrosoft Corporation. Ltd`r`n"))
+
+$spans = @{}
+foreach ($trim in 'true', 'false') {
+    $r = Invoke-Harness -Name "line-$trim" -TimeoutMs $FeedTimeoutMs -Env @{
+        GHOSTTY_HARNESS_EXTERNAL    = '1'
+        GHOSTTY_HARNESS_FEED        = $lineFeed
+        GHOSTTY_HARNESS_TRIM_LINE   = $trim
+        GHOSTTY_HARNESS_TRIPLECLICK = '60,5'
+        GHOSTTY_HARNESS_EXIT_MS     = '2000'
+    }
+    if ($r.TimedOut -or $r.ExitCode -ne 0 -or $r.Stderr -notmatch '\[tclick\] cells (\d+)\+(\d+) text "([^"]*)"') {
+        Add-Failure "no triple-click selection came back with selection-trim-line = $trim"
+        $spans = $null
+        break
+    }
+    $spans[$trim] = @{ Len = [int]$Matches[2]; Text = $Matches[3] }
+}
+if ($spans) {
+    if ($spans['false'].Len -le $spans['true'].Len) {
+        Add-Failure ("selection-trim-line = false did not widen the highlight ({0} cells either way)" -f
+            $spans['true'].Len)
+    }
+    elseif ($spans['false'].Text -ne 'Microsoft Corporation. Ltd') {
+        Add-Failure ("the wider selection copied '{0}' - trailing blanks reached the clipboard" -f
+            $spans['false'].Text)
+    }
+    else {
+        Add-Pass ("the highlight grows {0} -> {1} cells and the copied text does not" -f
+            $spans['true'].Len, $spans['false'].Len)
+    }
 }
 
 # --- 1c. A drag selects the same characters cascadia would ------------------

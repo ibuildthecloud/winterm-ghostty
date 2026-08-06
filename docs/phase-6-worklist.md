@@ -79,6 +79,20 @@ changed.
 
 ## Order
 
-3 first — it is WT-side, needs no rebuild of libghostty, and is the one the user hits every
+3 first - it is WT-side, needs no rebuild of libghostty, and is the one the user hits every
 time they drag. Then 1 (amend patch 25, rebuild, re-run the settings tests), then 4 (small
 patch, same rebuild cycle), then 2 (the one with a regression risk of its own).
+
+## Done, 2026-08-06 - session [0007](sessions/0007-phase-6.md)
+
+All four. **The order changed to 4, 3, 1, 2.** Item 3 was put first because it was believed
+to be WT-side only; measuring it showed the fix needs to re-press at the corrected anchor,
+and a press within one cell width of the previous one is a double click to ghostty - so
+something has to end the click sequence first, which is item 4.
+
+What the measurement settled, in full, is in [selection-geometry](selection-geometry.md).
+The short version: **both endpoints WT hands the core are already selection boundaries**,
+and the press site's `std::round` - the thing two earlier attempts took at face value - is
+discarded by the drag path's re-anchor. Item 2 shipped as a ghostty config option
+(`selection-trim-line`) rather than a change to ghostty's default, so it survives
+upstreaming; the WT pane behaves exactly as this document asked.

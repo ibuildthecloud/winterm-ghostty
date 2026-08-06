@@ -1,0 +1,290 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Thu, 6 Aug 2026 01:21:03 -0700
+Subject: [PATCH] config: selection-trim-line, for a triple click that reaches
+ the edge
+
+A triple click stops where the line's content stops. Several terminals instead
+highlight the full width of the line - notably Windows Terminal, whose pane
+libghostty now has to sit alongside, where the difference reads as a highlight
+that falls short of its neighbour's.
+
+The option changes what is highlighted, not what is copied. Screen.selectionString
+trims what it emits regardless of how far the selection reaches, so widening the
+extent does not start putting a row's trailing blanks on the clipboard. Measured
+rather than assumed, because that was the regression to fear: with the option
+off, a triple click on a 26-character line in a 71-column terminal reports a
+70-cell selection and still copies 26 characters.
+
+Default unchanged; the trimming stays on unless asked otherwise. The whitespace
+set threads through the gesture the same way selection-word-chars already does,
+as codepoints rather than as a flag, so SelectionGesture never learns about
+config shapes.
+
+zig build test: 3094 passed, 58 skipped, 0 failed.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BgDGqEqRBB8L5Ueoq1uuxy
+---
+ src/Surface.zig                   | 12 ++++
+ src/config/Config.zig             | 12 ++++
+ src/terminal/SelectionGesture.zig | 96 +++++++++++++++++++++++++++++--
+ src/terminal/main.zig             |  1 +
+ 4 files changed, 117 insertions(+), 4 deletions(-)
+
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 32d20d289..827e75174 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -322,6 +322,11 @@ const DerivedConfig = struct {
+     selection_clear_on_copy: bool,
+     selection_clear_on_typing: bool,
+     selection_word_chars: []const u21,
++
++    /// Null means a triple click highlights the full width of the line rather
++    /// than stopping where its content does. Kept as the codepoint set rather
++    /// than the bool so the gesture never has to know about config shapes.
++    line_selection_whitespace: ?[]const u21,
+     vt_kam_allowed: bool,
+     wait_after_command: bool,
+     window_padding_top: u32,
+@@ -401,6 +406,10 @@ const DerivedConfig = struct {
+             .selection_clear_on_copy = config.@"selection-clear-on-copy",
+             .selection_clear_on_typing = config.@"selection-clear-on-typing",
+             .selection_word_chars = try alloc.dupe(u21, config.@"selection-word-chars".codepoints),
++            .line_selection_whitespace = if (config.@"selection-trim-line")
++                try alloc.dupe(u21, &terminal.selection_codepoints.default_line_whitespace)
++            else
++                null,
+             .vt_kam_allowed = config.@"vt-kam-allowed",
+             .wait_after_command = config.@"wait-after-command",
+             .window_padding_top = config.@"window-padding-y".top_left,
+@@ -1252,6 +1261,7 @@ fn selectionScrollTick(self: *Surface) !void {
+         .ypos = pos.y,
+         .rectangle = SurfaceMouse.isRectangleSelectState(self.mouse.mods),
+         .word_boundary_codepoints = self.config.selection_word_chars,
++        .line_whitespace_codepoints = self.config.line_selection_whitespace,
+         .geometry = .{
+             .columns = @intCast(self.size.grid().columns),
+             .cell_width = self.size.cell.width,
+@@ -4045,6 +4055,7 @@ pub fn mouseButtonCallback(
+             .max_distance = @floatFromInt(self.size.cell.width),
+             .repeat_interval = self.config.mouse_interval,
+             .word_boundary_codepoints = self.config.selection_word_chars,
++            .line_whitespace_codepoints = self.config.line_selection_whitespace,
+             .behaviors = &.{
+                 .cell,
+                 .word,
+@@ -4741,6 +4752,7 @@ pub fn cursorPosCallback(
+             .ypos = pos.y,
+             .rectangle = SurfaceMouse.isRectangleSelectState(self.mouse.mods),
+             .word_boundary_codepoints = self.config.selection_word_chars,
++            .line_whitespace_codepoints = self.config.line_selection_whitespace,
+             .geometry = .{
+                 .columns = @intCast(self.size.grid().columns),
+                 .cell_width = self.size.cell.width,
+diff --git a/src/config/Config.zig b/src/config/Config.zig
+index 3881416f6..20d9c88f1 100644
+--- a/src/config/Config.zig
++++ b/src/config/Config.zig
+@@ -766,6 +766,18 @@ foreground: Color = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF },
+ /// Available since: 1.3.0
+ @"selection-word-chars": SelectionWordChars = .{},
+ 
++/// Whether a triple-click line selection trims the whitespace around the line.
++///
++/// When true (the default), a triple click highlights only as far as the line's
++/// content reaches. When false, it highlights the full width of the line, the
++/// way several other terminals do - notably Windows Terminal, whose pane this
++/// has to sit alongside.
++///
++/// This changes what is *highlighted*, not what is copied: the text taken from
++/// a selection is trimmed either way, so turning this off does not put trailing
++/// spaces on the clipboard.
++@"selection-trim-line": bool = true,
++
+ /// The minimum contrast ratio between the foreground and background colors.
+ /// The contrast ratio is a value between 1 and 21. A value of 1 allows for no
+ /// contrast (e.g. black on black). This value is the contrast ratio as defined
+diff --git a/src/terminal/SelectionGesture.zig b/src/terminal/SelectionGesture.zig
+index a842b2471..020509f60 100644
+--- a/src/terminal/SelectionGesture.zig
++++ b/src/terminal/SelectionGesture.zig
+@@ -79,6 +79,7 @@ const ScreenSet = @import("ScreenSet.zig");
+ const Selection = @import("Selection.zig");
+ const Terminal = @import("Terminal.zig");
+ const point = @import("point.zig");
++const selection_codepoints = @import("selection_codepoints.zig");
+ 
+ const freestanding_wasm = builtin.target.cpu.arch == .wasm32 and
+     builtin.target.os.tag == .freestanding;
+@@ -252,6 +253,14 @@ pub const Press = struct {
+     /// The codepoints that delimit words for double-click selection.
+     word_boundary_codepoints: []const u21,
+ 
++    /// The codepoints to trim from the ends of a triple-click line selection,
++    /// or null to select the full width of the line.
++    ///
++    /// Selecting the full width does not put trailing spaces on the clipboard:
++    /// `Screen.selectionString` trims what it emits regardless of how far the
++    /// selection reaches. What changes is what is *highlighted*.
++    line_whitespace_codepoints: ?[]const u21 = &selection_codepoints.default_line_whitespace,
++
+     /// Selection behaviors for single-, double-, and triple-clicks.
+     behaviors: *const [3]Behavior = &default_behaviors,
+ };
+@@ -311,6 +320,14 @@ pub const Drag = struct {
+     /// The codepoints that delimit words for double-click drag selection.
+     word_boundary_codepoints: []const u21,
+ 
++    /// The codepoints to trim from the ends of a triple-click line selection,
++    /// or null to select the full width of the line.
++    ///
++    /// Selecting the full width does not put trailing spaces on the clipboard:
++    /// `Screen.selectionString` trims what it emits regardless of how far the
++    /// selection reaches. What changes is what is *highlighted*.
++    line_whitespace_codepoints: ?[]const u21 = &selection_codepoints.default_line_whitespace,
++
+     /// Geometry required for selection threshold and autoscroll calculations.
+     geometry: Geometry,
+ 
+@@ -398,6 +415,7 @@ pub fn drag(
+             t.screens.active,
+             click_pin.*,
+             d.pin,
++            d.line_whitespace_codepoints,
+         ),
+ 
+         .output => dragSelectionOutput(
+@@ -434,6 +452,14 @@ pub const AutoscrollTick = struct {
+     /// The codepoints that delimit words for double-click drag selection.
+     word_boundary_codepoints: []const u21,
+ 
++    /// The codepoints to trim from the ends of a triple-click line selection,
++    /// or null to select the full width of the line.
++    ///
++    /// Selecting the full width does not put trailing spaces on the clipboard:
++    /// `Screen.selectionString` trims what it emits regardless of how far the
++    /// selection reaches. What changes is what is *highlighted*.
++    line_whitespace_codepoints: ?[]const u21 = &selection_codepoints.default_line_whitespace,
++
+     /// Geometry required for selection threshold and autoscroll calculations.
+     geometry: Drag.Geometry,
+ };
+@@ -486,6 +512,7 @@ pub fn autoscrollTick(
+         .ypos = tick.ypos,
+         .rectangle = tick.rectangle,
+         .word_boundary_codepoints = tick.word_boundary_codepoints,
++        .line_whitespace_codepoints = tick.line_whitespace_codepoints,
+         .geometry = tick.geometry,
+     });
+ }
+@@ -687,7 +714,10 @@ fn pressSelection(
+     return switch (self.left_click_behavior) {
+         .cell => null,
+         .word => screen.selectWord(p.pin, p.word_boundary_codepoints),
+-        .line => screen.selectLine(.{ .pin = p.pin }),
++        .line => screen.selectLine(.{
++            .pin = p.pin,
++            .whitespace = p.line_whitespace_codepoints,
++        }),
+         .output => screen.selectOutput(p.pin),
+     };
+ }
+@@ -883,16 +913,22 @@ fn dragSelectionLine(
+     screen: *Screen,
+     click_pin: Pin,
+     drag_pin: Pin,
++    whitespace: ?[]const u21,
+ ) ?Selection {
+     // Get the line selection under our current drag point. If there isn't a
+     // line, do nothing.
+-    const line = screen.selectLine(.{ .pin = drag_pin }) orelse return null;
++    const line = screen.selectLine(.{
++        .pin = drag_pin,
++        .whitespace = whitespace,
++    }) orelse return null;
+ 
+     // Get the selection under our click point. We first try to trim
+     // whitespace if we've selected a word. But if no word exists then
+     // we select the blank line.
+-    const sel_ = screen.selectLine(.{ .pin = click_pin }) orelse
+-        screen.selectLine(.{ .pin = click_pin, .whitespace = null });
++    const sel_ = screen.selectLine(.{
++        .pin = click_pin,
++        .whitespace = whitespace,
++    }) orelse screen.selectLine(.{ .pin = click_pin, .whitespace = null });
+ 
+     var sel = sel_ orelse return null;
+     if (drag_pin.before(click_pin)) {
+@@ -1924,6 +1960,58 @@ test "SelectionGesture triple-click drag selects by line" {
+     ), sel);
+ }
+ 
++test "SelectionGesture triple-click without trimming spans the full line" {
++    var t = try Terminal.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
++    defer t.deinit(testing.allocator);
++    try t.printString("alpha beta");
++
++    var gesture: SelectionGesture = .init;
++    defer gesture.deinit(&t);
++
++    const time = std.Io.Timestamp.now(testing.io, .awake);
++    var event = testPress(&t, 1, 0, time);
++    event.line_whitespace_codepoints = null;
++
++    _ = try gesture.press(&t, event);
++    _ = try gesture.press(&t, event);
++    const sel = (try gesture.press(&t, event)).?;
++
++    // Column 19, not column 9 where "alpha beta" ends. The highlight reaches
++    // the edge of the line the way Windows Terminal's does; what a copy takes
++    // from it is trimmed separately, by Screen.selectionString.
++    try testing.expectEqualDeep(Selection.init(
++        testPin(&t, 0, 0),
++        testPin(&t, 19, 0),
++        false,
++    ), sel);
++}
++
++test "SelectionGesture triple-click drag without trimming spans full lines" {
++    var t = try Terminal.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
++    defer t.deinit(testing.allocator);
++    try t.printString("alpha beta\none two\nthree four");
++
++    var gesture: SelectionGesture = .init;
++    defer gesture.deinit(&t);
++
++    const time = std.Io.Timestamp.now(testing.io, .awake);
++    var event = testPress(&t, 1, 0, time);
++    event.line_whitespace_codepoints = null;
++    _ = try gesture.press(&t, event);
++    _ = try gesture.press(&t, event);
++    _ = try gesture.press(&t, event);
++
++    var drag_event = testDrag(&t, 2, 2, 20, 50);
++    drag_event.line_whitespace_codepoints = null;
++    const sel = gesture.drag(&t, drag_event).?;
++
++    try testing.expectEqualDeep(Selection.init(
++        testPin(&t, 0, 0),
++        testPin(&t, 19, 2),
++        false,
++    ), sel);
++}
++
+ test "SelectionGesture triple-click drag selects by line backwards" {
+     var t = try Terminal.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
+     defer t.deinit(testing.allocator);
+diff --git a/src/terminal/main.zig b/src/terminal/main.zig
+index af277f976..1421e390f 100644
+--- a/src/terminal/main.zig
++++ b/src/terminal/main.zig
+@@ -51,6 +51,7 @@ pub const ScreenSet = @import("ScreenSet.zig");
+ pub const Scrollbar = PageList.Scrollbar;
+ pub const Selection = @import("Selection.zig");
+ pub const SelectionGesture = @import("SelectionGesture.zig");
++pub const selection_codepoints = @import("selection_codepoints.zig");
+ pub const SizeReportStyle = csi.SizeReportStyle;
+ pub const StringMap = @import("StringMap.zig");
+ pub const Style = style.Style;

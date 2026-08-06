@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Wed, 5 Aug 2026 11:48:04 -0700
+Subject: [PATCH] apprt: ghostty_surface_render_now for embedders without a
+ paint loop
+
+An embedder that feeds pty output has no way to say "I just gave you
+bytes, put them on screen". queueRender goes through the renderer's
+coalescing wakeup, and an update landing after the render thread has
+sampled terminal state is folded into a wake that has already done its
+work - so the tail of a burst never reaches the screen and the surface
+sits stale until some unrelated event forces a render.
+
+ghostty_surface_draw is not that lever: it is drawFrame alone, which
+re-presents the cells the render thread last *built*. Forcing it after
+new output redraws stale content - measured, the pane still froze.
+
+renderNow does both halves, updateFrame then drawFrame, on the calling
+thread. Both take the renderer state mutex exactly as the render thread's
+own path does, so it is safe from the thread feeding output.
+
+This only shows up without a paint loop. hwnd-host calls
+ghostty_surface_draw on WM_PAINT and a focused surface gets one-shot
+renders from focus, scroll and visibility changes - which is why three
+phases of harness work never surfaced it, and why an unfocused pane in a
+XAML SwapChainPanel surfaced it immediately.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ee27Fih3vSPYsqrUBpUoc
+---
+ include/ghostty.h      | 11 +++++++++++
+ src/Surface.zig        | 23 +++++++++++++++++++++++
+ src/apprt/embedded.zig | 21 +++++++++++++++++++++
+ 3 files changed, 55 insertions(+)
+
+diff --git a/include/ghostty.h b/include/ghostty.h
+index 166d93699..b316451ae 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -1227,6 +1227,17 @@ GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
+ GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
++// Rebuild the frame from current terminal state and draw it immediately, on
++// the calling thread.
++//
++// For embedders that feed pty output and have no paint loop.
++// ghostty_surface_draw only re-presents the cells the render thread last
++// built; this rebuilds them first, so bytes just written with
++// ghostty_surface_write_pty_output actually reach the screen instead of
++// waiting for an unrelated event (focus, scroll, resize) to force a render.
++//
++// Safe to call from the thread feeding output.
++GHOSTTY_API void ghostty_surface_render_now(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
+ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
+ GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+diff --git a/src/Surface.zig b/src/Surface.zig
+index c61f258df..4e6bd96eb 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -905,6 +905,29 @@ pub fn draw(self: *Surface) !void {
+     try self.renderer.drawFrame(true);
+ }
+ 
++/// Rebuild the frame from the current terminal state and draw it, now, on
++/// the calling thread.
++///
++/// `draw` only re-presents the cells the render thread last built, which is
++/// what a resize needs. An embedder that has just pushed pty output needs the
++/// other half too: without the rebuild it re-presents stale content.
++///
++/// This exists because scheduling a render is not sufficient for an embedder
++/// whose surface is not driven by a paint loop. `queueRender` goes through the
++/// renderer's coalescing wakeup, and an update landing after the render thread
++/// has sampled terminal state is folded into a wake that has already done its
++/// work - so the last output of a burst never reaches the screen and the
++/// surface sits stale until some unrelated event (focus, scroll, visibility)
++/// forces a render. A terminal in a XAML SwapChainPanel has no paint loop to
++/// hide that.
++///
++/// Both halves take the renderer state mutex, the same as the render thread's
++/// own path, so calling this from the thread feeding output is safe.
++pub fn renderNow(self: *Surface) !void {
++    try self.renderer.updateFrame(&self.renderer_state, true);
++    try self.renderer.drawFrame(true);
++}
++
+ /// Activate the inspector. This will begin collecting inspection data.
+ /// This will not affect the GUI. The GUI must use performAction to
+ /// show/hide the inspector UI.
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index 7c5bfb53f..ac4c943cf 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -930,6 +930,13 @@ pub const Surface = struct {
+         };
+     }
+ 
++    pub fn renderNow(self: *Surface) void {
++        self.core_surface.renderNow() catch |err| {
++            log.err("error in renderNow err={}", .{err});
++            return;
++        };
++    }
++
+     pub fn updateContentScale(self: *Surface, x: f64, y: f64) void {
+         // We are an embedded API so the caller can send us all sorts of
+         // garbage. We want to make sure that the float values are valid
+@@ -1943,6 +1950,20 @@ pub const CAPI = struct {
+         surface.draw();
+     }
+ 
++    /// Rebuild the frame from current terminal state and draw it immediately,
++    /// on the calling thread.
++    ///
++    /// For embedders that feed pty output and have no paint loop to fall back
++    /// on. ghostty_surface_draw only re-presents the cells the render thread
++    /// last built; this rebuilds them first, so output that has just been
++    /// written with ghostty_surface_write_pty_output actually reaches the
++    /// screen rather than waiting for an unrelated event to force a render.
++    ///
++    /// Safe to call from the thread feeding output.
++    export fn ghostty_surface_render_now(surface: *Surface) void {
++        surface.renderNow();
++    }
++
+     /// Update the size of a surface. This will trigger resize notifications
+     /// to the pty and the renderer.
+     export fn ghostty_surface_set_size(surface: *Surface, w: u32, h: u32) void {

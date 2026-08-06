@@ -297,6 +297,14 @@ int main(void) {
     // so being able to push the real thing in and then double click on the
     // result is the check that matters.
     {
+        char trim[16];
+        const DWORD n = GetEnvironmentVariableA("GHOSTTY_HARNESS_TRIM_LINE", trim, sizeof(trim));
+        if (n > 0 && n < sizeof(trim)) {
+            ghostty_config_set_kv(config, "selection-trim-line",
+                                  sizeof("selection-trim-line") - 1, trim, n);
+        }
+    }
+    {
         char chars[256];
         const DWORD n = GetEnvironmentVariableA("GHOSTTY_HARNESS_WORD_CHARS", chars, sizeof(chars));
         if (n > 0 && n < sizeof(chars)) {
@@ -495,6 +503,10 @@ int main(void) {
             // GHOSTTY_HARNESS_DOUBLECLICK=x,y selects the word under a point
             // the way a Windows Terminal double click does: two presses, no
             // movement, then read back what ghostty called a word.
+            // GHOSTTY_HARNESS_TRIPLECLICK=x,y is the same with three, which is
+            // how the *copy* half of a full-width line selection gets checked:
+            // widening the highlight must not start putting the rest of the
+            // row's blanks on the clipboard.
             //
             // Paired with GHOSTTY_HARNESS_WORD_CHARS this is the end-to-end
             // check for the settings entry point. WT's word delimiters reached
@@ -502,21 +514,31 @@ int main(void) {
             // still parsed, and the only symptom was a double click that kept a
             // trailing character cascadia dropped.
             char dclick[64];
-            if (GetEnvironmentVariableA("GHOSTTY_HARNESS_DOUBLECLICK", dclick, sizeof(dclick)) > 0) {
+            const bool triple = GetEnvironmentVariableA("GHOSTTY_HARNESS_TRIPLECLICK", dclick, sizeof(dclick)) > 0;
+            if (triple || GetEnvironmentVariableA("GHOSTTY_HARNESS_DOUBLECLICK", dclick, sizeof(dclick)) > 0) {
                 double x = 0, y = 0;
                 if (sscanf(dclick, "%lf,%lf", &x, &y) == 2) {
+                    const int clicks = triple ? 3 : 2;
                     ghostty_surface_mouse_pos(g_state.surface, x, y, GHOSTTY_MODS_NONE);
-                    ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
-                    ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+                    for (int i = 0; i < clicks; i++) {
+                        ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+                    }
 
-                    fprintf(stderr, "[dclick] ");
+                    fprintf(stderr, "[%s] ", triple ? "tclick" : "dclick");
                     ghostty_text_s word = {0};
                     if (!ghostty_surface_has_selection(g_state.surface)) {
                         fprintf(stderr, "(none)\n");
                     } else if (!ghostty_surface_read_selection(g_state.surface, &word)) {
                         fprintf(stderr, "READ FAILED\n");
                     } else {
-                        fprintf(stderr, "\"%.*s\"\n", (int)word.text_len, word.text);
+                        // The offsets are how far the *highlight* reaches; the
+                        // text is what a copy would take. For a full-width line
+                        // selection those two are supposed to disagree, and
+                        // printing both is the only way to see it from here -
+                        // ghostty_text_s carries no bottom-right corner.
+                        fprintf(stderr, "cells %u+%u text \"%.*s\"\n",
+                                word.offset_start, word.offset_len,
+                                (int)word.text_len, word.text);
                         ghostty_surface_free_text(g_state.surface, &word);
                     }
                     ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
