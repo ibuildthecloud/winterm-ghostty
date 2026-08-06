@@ -185,6 +185,50 @@ else {
     Add-Pass 'the whole-screen selection returns exactly what was written'
 }
 
+# --- 1bb. WT's word delimiters reach the engine intact ----------------------
+#
+# The bug that reshaped the settings entry point: WT's default wordDelimiters
+# went over as part of a config-file *line*, lost its meaning to that line's
+# syntax, and was rejected by a diagnostic libghostty never surfaces. The
+# setting looked forwarded and ghostty quietly kept its own word boundaries -
+# visible only as a double click that kept a trailing "." cascadia dropped.
+#
+# So the check is the symptom: feed a sentence, double click a word, and demand
+# the character cascadia would have left out.
+Write-Host "check: WT's word delimiters survive the trip into ghostty" -ForegroundColor Cyan
+$wordFeed = Join-Path $scratch 'words.bin'
+[System.IO.File]::WriteAllBytes($wordFeed, [System.Text.Encoding]::UTF8.GetBytes(
+    "`e[2J`e[HMicrosoft Corporation. Ltd`r`n"))
+
+# WT's default wordDelimiters, escaped exactly as GhosttySettingsTranslator
+# emits it - the backslash doubled because selection-word-chars is parsed as a
+# Zig string literal by the field itself, and nothing else touched.
+$wordChars = ' ./\\()"' + "'" + '-:,.;<>~!@#$%^&*|+=[]{}~?'
+
+# x lands inside "Corporation", which starts at column 10.
+$r = Invoke-Harness -Name 'words' -TimeoutMs $FeedTimeoutMs -Env @{
+    GHOSTTY_HARNESS_EXTERNAL    = '1'
+    GHOSTTY_HARNESS_FEED        = $wordFeed
+    GHOSTTY_HARNESS_WORD_CHARS  = $wordChars
+    GHOSTTY_HARNESS_DOUBLECLICK = '130,5'
+    GHOSTTY_HARNESS_EXIT_MS     = '2000'
+}
+if ($r.TimedOut -or $r.ExitCode -ne 0) {
+    Add-Failure 'harness did not survive the word-delimiter feed'
+}
+elseif ($r.Stderr -match 'selection-word-chars REJECTED') {
+    Add-Failure 'ghostty rejected the word delimiters outright'
+}
+elseif ($r.Stderr -notmatch '\[dclick\] "([^"]*)"') {
+    Add-Failure 'no word came back from the double click'
+}
+elseif ($Matches[1] -ne 'Corporation') {
+    Add-Failure ("double click selected '{0}', cascadia would select 'Corporation'" -f $Matches[1])
+}
+else {
+    Add-Pass 'a double click ends the word where WT says it ends'
+}
+
 # --- 1c. A drag selects the same characters cascadia would ------------------
 #
 # The pieces of the selection mapping are pinned on their own sides - what

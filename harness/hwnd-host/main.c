@@ -269,6 +269,11 @@ int main(void) {
 
     trace("ghostty_init_w ok");
 
+    // Key and value, not a line: ghostty_config_set_kv parses neither, which is
+    // the whole point of it - a value never has to survive a text format.
+    #define set_config(cfg, key, value) \
+        ghostty_config_set_kv((cfg), (key), sizeof(key) - 1, (value), sizeof(value) - 1)
+
     ghostty_config_t config = ghostty_config_new();
     if (!config) { fprintf(stderr, "ghostty_config_new failed\n"); return 1; }
     trace("ghostty_config_new ok");
@@ -282,9 +287,25 @@ int main(void) {
     // the harness sends lands a third of a cell further left than the same
     // position would in a WT pane, which makes the harness a measuring
     // instrument for a geometry nobody ships.
-    ghostty_config_set(config, "window-padding-x = 0");
-    ghostty_config_set(config, "window-padding-y = 0");
-    ghostty_config_set(config, "window-padding-balance = false");
+    set_config(config, "window-padding-x", "0");
+    set_config(config, "window-padding-y", "0");
+    set_config(config, "window-padding-balance", "false");
+
+    // GHOSTTY_HARNESS_WORD_CHARS is passed straight through, exactly as
+    // Windows Terminal's settings translator would hand it over. WT's default
+    // word delimiters are the value that broke the old line-shaped entry point,
+    // so being able to push the real thing in and then double click on the
+    // result is the check that matters.
+    {
+        char chars[256];
+        const DWORD n = GetEnvironmentVariableA("GHOSTTY_HARNESS_WORD_CHARS", chars, sizeof(chars));
+        if (n > 0 && n < sizeof(chars)) {
+            if (!ghostty_config_set_kv(config, "selection-word-chars",
+                                       sizeof("selection-word-chars") - 1, chars, n)) {
+                fprintf(stderr, "[hwnd-host] selection-word-chars REJECTED\n");
+            }
+        }
+    }
     ghostty_config_finalize(config);
     trace("ghostty_config_finalize ok");
 
@@ -467,6 +488,38 @@ int main(void) {
                     ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
                     fprintf(stderr, "[hwnd-host] after release has_selection=%d\n",
                             ghostty_surface_has_selection(g_state.surface) ? 1 : 0);
+                    fflush(stderr);
+                }
+            }
+
+            // GHOSTTY_HARNESS_DOUBLECLICK=x,y selects the word under a point
+            // the way a Windows Terminal double click does: two presses, no
+            // movement, then read back what ghostty called a word.
+            //
+            // Paired with GHOSTTY_HARNESS_WORD_CHARS this is the end-to-end
+            // check for the settings entry point. WT's word delimiters reached
+            // ghostty mangled once already and nothing reported it - the value
+            // still parsed, and the only symptom was a double click that kept a
+            // trailing character cascadia dropped.
+            char dclick[64];
+            if (GetEnvironmentVariableA("GHOSTTY_HARNESS_DOUBLECLICK", dclick, sizeof(dclick)) > 0) {
+                double x = 0, y = 0;
+                if (sscanf(dclick, "%lf,%lf", &x, &y) == 2) {
+                    ghostty_surface_mouse_pos(g_state.surface, x, y, GHOSTTY_MODS_NONE);
+                    ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+                    ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+
+                    fprintf(stderr, "[dclick] ");
+                    ghostty_text_s word = {0};
+                    if (!ghostty_surface_has_selection(g_state.surface)) {
+                        fprintf(stderr, "(none)\n");
+                    } else if (!ghostty_surface_read_selection(g_state.surface, &word)) {
+                        fprintf(stderr, "READ FAILED\n");
+                    } else {
+                        fprintf(stderr, "\"%.*s\"\n", (int)word.text_len, word.text);
+                        ghostty_surface_free_text(g_state.surface, &word);
+                    }
+                    ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
                     fflush(stderr);
                 }
             }
