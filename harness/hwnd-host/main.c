@@ -410,6 +410,56 @@ int main(void) {
                 }
                 fflush(stderr);
             }
+
+            // GHOSTTY_HARNESS_SELECT=x1,y1,x2,y2 (in cells) drives exactly the
+            // sequence Windows Terminal's GhosttyControlCore drives for a
+            // drag-selection - mouse_pos, press, mouse_pos, then read the
+            // selection back - and prints what ghostty says is selected.
+            //
+            // The point is the *sequence*, not the geometry. WT never reports
+            // a button release outside VT mouse mode, so its core synthesises
+            // one lazily; this proves the press/move/read order actually
+            // produces a selection before that inference is trusted in a pane
+            // nobody can drag a mouse in unattended.
+            char sel[64];
+            if (GetEnvironmentVariableA("GHOSTTY_HARNESS_SELECT", sel, sizeof(sel)) > 0) {
+                int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+                if (sscanf(sel, "%d,%d,%d,%d", &x1, &y1, &x2, &y2) == 4) {
+                    const ghostty_surface_size_s size = ghostty_surface_size(g_state.surface);
+                    const double cw = size.cell_width_px, ch = size.cell_height_px;
+                    fprintf(stderr, "[hwnd-host] cell %.1fx%.1f px\n", cw, ch);
+
+                    ghostty_surface_mouse_pos(g_state.surface, (x1 + 0.5) * cw, (y1 + 0.5) * ch, GHOSTTY_MODS_NONE);
+                    ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+                    ghostty_surface_mouse_pos(g_state.surface, (x2 + 0.5) * cw, (y2 + 0.5) * ch, GHOSTTY_MODS_NONE);
+
+                    fprintf(stderr, "[hwnd-host] has_selection=%d\n",
+                            ghostty_surface_has_selection(g_state.surface) ? 1 : 0);
+
+                    ghostty_text_s got = {0};
+                    if (!ghostty_surface_read_selection(g_state.surface, &got)) {
+                        fprintf(stderr, "[hwnd-host] read_selection FAILED\n");
+                    } else {
+                        fprintf(stderr, "[hwnd-host] selection %zu bytes: ", got.text_len);
+                        for (size_t i = 0; i < got.text_len; i++) {
+                            const unsigned char c = (unsigned char)got.text[i];
+                            if (c == '\n') fprintf(stderr, "<LF>");
+                            else if (c < 0x20) fprintf(stderr, "<%02x>", c);
+                            else fputc(c, stderr);
+                        }
+                        fprintf(stderr, "\n");
+                        ghostty_surface_free_text(g_state.surface, &got);
+                    }
+
+                    // The lazy release WT's core performs before the next
+                    // selection. If this ever stops being a no-op for the
+                    // selection state, the core's assumption is wrong.
+                    ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+                    fprintf(stderr, "[hwnd-host] after release has_selection=%d\n",
+                            ghostty_surface_has_selection(g_state.surface) ? 1 : 0);
+                    fflush(stderr);
+                }
+            }
         }
     }
 
