@@ -164,6 +164,22 @@ was cheap. On that basis:
 
 ## Carried from Phase 5, for the retro
 
+0. **`ghostty_config_set` should take a key and a value, not a line.** Patch 25 implemented
+   it by reusing ghostty's config-*file* line parser, so every setting is handed over as
+   `key = value` text and any value containing quoting metacharacters has to be escaped.
+   That is not ghostty's constraint - it is the cheap implementation showing through.
+
+   It failed the first time it met a real value: WT's default `wordDelimiters` contains a
+   backslash and a double quote, so the entry ended its own quoted string early and ghostty
+   received a truncated delimiter set. The entry was *accepted*, so nothing logged a
+   rejection; the only symptom was a double click picking a different word than cascadia.
+
+   Escaping now fixes it, but the shape is still wrong. `ghostty_config_set_kv(config, key,
+   key_len, value, value_len)` assigning the value verbatim removes the class of bug rather
+   than this instance of it. Small change to the same patch; worth doing before more
+   settings are added on top.
+
+
 1. **`renderNow` compensates for an upstream shortcoming.** Windows Terminal renders after
    every write because libghostty's wakeup coalesces. The alternative is a patch making the
    wakeup's tail non-coalescing, upstream-shaped. Still open; it costs a render per batch
