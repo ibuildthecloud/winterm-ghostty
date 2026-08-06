@@ -92,6 +92,31 @@ the preedit width and padding accounted for.
 end-to-end including candidate-window placement, which needs an installed IME and
 a human at the keyboard. *Read.*
 
+### GD-13 — Double-clicking past the end of a line selects nothing
+
+Double-click in the empty region to the right of a prompt or a line of output:
+cascadia highlights the whitespace out to the edge of the pane, ghostty selects
+nothing. Found by hand, 2026-08-06.
+
+This is a buffer-model difference rather than a selection-rule one, and it is
+narrower than it looks. Measured against the real engine on `aaa     bbb`:
+
+| double-click target | cascadia | ghostty |
+|---|---|---|
+| space run **inside** written text | selects the run | selects the run (`cells 3+4`, five spaces) |
+| region **past the end** of the line | selects to the pane edge | selects nothing |
+
+Cascadia's text buffer pads every row to full width with real space characters,
+so those cells are written and a run of them is a word made of delimiters.
+ghostty leaves them empty, and `Screen.selectWord` refuses on purpose: "If our
+cell is empty we can't select a word, because we can't select areas where the
+screen is not yet written."
+
+**Recommended: leave it.** What closing it buys is selecting and copying spaces
+that do not exist; what it costs is either changing ghostty's double-click for
+everyone against an explicit design decision (so, not upstreamable) or a third
+config option and its plumbing. *Measured.*
+
 ### GD-06 — Keyboard selection: no mark mode, no quick-edit
 
 `ToggleMarkMode`, `SwitchSelectionEndpoint`, `ExpandSelectionToWord`,
