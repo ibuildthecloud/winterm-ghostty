@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Thu, 6 Aug 2026 15:04:06 -0700
+Subject: [PATCH] config: cursor-style-unfocused, for a surface that draws no
+ cursor unfocused
+
+An unfocused surface always drew a hollow block. The rule was hardcoded in
+renderer/cursor.zig with no way past it, so every configured cursor style
+collapsed to the same hollow box the moment focus moved.
+
+Most terminals do exactly that, and it stays the default. Windows Terminal draws
+no cursor at all in an unfocused pane, and a libghostty surface sitting next to
+one of those needs to agree with it - side by side, a hollow box where the
+neighbour shows nothing does not read as a different convention, it reads as the
+cursor setting being ignored.
+
+The option is an enum rather than a bool so a future "keep the focused style"
+has somewhere to go. Threaded through the renderer's derived config, so it
+follows a live config reload like every other cursor setting.
+
+zig build test: 3095 passed, 58 skipped, 0 failed. The new test pins that the
+blink state cannot resurrect a hidden unfocused cursor, which is the way the
+old ordering would most plausibly have been got wrong.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BgDGqEqRBB8L5Ueoq1uuxy
+---
+ src/config/Config.zig    | 19 +++++++++++++++++++
+ src/renderer.zig         |  1 +
+ src/renderer/cursor.zig  | 41 +++++++++++++++++++++++++++++++++++++---
+ src/renderer/generic.zig |  6 ++++++
+ 4 files changed, 64 insertions(+), 3 deletions(-)
+
+diff --git a/src/config/Config.zig b/src/config/Config.zig
+index 20d9c88f1..55be18012 100644
+--- a/src/config/Config.zig
++++ b/src/config/Config.zig
+@@ -890,6 +890,19 @@ palette: Palette = .{},
+ ///   * `block_hollow`
+ @"cursor-style": terminal.CursorStyle = .block,
+ 
++/// What the cursor looks like while the surface does not have focus.
++///
++/// Valid values are:
++///
++///   * `hollow` - a hollow block, whatever the focused style is
++///   * `hidden` - no cursor at all
++///
++/// The default matches most terminals: an unfocused surface shows a hollow
++/// block so the cursor's position is still readable. Windows Terminal instead
++/// draws nothing at all when a pane loses focus, and a pane sitting next to one
++/// of those wants to agree with it.
++@"cursor-style-unfocused": UnfocusedCursorStyle = .hollow,
++
+ /// Sets the default blinking state of the cursor. This is just the default
+ /// state; running programs may override the cursor style using `DECSCUSR` (`CSI
+ /// q`).
+@@ -6274,6 +6287,12 @@ pub const RepeatableString = struct {
+ /// characters used during text selection. The string is parsed once
+ /// during configuration and stored as u21 codepoints for efficient
+ /// lookup during selection operations.
++/// See cursor-style-unfocused.
++pub const UnfocusedCursorStyle = enum {
++    hollow,
++    hidden,
++};
++
+ pub const SelectionWordChars = struct {
+     const Self = @This();
+ 
+diff --git a/src/renderer.zig b/src/renderer.zig
+index 2e25a96ce..7c4241f06 100644
+--- a/src/renderer.zig
++++ b/src/renderer.zig
+@@ -32,6 +32,7 @@ pub const ScreenSize = size.ScreenSize;
+ pub const GridSize = size.GridSize;
+ pub const Padding = size.Padding;
+ pub const cursorStyle = cursor.style;
++pub const CursorStyleOptions = cursor.StyleOptions;
+ pub const lib = @import("lib/main.zig");
+ 
+ /// The implementation to use for the renderer. This is comptime chosen
+diff --git a/src/renderer/cursor.zig b/src/renderer/cursor.zig
+index 3314db29f..073d86bb6 100644
+--- a/src/renderer/cursor.zig
++++ b/src/renderer/cursor.zig
+@@ -29,6 +29,14 @@ pub const StyleOptions = struct {
+     preedit: bool = false,
+     focused: bool = false,
+     blink_visible: bool = false,
++
++    /// What to draw when the surface is unfocused. Most terminals show a
++    /// hollow block so the cursor stays findable; some - Windows Terminal
++    /// among them - draw nothing, and a surface embedded beside one of those
++    /// wants to agree with it. Config: cursor-style-unfocused.
++    unfocused: Unfocused = .hollow,
++
++    pub const Unfocused = enum { hollow, hidden };
+ };
+ 
+ /// Returns the cursor style to use for the current render state or null
+@@ -55,9 +63,13 @@ pub fn style(
+     // If the cursor is explicitly not visible by terminal mode, we don't render.
+     if (!state.cursor.visible) return null;
+ 
+-    // If we're not focused, our cursor is always visible so that
+-    // we can show the hollow box.
+-    if (!opts.focused) return .block_hollow;
++    // If we're not focused we show the hollow box, which keeps the cursor
++    // findable without implying the surface will accept input - unless the
++    // embedder asked for nothing at all.
++    if (!opts.focused) return switch (opts.unfocused) {
++        .hollow => .block_hollow,
++        .hidden => null,
++    };
+ 
+     // If the cursor is blinking and our blink state is not visible,
+     // then we don't show the cursor.
+@@ -67,6 +79,29 @@ pub fn style(
+     return .fromTerminal(state.cursor.visual_style);
+ }
+ 
++test "cursor: unfocused can be hidden entirely" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    const io = testing.io;
++    var term: terminal.Terminal = try .init(io, alloc, .{ .cols = 10, .rows = 10 });
++    defer term.deinit(alloc);
++
++    term.screens.active.cursor.cursor_style = .bar;
++
++    var state: terminal.RenderState = .empty;
++    defer state.deinit(alloc);
++    try state.update(alloc, &term);
++
++    // Focused is unaffected either way.
++    try testing.expect(style(&state, .{ .focused = true, .blink_visible = true, .unfocused = .hidden }) == .bar);
++    try testing.expect(style(&state, .{ .focused = true, .blink_visible = true, .unfocused = .hollow }) == .bar);
++
++    // Unfocused is the whole point, and the blink state must not resurrect it.
++    try testing.expect(style(&state, .{ .focused = false, .blink_visible = true, .unfocused = .hidden }) == null);
++    try testing.expect(style(&state, .{ .focused = false, .blink_visible = false, .unfocused = .hidden }) == null);
++    try testing.expect(style(&state, .{ .focused = false, .blink_visible = true, .unfocused = .hollow }) == .block_hollow);
++}
++
+ test "cursor: default uses configured style" {
+     const testing = std.testing;
+     const alloc = testing.allocator;
+diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
+index e0760fce1..770595402 100644
+--- a/src/renderer/generic.zig
++++ b/src/renderer/generic.zig
+@@ -547,6 +547,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             font_shaping_break: configpkg.FontShapingBreak,
+             cursor_color: ?configpkg.Config.TerminalColor,
+             cursor_opacity: f64,
++            cursor_unfocused: renderer.CursorStyleOptions.Unfocused,
+             cursor_text: ?configpkg.Config.TerminalColor,
+             background: terminal.color.RGB,
+             background_opacity: f64,
+@@ -620,6 +621,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                     .cursor_color = config.@"cursor-color",
+                     .cursor_text = config.@"cursor-text",
+                     .cursor_opacity = @max(0, @min(1, config.@"cursor-opacity")),
++                    .cursor_unfocused = switch (config.@"cursor-style-unfocused") {
++                        .hollow => .hollow,
++                        .hidden => .hidden,
++                    },
+ 
+                     .background = config.background.toTerminalRGB(),
+                     .foreground = config.foreground.toTerminalRGB(),
+@@ -1376,6 +1381,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                         .preedit = critical.preedit != null,
+                         .focused = self.focused,
+                         .blink_visible = cursor_blink_visible,
++                        .unfocused = self.config.cursor_unfocused,
+                     }),
+                     &critical.links,
+                 ) catch |err| {

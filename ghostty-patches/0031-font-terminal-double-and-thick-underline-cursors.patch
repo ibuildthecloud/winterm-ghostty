@@ -1,0 +1,358 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Thu, 6 Aug 2026 15:32:44 -0700
+Subject: [PATCH] font+terminal: double and thick underline cursors
+
+Two cursor shapes DECSCUSR has no name for, and which several terminals draw
+anyway: two stacked underlines, and a thick underline filling the bottom quarter
+of the cell - the shape the Windows console has drawn for decades and the one
+Windows Terminal calls "vintage".
+
+Both are sprite glyphs, so they are drawn once into the atlas by shared code and
+every renderer gets them without touching a backend. The double one uses the
+same arrangement as the double underline for *text*, so the cursor and an
+underlined character line up. The thick one is measured from the bottom of the
+cell rather than from the underline position, because it is a short block rather
+than a heavy line and hanging it off the underline would put it somewhere
+different in every font.
+
+Both report as DECSCUSR 3 or 4, alongside block_hollow reporting as 1 or 2:
+they are Ghostty styles, not new terminal protocol.
+
+The C API's two cursor enums grew with them, which `zig build test` could not
+have told me - it builds a module set that excludes them, and the library build
+is what caught it. That is the second time today.
+
+zig build test: 3096 passed, 58 skipped, 0 failed. The sprite test pins what
+distinguishes each from a plain underline - the double is taller than one band,
+the thick is a quarter of the cell - because either could silently degrade to
+the single underline they replaced.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BgDGqEqRBB8L5Ueoq1uuxy
+---
+ include/ghostty/vt/render.h      |  7 ++++
+ include/ghostty/vt/terminal.h    |  7 ++++
+ src/font/sprite.zig              |  2 ++
+ src/font/sprite/Face.zig         | 41 +++++++++++++++++++++
+ src/font/sprite/draw/special.zig | 62 ++++++++++++++++++++++++++++++++
+ src/renderer/cell.zig            |  8 ++++-
+ src/renderer/cursor.zig          |  4 +++
+ src/renderer/generic.zig         |  4 +++
+ src/terminal/c/render.zig        |  4 +++
+ src/terminal/c/terminal.zig      |  4 +++
+ src/terminal/cursor.zig          |  9 +++++
+ src/terminal/dcs.zig             |  5 ++-
+ 12 files changed, 155 insertions(+), 2 deletions(-)
+
+diff --git a/include/ghostty/vt/render.h b/include/ghostty/vt/render.h
+index 2e3f2f71e..d67e5d2e1 100644
+--- a/include/ghostty/vt/render.h
++++ b/include/ghostty/vt/render.h
+@@ -127,6 +127,13 @@ typedef enum GHOSTTY_ENUM_TYPED {
+ 
+   /** Hollow block cursor. */
+   GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW = 3,
++
++  /** Two stacked underlines (DECSCUSR 3, 4). */
++  GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE_DOUBLE = 4,
++
++  /** A thick underline filling the bottom quarter of the cell
++   *  (DECSCUSR 3, 4). */
++  GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE_THICK = 5,
+   GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+ } GhosttyRenderStateCursorVisualStyle;
+ 
+diff --git a/include/ghostty/vt/terminal.h b/include/ghostty/vt/terminal.h
+index 9480d37a3..bdd7ce844 100644
+--- a/include/ghostty/vt/terminal.h
++++ b/include/ghostty/vt/terminal.h
+@@ -296,6 +296,13 @@ typedef enum GHOSTTY_ENUM_TYPED {
+ 
+   /** Hollow block cursor. */
+   GHOSTTY_TERMINAL_CURSOR_STYLE_BLOCK_HOLLOW = 3,
++
++  /** Two stacked underlines (reported as DECSCUSR 3, 4). */
++  GHOSTTY_TERMINAL_CURSOR_STYLE_UNDERLINE_DOUBLE = 4,
++
++  /** A thick underline filling the bottom quarter of the cell
++   *  (reported as DECSCUSR 3, 4). */
++  GHOSTTY_TERMINAL_CURSOR_STYLE_UNDERLINE_THICK = 5,
+   GHOSTTY_TERMINAL_CURSOR_STYLE_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+ } GhosttyTerminalCursorStyle;
+ 
+diff --git a/src/font/sprite.zig b/src/font/sprite.zig
+index cf86fa6dd..4211dc7e9 100644
+--- a/src/font/sprite.zig
++++ b/src/font/sprite.zig
+@@ -33,6 +33,8 @@ pub const Sprite = enum(u32) {
+     cursor_hollow_rect,
+     cursor_bar,
+     cursor_underline,
++    cursor_underline_double,
++    cursor_underline_thick,
+ 
+     test {
+         const testing = std.testing;
+diff --git a/src/font/sprite/Face.zig b/src/font/sprite/Face.zig
+index e2e37d2af..533f2f227 100644
+--- a/src/font/sprite/Face.zig
++++ b/src/font/sprite/Face.zig
+@@ -567,6 +567,47 @@ test "sprite face render all sprites" {
+     try std.testing.expect(!diff); // There should be no diffs from reference.
+ }
+ 
++// The two shapes Windows Terminal has and DECSCUSR does not. Both are drawn
++// against the cell rather than being full-height cursors, so they are checked
++// for what makes them different from `cursor_underline` - that they are inside
++// the cell, and that the thick one really is thick.
++test "underline cursor sprites" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var atlas: font.Atlas = try .init(alloc, 128, .grayscale);
++    defer atlas.deinit(alloc);
++
++    // face with an 8x16 cell dimension.
++    var face: Face = .{
++        .metrics = .calc(.{
++            .px_per_em = 16,
++            .cell_width = 8.0,
++            .ascent = 12.0,
++            .descent = -4.0,
++            .line_gap = 0.0,
++        }),
++    };
++    try testing.expectEqual(16, face.metrics.cell_height);
++
++    const single = try face.renderGlyph(alloc, &atlas, @intFromEnum(Sprite.cursor_underline), .{ .grid_metrics = face.metrics });
++    const double = try face.renderGlyph(alloc, &atlas, @intFromEnum(Sprite.cursor_underline_double), .{ .grid_metrics = face.metrics });
++    const thick = try face.renderGlyph(alloc, &atlas, @intFromEnum(Sprite.cursor_underline_thick), .{ .grid_metrics = face.metrics });
++
++    // All three span the cell horizontally - none of them is a bar.
++    try testing.expectEqual(single.width, double.width);
++    try testing.expectEqual(single.width, thick.width);
++
++    // The double is taller than the single: it is two bands and a gap, not one
++    // band. Without this the sprite could quietly be a single underline.
++    try testing.expect(double.height > single.height);
++
++    // A quarter of a 16px cell, and thicker than the single underline - that
++    // difference is the whole point of the shape.
++    try testing.expectEqual(4, thick.height);
++    try testing.expect(thick.height > single.height);
++}
++
+ test "full height cursor sprites respect cursor height metric" {
+     const testing = std.testing;
+     const alloc = testing.allocator;
+diff --git a/src/font/sprite/draw/special.zig b/src/font/sprite/draw/special.zig
+index 8cad9ceba..2268ec33b 100644
+--- a/src/font/sprite/draw/special.zig
++++ b/src/font/sprite/draw/special.zig
+@@ -370,3 +370,65 @@ pub fn cursor_underline(
+         .height = @intCast(metrics.cursor_thickness),
+     }, .on);
+ }
++
++pub fn cursor_underline_double(
++    cp: u32,
++    canvas: *font.sprite.Canvas,
++    width: u32,
++    height: u32,
++    metrics: font.Metrics,
++) !void {
++    _ = cp;
++
++    // Two lines with a gap of one thickness between them, placed so the pair
++    // straddles where the single underline would sit - the same arrangement
++    // `underline_double` uses for text, so a double-underline cursor and a
++    // double-underlined character line up.
++    //
++    // The clamp leaves room for all three bands rather than one, which is why
++    // it subtracts three thicknesses and not one.
++    const t = metrics.cursor_thickness;
++    const y = @min(
++        metrics.underline_position,
++        height +| canvas.padding_y -| 3 * t,
++    );
++
++    canvas.rect(.{
++        .x = 0,
++        .y = @intCast(y -| t),
++        .width = @intCast(width),
++        .height = @intCast(t),
++    }, .on);
++    canvas.rect(.{
++        .x = 0,
++        .y = @intCast(y +| t),
++        .width = @intCast(width),
++        .height = @intCast(t),
++    }, .on);
++}
++
++pub fn cursor_underline_thick(
++    cp: u32,
++    canvas: *font.sprite.Canvas,
++    width: u32,
++    height: u32,
++    metrics: font.Metrics,
++) !void {
++    _ = cp;
++
++    // The bottom quarter of the cell, filled. This is the shape the Windows
++    // console has drawn for decades, and a quarter is what Windows Terminal
++    // still defaults its own `cursorHeight` to.
++    //
++    // Measured from the bottom of the *cell* rather than from the underline
++    // position: this one is a short block, not a thick line, and hanging it
++    // off the underline would put it somewhere different in every font.
++    const thickness = @max(metrics.cursor_thickness, height / 4);
++
++    canvas.rect(.{
++        .x = 0,
++        .y = @intCast(height -| thickness),
++        .width = @intCast(width),
++        .height = @intCast(thickness),
++    }, .on);
++}
+diff --git a/src/renderer/cell.zig b/src/renderer/cell.zig
+index b9880fbde..51081cc2c 100644
+--- a/src/renderer/cell.zig
++++ b/src/renderer/cell.zig
+@@ -152,7 +152,13 @@ pub const Contents = struct {
+             // Block cursors should be drawn first
+             .block => self.fg_rows.lists[0].appendAssumeCapacity(cell),
+             // Other cursor styles should be drawn last
+-            .block_hollow, .bar, .underline, .lock => self.fg_rows.lists[self.size.rows + 1].appendAssumeCapacity(cell),
++            .block_hollow,
++            .bar,
++            .underline,
++            .underline_double,
++            .underline_thick,
++            .lock,
++            => self.fg_rows.lists[self.size.rows + 1].appendAssumeCapacity(cell),
+         }
+     }
+ 
+diff --git a/src/renderer/cursor.zig b/src/renderer/cursor.zig
+index 073d86bb6..6e6d9f12a 100644
+--- a/src/renderer/cursor.zig
++++ b/src/renderer/cursor.zig
+@@ -10,6 +10,8 @@ pub const Style = enum {
+     block_hollow,
+     bar,
+     underline,
++    underline_double,
++    underline_thick,
+ 
+     // Special cursor styles
+     lock,
+@@ -21,6 +23,8 @@ pub const Style = enum {
+             .block => .block,
+             .block_hollow => .block_hollow,
+             .underline => .underline,
++            .underline_double => .underline_double,
++            .underline_thick => .underline_thick,
+         };
+     }
+ };
+diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
+index 770595402..ae5272f87 100644
+--- a/src/renderer/generic.zig
++++ b/src/renderer/generic.zig
+@@ -3245,12 +3245,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 .block_hollow,
+                 .bar,
+                 .underline,
++                .underline_double,
++                .underline_thick,
+                 => render: {
+                     const sprite: font.Sprite = switch (cursor_style) {
+                         .block => .cursor_rect,
+                         .block_hollow => .cursor_hollow_rect,
+                         .bar => .cursor_bar,
+                         .underline => .cursor_underline,
++                        .underline_double => .cursor_underline_double,
++                        .underline_thick => .cursor_underline_thick,
+                         .lock => unreachable,
+                     };
+ 
+diff --git a/src/terminal/c/render.zig b/src/terminal/c/render.zig
+index e70e7a4b7..5906e7402 100644
+--- a/src/terminal/c/render.zig
++++ b/src/terminal/c/render.zig
+@@ -76,6 +76,8 @@ pub const CursorVisualStyle = enum(c_int) {
+     block = 1,
+     underline = 2,
+     block_hollow = 3,
++    underline_double = 4,
++    underline_thick = 5,
+ 
+     pub fn fromCursorStyle(s: cursorpkg.Style) CursorVisualStyle {
+         return switch (s) {
+@@ -83,6 +85,8 @@ pub const CursorVisualStyle = enum(c_int) {
+             .block => .block,
+             .underline => .underline,
+             .block_hollow => .block_hollow,
++            .underline_double => .underline_double,
++            .underline_thick => .underline_thick,
+         };
+     }
+ };
+diff --git a/src/terminal/c/terminal.zig b/src/terminal/c/terminal.zig
+index 85f4dbcf4..b22061831 100644
+--- a/src/terminal/c/terminal.zig
++++ b/src/terminal/c/terminal.zig
+@@ -727,6 +727,8 @@ pub const TerminalCursorStyle = enum(c_int) {
+     block = 1,
+     underline = 2,
+     block_hollow = 3,
++    underline_double = 4,
++    underline_thick = 5,
+     _,
+ 
+     fn toZig(self: TerminalCursorStyle) ?Screen.CursorStyle {
+@@ -735,6 +737,8 @@ pub const TerminalCursorStyle = enum(c_int) {
+             .block => .block,
+             .underline => .underline,
+             .block_hollow => .block_hollow,
++            .underline_double => .underline_double,
++            .underline_thick => .underline_thick,
+             _ => null,
+         };
+     }
+diff --git a/src/terminal/cursor.zig b/src/terminal/cursor.zig
+index 136ee085a..a98fa7493 100644
+--- a/src/terminal/cursor.zig
++++ b/src/terminal/cursor.zig
+@@ -12,4 +12,13 @@ pub const Style = enum {
+     /// Hollow block cursor. This is a block cursor with the center empty.
+     /// Reported as DECSCUSR 1 or 2 (block).
+     block_hollow,
++
++    /// Two underlines stacked with a gap between them, matching the double
++    /// underline used for text. Reported as DECSCUSR 3 or 4 (underline).
++    underline_double,
++
++    /// A thick underline occupying the bottom quarter of the cell, which is
++    /// the shape the Windows console has drawn since long before it was
++    /// configurable. Reported as DECSCUSR 3 or 4 (underline).
++    underline_thick,
+ };
+diff --git a/src/terminal/dcs.zig b/src/terminal/dcs.zig
+index bc183dcf5..1b2bddb63 100644
+--- a/src/terminal/dcs.zig
++++ b/src/terminal/dcs.zig
+@@ -285,7 +285,10 @@ pub const Command = union(enum) {
+                     const blink = t.modes.get(.cursor_blinking);
+                     const style: u8 = switch (t.screens.active.cursor.cursor_style) {
+                         .block, .block_hollow => if (blink) 1 else 2,
+-                        .underline => if (blink) 3 else 4,
++                        .underline,
++                        .underline_double,
++                        .underline_thick,
++                        => if (blink) 3 else 4,
+                         .bar => if (blink) 5 else 6,
+                     };
+                     try writer.print("{d} q", .{style});
