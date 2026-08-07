@@ -51,6 +51,24 @@ rather than the swap chain.
 > the original bug needed: the freeze was found in a pane that was not
 > focused. A split with focus elsewhere still wants a human.
 
+## 1b. The child agrees with the pane about its size
+
+Added after KD-02, where a ghostty pane told its shell it was 56x18 while being
+109x27 — for six phases, in plain sight, because nothing ever asked.
+
+1. Open a ghostty pane.
+2. Run `wsl -d <distro> stty size` (or `mode con` without WSL).
+3. Compare with the pane's own answer: run the `askcell` probe, or count.
+
+**Pass:** rows and columns match the pane, immediately, without resizing the
+window first.
+**Fail:** they disagree — and note whether resizing the window corrects it. That
+asymmetry is the signature of a size applied before the pseudoconsole is ready
+to receive it, and it is what disguised this as a rendering quirk.
+
+Worth doing after any change to connection startup, surface sizing, or the
+`resize_pty` path.
+
 ## 2. Non-ASCII output
 
 Covered automatically for the harness (see below), but not for Windows

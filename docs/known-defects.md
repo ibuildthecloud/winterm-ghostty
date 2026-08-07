@@ -112,7 +112,7 @@ from a bounding box.
 
 ---
 
-### KD-02 — The child is told the wrong terminal size
+### KD-02 — The child is told the wrong terminal size — **fixed 2026-08-07**
 
 **Found** 2026-08-07, while chasing KD-01, by reading a `script` capture header
 that said `COLUMNS="56" LINES="18"` in a pane that is 109x27.
@@ -172,7 +172,102 @@ since Phase 5** and no test has ever asked the child how big it thinks it is.
 run or the manual list. Nothing automated has ever compared the two, which is
 exactly how a bug this visible survived six phases.
 
-#### Owner
+#### Root cause
 
-Not Phase 7. This is a correctness bug in the Phase 5/6 integration and should be
-fixed before presentation work resumes.
+`ConptyConnection::Resize` applies a size to the pseudoconsole **only while the
+connection is `Connected`**; before that it just records the numbers for
+`Start()` to use. But `Start()` transitions to `Connecting`
+(`ConptyConnection.cpp:403`), *then* creates the pseudoconsole (`:412`), and only
+reaches `Connected` at `:477`. A resize arriving inside that window is recorded
+and applied to nothing.
+
+That window is exactly where ours arrives: `TermControl::_InitializeTerminal`
+initializes the core before starting the connection, libghostty sizes its surface
+during that initialization, and the resulting `resize_pty` callback is the one
+carrying the real grid.
+
+Captured live with a DBWIN reader against the packaged app's own `_trace` output:
+
+```
+resizeConnection 56x18 cells                 <- ghostty's default grid
+set font-size = 12
+cellSize 14x28 px
+pushSize panel=1024.0x520.0 dips scale=1.500 -> 1536x780 px
+resizeConnection 109x27 cells                <- correct, and lost
+```
+
+The value was computed correctly every time. It simply never reached the
+pseudoconsole.
+
+#### Fix
+
+`GhosttyControlCore` remembers the last grid size `resize_pty` asked for and
+re-applies it when the connection reports `Connected`. `Resize` is idempotent, so
+the replay costs nothing when the size already took.
+
+#### Verified
+
+`wsl -d Ubuntu-24.04 stty size` in a fresh pane now answers **`27 109`**,
+matching the pane's own `CSI 18 t`. Before the fix the same probe answered
+`18 56`, and only a window resize corrected it — which is what made this look
+like a rendering quirk rather than a pty bug.
+
+`unitControl` 62 passed / 0 failed / 1 skipped (the key test skips off a US
+layout).
+
+#### What it did *not* fix
+
+The Kitty image aspect ratio of KD-01. That is a separate cause — see KD-03.
+
+---
+
+### KD-03 — `c`+`r` image placement stretches instead of fitting
+
+**Upstream ghostty behaviour, not our port**, and the actual cause of KD-01's
+distortion. Recorded here because it is user-visible and unresolved, not because
+it is ours to fix alone.
+
+When a Kitty graphics placement specifies **both** `c` (columns) and `r` (rows),
+ghostty scales the image to exactly `c x cell_width` by `r x cell_height`,
+**ignoring the source aspect ratio**. Its own comment says so
+(`src/terminal/kitty/graphics_storage.zig:809-818`):
+
+> If we have a specified cols AND rows then we calculate the width and height
+> from them directly, we don't need to adjust for aspect ratio.
+
+Confirmed by measurement in a pane: a 200x100 source sent as `c=34,r=17` draws at
+**476x476** — exactly the cell box, aspect forced to 1.000.
+
+#### Why that breaks chafa
+
+chafa **letterboxes**. Decoding the canvas it actually transmits for a square
+SVG at `c=34,r=17`:
+
+```
+canvas       : 272x136
+ink in canvas: 100x102, aspect 0.980   (fills 36.8% of width, 75.0% of height)
+```
+
+The ink keeps the source's square aspect inside a 2:1 canvas. That is only
+correct if the terminal *fits* the canvas into the cell box preserving aspect —
+under ghostty's stretch it becomes 2:1 tall, which is exactly the reported
+symptom (measured ink aspect 0.484 against a ground truth of 0.969 from
+rendering the same SVG square with ImageMagick).
+
+#### Unresolved
+
+kitty's specification says the image "will be scaled (enlarged/shrunk) as needed
+to **fit** the specified area", which reads as fit-preserving-aspect and matches
+what chafa assumes — but **this has not been checked against a real kitty**, and
+that check is what would decide whether ghostty diverges from the protocol or
+chafa relies on behaviour the spec does not promise. Until then this is a
+discrepancy with evidence, not a verdict.
+
+If ghostty does diverge, the fix is upstream and affects every platform, not
+just Windows.
+
+#### Workaround today
+
+Omit `c`/`r` and send only `s`/`v`; natural-size placement is pixel-exact
+(verified). For chafa specifically, that means generating at display time is not
+enough — the letterboxing is in the canvas either way.
