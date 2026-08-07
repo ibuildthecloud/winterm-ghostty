@@ -16,14 +16,16 @@ by reading source and had it turn out wrong.
 
 ---
 
-### KD-01 — Kitty graphics images render distorted — **closed 2026-08-07, not a defect**
+### KD-01 — Kitty graphics images render distorted — **partially explained; see KD-02**
 
 **Reported** by the user, from use: an image sent with the Kitty graphics
 protocol appeared skewed — wrong aspect ratio, not merely the wrong size.
 
-**Measured, and the engine is right on every count.** Kept as a closed entry
-rather than deleted, because the wrong conclusion was reachable from every
-direction and the measurements are what stopped it.
+**The image *drawing* is right on every count — but the terminal lies to the
+child about its size, and that is [KD-02](#kd-02).** A client that sizes its
+output from the terminal is therefore given bad input, which is enough on its
+own to produce the reported distortion. This entry was briefly closed as "not a
+defect"; that verdict was wrong and is corrected here.
 
 #### What was measured
 
@@ -107,3 +109,70 @@ what turned that around. It says directly which source rows landed where, so an
 offset, a squeeze and a clamp are distinguishable by looking instead of inferred
 from a bounding box.
 
+
+---
+
+### KD-02 — The child is told the wrong terminal size
+
+**Found** 2026-08-07, while chasing KD-01, by reading a `script` capture header
+that said `COLUMNS="56" LINES="18"` in a pane that is 109x27.
+
+Confirmed directly. In a ghostty pane, `wsl -d Ubuntu-24.04 stty size` answers:
+
+```
+18 56
+```
+
+while the same pane's own reports, measured in the same session, are:
+
+| | |
+|---|---|
+| `CSI 18 t` (text area) | **109 cols x 27 rows** |
+| `CSI 14 t` (window px) | 1526 x 756 |
+| `CSI 16 t` (cell px) | 14 x 28 |
+
+Those three agree with each other and with the rendering — 109x14 = 1526,
+27x28 = 756. The **ConPTY** does not agree with any of them.
+
+#### Why nobody saw it
+
+It is visible in every screenshot taken this session and I looked past all of
+them: typed commands wrap at about column 56 in a 109-column window. It reads as
+normal terminal wrapping unless you are counting.
+
+#### What it breaks
+
+Everything that asks the terminal how big it is, not just images:
+
+- Line wrapping — half the pane is unusable for long lines.
+- Any full-screen TUI: `vim`, `less`, `top`, `htop` will draw into a 56x18 box.
+- Image clients like `chafa`, which size their output from the view they are
+  told about. This is the KD-01 connection: the terminal reports **correct
+  pixels and wrong cells**, so a client deriving cell geometry from the two gets
+  an inconsistent answer.
+
+#### Where to look
+
+The plumbing exists and is wired: libghostty's `resize_pty_cb` →
+`GhosttyEngine::_resizePty` (`GhosttyEngine.cpp:308-314`) →
+`GhosttyControlCore::ResizeConnection` (`GhosttyControlCore.cpp:392-401`) →
+`_connection.Resize(rows, columns)`. So the question is not whether the path is
+connected but **what values travel it and when** — whether libghostty ever calls
+back with the final grid, or only with an early one before the surface reaches
+its real size.
+
+56x18 is suspicious in itself: the Phase 5 report records the first ghostty pane
+running `OpenConsole.exe --headless --width 56 --height 18`. That suggests an
+initial size that is never corrected, which would mean **this has been wrong
+since Phase 5** and no test has ever asked the child how big it thinks it is.
+
+#### The check that should exist
+
+`wsl stty size` (or `mode con`) against the pane's own `CSI 18 t`, in the smoke
+run or the manual list. Nothing automated has ever compared the two, which is
+exactly how a bug this visible survived six phases.
+
+#### Owner
+
+Not Phase 7. This is a correctness bug in the Phase 5/6 integration and should be
+fixed before presentation work resumes.
