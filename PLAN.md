@@ -564,6 +564,17 @@ Open questions (standing, revisit each retro):
 - **New:** patch 0 (`windows-build`) is upstreamable as-is and is the first thing to offer
   — ahead of `init-wtf16`. Both halves are upstream bugs, not port scaffolding.
 
+- **libxev: the IOCP `Async` is silently non-copyable while the others are not.**
+  Found 2026-08-07; it cost this project three phases of a misdiagnosed freeze and
+  a 26% throughput workaround. `AsyncEventFd` holds a `posix.fd_t` and
+  `AsyncMachPort` a mach port, so a copy of the struct is equivalent to the
+  original and `notify()` on it reaches the loop. `AsyncIOCP` holds `guard`,
+  `wakeup: bool` and `waiter: ?{loop, c}` - all userspace state - and `wait()`
+  sets `waiter` on the instance the loop owns. So `notify()` on a copy finds
+  `waiter == null`, sets a bool nobody reads, and **returns success**. Silent, and
+  Windows-only. Two things worth offering upstream: make the IOCP async
+  copy-hostile (or copy-safe), and note in the `Async` docs that it must be held
+  by pointer. Ghostty's side is patch 34, which holds it by pointer.
 - Immediately: libxev IOCP timer fix → mitchellh/libxev; contact deblasis re:
   collaboration/patch heritage.
 - After Phase 4: `IControlCore` PR → microsoft/terminal.

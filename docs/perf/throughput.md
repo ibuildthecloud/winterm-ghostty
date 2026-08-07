@@ -122,8 +122,15 @@ the freeze fix needs, so the guarantee is kept rather than traded away.
 >
 > | | MB/s |
 > |---|---|
-> | ghostty pane, wakeup fixed, no forced render | 27.0, 31.6, 27.4 — **median 27.4** |
+> | ghostty pane, wakeup fixed, forced render **deleted** (shipped) | 30.9, 30.9, 30.9 — **median 30.9** |
 > | cascadia pane, same session | 30.3, 37.7, 39.0, 32.3 — **median ~35** |
+>
+> ghostty's three runs are identical to a tenth; cascadia's spread 30.3–39.0 on
+> the same machine in the same session. **The cascadia figure is the shakier of
+> the two** and wants re-measuring on a quiet machine before any gap is quoted
+> precisely. On what is here, the gap is somewhere around 10–15%, not the 25% a
+> first reading of these numbers suggests and not the zero the retracted 37.4
+> claimed.
 >
 > So the gap is **real renderer cost of roughly 25%**, not an artifact of a
 > workaround. That is a harder problem than the retracted number implied, and it

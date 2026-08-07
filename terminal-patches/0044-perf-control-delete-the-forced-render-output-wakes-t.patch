@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Fri, 7 Aug 2026 15:58:09 -0700
+Subject: [PATCH] perf(control): delete the forced render; output wakes the
+ renderer now
+
+The throttled `ghostty_surface_render_now` existed to work around a pane
+that froze mid-output, blamed on libghostty's wakeup coalescing. That
+diagnosis was wrong. On Windows, pty output never woke the renderer at all:
+ghostty held the renderer wakeup by value and libxev's IOCP async keeps its
+state in the struct, so the copy's notify() set a bool nobody read. Fixed in
+ghostty patch 34.
+
+With output driving rendering by itself, forcing a render here is both
+unnecessary and expensive - this handler runs on the connection's output
+thread, whose blocking *is* the backpressure to the child, and render_now is
+a synchronous rebuild and present.
+
+Measured, 8 MB corpus, same session, same probe:
+
+    ghostty, wakeup fixed, no forced render   30.9, 30.9, 30.9  median 30.9
+    cascadia                                  30.3, 37.7, 39.0, 32.3
+
+Note the previously published "37.4 = parity" is retracted: it measured a
+terminal that was not drawing. See docs/perf/throughput.md.
+
+`_renderNow` stays - six other callers force a redraw after a state change
+we make ourselves, which is a different thing from forcing one per chunk of
+someone else's output.
+
+unitControl 63/63.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 81 ++++---------------
+ .../TerminalControl/GhosttyControlCore.h      |  1 -
+ 2 files changed, 14 insertions(+), 68 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 5a6570182..16b7edaaf 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -80,24 +80,6 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         _initializedTerminal = true;
+ 
+-        // Bounds how often output can force a frame. 8ms is two frames at 60Hz
+-        // and one at 120Hz - fast enough that output looks continuous, slow
+-        // enough that a flood is not paying for a synchronous present per
+-        // chunk of pty output.
+-        _renderThrottler = std::make_unique<til::throttled_func<>>(
+-            til::throttled_func_options{
+-                .delay = std::chrono::milliseconds{ 8 },
+-                .debounce = false,
+-                .leading = false,
+-                .trailing = true,
+-            },
+-            [weakThis = get_weak()]() {
+-                if (const auto self = weakThis.get())
+-                {
+-                    self->_renderNow();
+-                }
+-            });
+-
+         // If the renderer already built a swap chain while we were in
+         // ghostty_surface_new, its action fired before anything could act on
+         // it. Raising once here costs nothing when the handle is still 0.
+@@ -213,10 +195,6 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         }
+         _closing = true;
+ 
+-        // Before the surface goes: its destructor cancels any pending trailing
+-        // render, which would otherwise fire against a freed surface.
+-        _renderThrottler.reset();
+-
+         _connectionOutputRevoker.revoke();
+         _connectionStateRevoker.revoke();
+ 
+@@ -317,53 +295,22 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         ghostty_surface_write_pty_output(_surface,
+                                          reinterpret_cast<const uint8_t*>(_utf8Scratch.data()),
+                                          _utf8Scratch.size());
+-
+-        // Then force the frame out.
++        // No render is forced here, and that is deliberate.
+         //
+-        // Parsing schedules a render through libghostty's `wakeup` async,
+-        // which *coalesces by design* (its own comment contrasts it with the
+-        // non-coalescing `draw_now`). A notify that lands after the renderer
+-        // has already sampled the terminal state is folded into a wake that
+-        // has done its work, so the final batch never reaches the screen: the
+-        // pane freezes mid-output and stays frozen until something unrelated
+-        // wakes it, which is exactly what scrolling did.
++        // Until 2026-08-07 this handler called ghostty_surface_render_now on
++        // every chunk, later throttled to 8ms, to work around a pane that froze
++        // mid-output. The freeze was blamed on libghostty's wakeup coalescing.
++        // It was not: on Windows, pty output never woke the renderer at all,
++        // because ghostty held the renderer wakeup by value and libxev's IOCP
++        // async keeps its state in the struct - so the copy's notify() set a
++        // bool nobody read. Fixed in ghostty patch 34; output now drives
++        // rendering by itself, measured at 321 renders in the second where it
++        // used to manage 2.
+         //
+-        // Measured: 80 notifies produced fewer than 20 wakes, and drawFrame
+-        // stopped being called entirely while the parser kept running.
+-        //
+-        // It must be render_now rather than draw: ghostty_surface_draw only
+-        // re-presents the cells the render thread last built, so forcing it
+-        // after new output just redraws stale content - measured, the pane
+-        // still froze. render_now rebuilds from terminal state first.
+-        //
+-        // A pane in a XAML SwapChainPanel has no paint loop, so nothing else
+-        // ever forces this. hwnd-host does it on WM_PAINT, which is why three
+-        // phases of harness work never surfaced the problem.
+-        //
+-        // Throttled, though, because forcing it on *every* chunk cost a factor
+-        // of nine. This handler runs on the connection's output thread and
+-        // render_now is synchronous, so a forced render per chunk put a full
+-        // rebuild-and-present in the middle of the path whose blocking is the
+-        // backpressure to the child. Measured on an 8 MB corpus: 4.2 MB/s with
+-        // a render per chunk, 37.4 MB/s without one, against cascadia's 38.1.
+-        //
+-        // leading + trailing, not debounced:
+-        //   * trailing only, no leading - a leading invocation runs *inline on
+-        //                this thread*, so it would go on blocking the
+-        //                backpressure path once per interval. Measured:
+-        //                leading+trailing at 8ms gave 12.6 MB/s. The cost of
+-        //                dropping it is that the first frame of a burst is 8ms
+-        //                late, which is not perceptible.
+-        //   * trailing - the last chunk always draws, which is the whole point
+-        //                of forcing renders here. Without it the coalescing
+-        //                wakeup can drop the final batch and the pane freezes
+-        //                mid-output, which is the defect this code exists for.
+-        //   * not debounced - a sustained flood must not starve the screen;
+-        //                every interval gets a frame.
+-        if (_renderThrottler)
+-        {
+-            (*_renderThrottler)();
+-        }
++        // Forcing a render here was expensive as well as unnecessary: this runs
++        // on the connection's output thread, whose blocking *is* the
++        // backpressure to the child, and render_now is a synchronous rebuild
++        // and present.
+     }
+ 
+     void GhosttyControlCore::_connectionStateChangedHandler()
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.h b/src/cascadia/TerminalControl/GhosttyControlCore.h
+index dc6432254..e92454467 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.h
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.h
+@@ -341,7 +341,6 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // -1 is not a placeholder: SearchBoxControl renders a negative total as
+         // "Searching...", which is exactly what is true until they do.
+         // Bounds how often pty output forces a frame; see _connectionOutputHandler.
+-        std::unique_ptr<til::throttled_func<>> _renderThrottler;
+ 
+         std::wstring _searchNeedle;
+         int32_t _searchTotal{ -1 };
