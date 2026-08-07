@@ -53,5 +53,15 @@ harness/xaml-host/*.txt
 harness/hwnd-host/ghostty.pdb
 harness/hwnd-host/crash.dmp
 
+harness/wgc-shot/*.exe
+harness/wgc-shot/*.obj
+harness/wgc-shot/*.pdb
+harness/wgc-shot/*.ilk
+
+harness/pdbaddr/*.exe
+harness/pdbaddr/*.obj
+harness/pdbaddr/*.pdb
+harness/pdbaddr/*.ilk
+
 # Crash dumps from debugging sessions are artifacts, not deliverables.
 *.dmp
