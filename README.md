@@ -51,6 +51,7 @@ DESIGN.md             target architecture, upstream pins, threading model
 docs/adr/             decisions, and the alternatives that were rejected
 docs/sessions/        one report per session: what was built, what was not, what broke
 docs/documented-diffs.md   every way a ghostty pane differs from a cascadia one
+docs/known-defects.md      things it gets wrong, as opposed to differently
 docs/selection-geometry.md both engines' selection rules, measured
 docs/manual-validation.md  the checks that still need a human
 ghostty-patches/      the ghostty fork as an ordered, rebasable patch series

@@ -182,6 +182,44 @@ left rather than half-wired. *Read.*
 
 ---
 
+## Permanent, by upstream decision
+
+### GD-14 — Sixel graphics are not supported and never will be
+
+A cascadia pane renders sixel images; a ghostty pane ignores the sequence
+entirely. This is not a gap waiting on an upstream release, and advancing the
+pin will never close it.
+
+ghostty has **no sixel implementation at all**. At pin `4d605bf0` the string
+"sixel" appears exactly twice in the whole repository, and both are the same
+thing — the DA1 feature *code* `4`, in `src/terminal/device_attributes.zig:53`
+and its C mirror `include/ghostty/vt/device.h:38`. There is no decoder and no
+pixel path, and the default DA1 response advertises only `.ansi_color`, so
+ghostty does not claim the capability either.
+
+Upstream has decided against it
+([discussion #2496](https://github.com/ghostty-org/ghostty/discussions/2496)):
+sixel has many unspecified edge cases, libsixel is not suited to drop-in
+adoption, the performance cost is unclear, and the Kitty graphics protocol —
+which ghostty does implement — was designed to solve the problem sixel forces on
+clients, where a partially clipped image must be re-encoded to the visible
+region.
+
+Cascadia's implementation is `src/terminal/parser/SixelParser.cpp`, dispatched
+through `adaptDispatch`, so the capability really is present on one side of the
+seam and absent on the other.
+
+**Closing it** would mean writing a sixel decoder against a protocol upstream
+has rejected, and carrying it as a fork patch forever. Not recommended. The
+honest fix is that this is documented and that an application probing DA1 gets a
+truthful answer, which it does.
+
+*Read* — verified from both engines' sources, not by displaying an image.
+
+> Related, and **not** yet verified: ghostty does not implement the Kitty
+> protocol's *animation frames*. Whether anything a user runs depends on that is
+> unknown here.
+
 ## Not diffs, though they look like ones
 
 - **`ForegroundColor`/`BackgroundColor` return constants.** They feed WT's
