@@ -50,29 +50,46 @@ Three probes into a live ghostty pane, each photographed with
 
 #### The actual cause
 
-The producer's own output file was read. Its first APC control block is:
+The producer was `chafa 1.14.0`, converting an SVG, with its output **captured to
+a file** and replayed later. That capture's first APC control block is:
 
 ```
 a=T,f=32,s=1264,v=632,c=158,r=79,m=1
 ```
 
 A 1264x632 source — exactly 2:1 — asked to be displayed over 158 columns by 79
-rows. Note `1264/158 = 8` and `632/79 = 8`: **the producer computed its cell
-counts assuming 8x8 pixel cells.**
+rows. Note `1264/158 = 8` and `632/79 = 8`.
 
-`c`/`r` in the Kitty protocol mean "scale this image to fill that many cells",
-so with real 14x28 cells the terminal correctly draws it at 158x14 = 2212 by
-79x28 = 2212 — **a perfect square**. Aspect 2.000 in, 1.000 out. That is the
-whole distortion, and kitty itself would render it identically.
+**chafa is not at fault.** With no terminal on stdout it cannot learn the cell
+geometry, so it falls back to a nominal 8x8 pixel cell — reproduced directly:
+
+```
+$ chafa -f kitty favicon.svg | head -c 300     # stdout is a pipe
+a=T,f=32,s=464,v=232,c=58,r=29                 # 464/58 = 232/29 = 8
+```
+
+Run **live in a ghostty pane**, the same chafa command renders the image with
+correct proportions. It asks, and this terminal answers correctly.
+
+`c`/`r` mean "scale this image to fill that many cells", so replaying an
+8x8-derived capture on this pane's real 14x28 cells draws it at 158x14 = 2212 by
+79x28 = 2212 — **a perfect square**. Aspect 2.000 in, 1.000 out. kitty itself
+would render it identically.
+
+**The general lesson: kitty-protocol output captured to a file is
+terminal-specific.** The `c`/`r` geometry is baked at generation time against
+whatever cell size the generator believed.
 
 #### What to do about it
 
-Nothing here. In the producer, either:
+Nothing in this repository. In a pipeline that pre-generates:
 
-- **omit `c`/`r`** and send only `s`/`v`, letting the terminal place the image at
-  its natural pixel size (probe 1 shows this is exact), or
-- **query `CSI 16 t`** and compute `c`/`r` from the reported cell size, which
-  this terminal answers correctly.
+- **Generate at display time**, with the terminal attached — verified correct.
+- **Or declare the cell shape**: `chafa --font-ratio 1/2` matches this pane's
+  14x28 cells, and a file generated that way was replayed into a pane and came
+  out identical to the live run.
+- **Or omit `c`/`r`** entirely and send only `s`/`v`, letting the terminal place
+  the image at its natural pixel size — probe 1 shows that path is exact.
 
 #### The trap worth remembering
 
