@@ -97,6 +97,43 @@ backpressure path once per interval and recovers only a third of the gap. Traili
 puts every render on the timer thread. The trailing edge is also exactly the final render
 the freeze fix needs, so the guarantee is kept rather than traded away.
 
+> ## RETRACTED 2026-08-07: the 37.4 figure measured a terminal that was not drawing
+>
+> "Forced render removed entirely = 37.4 MB/s = parity with cascadia" is **wrong**,
+> and the conclusion built on it — that the engine is already fast enough and only
+> the workaround costs us — is wrong with it.
+>
+> On Windows, pty output had **never** woken the renderer. `Termio`, `Options` and
+> `StreamHandler` held `renderer_wakeup: xev.Async` by value, and libxev's IOCP
+> async keeps its state in the struct, so a copy's `notify()` set a bool nobody
+> read and returned success. Removing the forced render therefore did not "let the
+> engine run" — it removed *all* rendering during the flood except the cursor
+> blink. 37.4 MB/s was the cost of parsing 8 MB and drawing it about twice a
+> second.
+>
+> Measured with stage counters during `dir /s`, throttle bypassed:
+>
+> ```
+> before the fix   notify=41 wakeup=79  update=79  present=81    <- +2/sec, the blink
+> after the fix    notify=41 wakeup=404 update=404 present=406   <- +321 in one second
+> ```
+>
+> **Corrected numbers**, same 8 MB corpus, same probe, same session:
+>
+> | | MB/s |
+> |---|---|
+> | ghostty pane, wakeup fixed, no forced render | 27.0, 31.6, 27.4 — **median 27.4** |
+> | cascadia pane, same session | 30.3, 37.7, 39.0, 32.3 — **median ~35** |
+>
+> So the gap is **real renderer cost of roughly 25%**, not an artifact of a
+> workaround. That is a harder problem than the retracted number implied, and it
+> is the problem Phase 7 is actually for.
+>
+> The engine-identity check in the harness is worth distrusting too: with
+> `profiles.defaults.engine = ghostty`, `ghostty-internal.dll` is loaded in the
+> process even for a cascadia pane. The reliable per-pane check is the search
+> box's regex/case toggles, which a ghostty pane greys out.
+
 ### What is left
 
 ~25%, and it is the cost of forcing renders at all. The proper fix is upstream: a wakeup

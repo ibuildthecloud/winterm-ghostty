@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Fri, 7 Aug 2026 14:44:03 -0700
+Subject: [PATCH] renderer: stage counters for diagnosing a render that stops
+
+The Phase 5 "pane freezes mid-output" fault was explained by a lost wakeup
+and worked around with a forced render per chunk. That explanation does not
+survive reading the source, so the fault had no established cause while its
+workaround cost ~26% of throughput.
+
+Diagnosing it needs to know *which stage* stops, and the stages span three
+files and two threads:
+
+    notify  -> Surface.queueRender
+    wakeup  -> Thread.wakeupCallback
+    update  -> Thread.renderCallback
+    present -> D3D11.present
+
+Reported from the cursor blink timer, not from the render path. That is the
+point: a report emitted by rendering goes silent exactly when rendering
+stops, which is the case being observed. The blink keeps firing regardless,
+so a freeze reads as one column standing still while another climbs.
+
+Output goes to OutputDebugString because the only interesting host is a
+packaged Windows Terminal, which has no stdout and no stderr.
+
+Gated on GHOSTTY_RENDER_DIAG=1.
+
+This found the bug in one run.
+
+zig build test passes.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/renderer/D3D11.zig       |  2 +
+ src/renderer/Thread.zig      |  8 ++++
+ src/renderer/render_diag.zig | 89 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 99 insertions(+)
+ create mode 100644 src/renderer/render_diag.zig
+
+diff --git a/src/renderer/D3D11.zig b/src/renderer/D3D11.zig
+index 961624be1..bcd50cfa6 100644
+--- a/src/renderer/D3D11.zig
++++ b/src/renderer/D3D11.zig
+@@ -25,6 +25,7 @@ const global = @import("../global.zig");
+ const font = @import("../font/main.zig");
+ const rendererpkg = @import("../renderer.zig");
+ const shadertoy = @import("shadertoy.zig");
++const render_diag = @import("render_diag.zig");
+ const Renderer = rendererpkg.GenericRenderer(D3D11);
+ 
+ const com = @import("directx11/com.zig");
+@@ -342,6 +343,7 @@ pub fn present(self: *D3D11, target: Target) !void {
+     }
+ 
+     frames_presented +|= 1;
++    render_diag.present();
+     reportPresentRate();
+     const simulated = simulate_loss_after > 0 and
+         frames_presented == simulate_loss_after;
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 4b2b741d8..ca2cd19f9 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -9,6 +9,7 @@ const xev = global.xev;
+ const crash = @import("../crash/main.zig");
+ const internal_os = @import("../os/main.zig");
+ const rendererpkg = @import("../renderer.zig");
++const render_diag = @import("render_diag.zig");
+ const apprt = @import("../apprt.zig");
+ const configpkg = @import("../config.zig");
+ const terminalpkg = @import("../terminal/main.zig");
+@@ -555,6 +556,7 @@ fn wakeupCallback(
+     };
+ 
+     const t = self_.?;
++    render_diag.wakeup();
+ 
+     // When we wake up, we check the mailbox. Mailbox producers should
+     // wake up our thread after publishing.
+@@ -648,6 +650,7 @@ fn renderCallback(
+     if (!t.flags.visible) return .disarm;
+ 
+     // Update our frame data
++    render_diag.update();
+     t.renderer.updateFrame(
+         t.state,
+         t.flags.cursor_blink_visible,
+@@ -682,6 +685,11 @@ fn cursorTimerCallback(
+         return .disarm;
+     };
+ 
++    // Heartbeat for the render diagnostic. Deliberately here and not on the
++    // render path: a report emitted by rendering goes silent exactly when
++    // rendering stops, which is the case being observed.
++    render_diag.report();
++
+     t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;
+     t.wakeup.notify() catch {};
+ 
+diff --git a/src/renderer/render_diag.zig b/src/renderer/render_diag.zig
+new file mode 100644
+index 000000000..a00c7d7dc
+--- /dev/null
++++ b/src/renderer/render_diag.zig
+@@ -0,0 +1,89 @@
++//! Stage counters for diagnosing a render that stops.
++//!
++//! The Phase 5 "pane freezes mid-output" fault was explained by a lost wakeup
++//! and worked around with a forced render per chunk. That explanation does not
++//! survive reading the source (see docs/phase-7-readiness.md), so the fault has
++//! no established cause and the workaround costs ~26% of throughput.
++//!
++//! Diagnosing it needs to know *which stage stops*, and the stages are spread
++//! across three files and two threads. So they are counted here:
++//!
++//!     notify  -> Surface.queueRender, i.e. someone asked for a render
++//!     wakeup  -> Thread.wakeupCallback, i.e. the render thread woke
++//!     update  -> Thread.renderCallback, i.e. terminal state was sampled
++//!     present -> D3D11.present, i.e. pixels reached the swap chain
++//!
++//! Reported from the **cursor blink timer**, not from the render path. That is
++//! the whole point: a report emitted by rendering goes silent exactly when
++//! rendering stops, which is the case we are trying to observe. The blink timer
++//! keeps firing regardless, so a freeze shows up as `notify` climbing while
++//! `present` stands still.
++//!
++//! Output goes to OutputDebugString because the only interesting host is a
++//! packaged Windows Terminal, which has no stdout and no stderr.
++//!
++//! Diagnostic, not operation: gated on `GHOSTTY_RENDER_DIAG=1`.
++
++const std = @import("std");
++const builtin = @import("builtin");
++
++var notifies: std.atomic.Value(u32) = .{ .raw = 0 };
++var wakeups: std.atomic.Value(u32) = .{ .raw = 0 };
++var updates: std.atomic.Value(u32) = .{ .raw = 0 };
++var presents: std.atomic.Value(u32) = .{ .raw = 0 };
++
++var enabled_cache: ?bool = null;
++var last_report_ms: u64 = 0;
++
++extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
++extern "kernel32" fn OutputDebugStringA(lpOutputString: [*:0]const u8) callconv(.winapi) void;
++
++fn enabled() bool {
++    if (comptime builtin.os.tag != .windows) return false;
++    if (enabled_cache) |v| return v;
++    const global = @import("../global.zig");
++    const value = global.environ().getWindows(
++        std.unicode.utf8ToUtf16LeStringLiteral("GHOSTTY_RENDER_DIAG"),
++    );
++    const on = value != null and value.?.len > 0 and value.?[0] == '1';
++    enabled_cache = on;
++    return on;
++}
++
++pub fn notify() void {
++    if (!enabled()) return;
++    _ = notifies.fetchAdd(1, .monotonic);
++}
++
++pub fn wakeup() void {
++    if (!enabled()) return;
++    _ = wakeups.fetchAdd(1, .monotonic);
++}
++
++pub fn update() void {
++    if (!enabled()) return;
++    _ = updates.fetchAdd(1, .monotonic);
++}
++
++pub fn present() void {
++    if (!enabled()) return;
++    _ = presents.fetchAdd(1, .monotonic);
++}
++
++/// Emit a line if a second has passed. Safe to call at any rate.
++pub fn report() void {
++    if (!enabled()) return;
++
++    const now = GetTickCount64();
++    if (last_report_ms != 0 and now -| last_report_ms < 1000) return;
++    last_report_ms = now;
++
++    var buf: [160]u8 = undefined;
++    const line = std.fmt.bufPrintZ(&buf, "[ghostty-diag] notify={d} wakeup={d} update={d} present={d}\n", .{
++        notifies.load(.monotonic),
++        wakeups.load(.monotonic),
++        updates.load(.monotonic),
++        presents.load(.monotonic),
++    }) catch return;
++    OutputDebugStringA(line.ptr);
++}

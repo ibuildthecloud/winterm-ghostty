@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Fri, 7 Aug 2026 14:44:19 -0700
+Subject: [PATCH] termio: hold the renderer wakeup by pointer, not by value
+
+On Windows, pty output has never woken the renderer.
+
+`Termio`, `Options` and `StreamHandler` each held `renderer_wakeup:
+xev.Async` **by value**, and `Surface.init` assigned a copy of the render
+thread's async. libxev's async is an OS handle on Linux (an eventfd) and
+macOS (a mach port), so a copy is equivalent to the original and a notify
+on it reaches the loop. The IOCP implementation keeps its state in the
+struct: `wait()` sets `waiter` on the instance the loop owns, so a copy
+has `waiter == null` and `notify()` takes the else branch - setting a bool
+nobody reads, and returning success.
+
+So `processOutputLocked` called `queueRender()` for every chunk, every
+call succeeded, and nothing ever woke.
+
+Measured with the stage counters, throttle bypassed, during `dir /s`:
+
+    before   notify=41 wakeup=61 update=61 present=63
+             notify=41 wakeup=79 update=79 present=81   <- +2/sec, the blink
+    after    notify=39 wakeup=81  update=81  present=82
+             notify=41 wakeup=404 update=404 present=406 <- +321 in one second
+
+This is the Phase 5 freeze. It explains why the freeze was found in an
+*unfocused* pane specifically: the blink timer is cancelled on focus loss,
+so an unfocused pane had no wakeups at all and stopped dead, while a
+focused one limped at the blink rate. It explains why scrolling cured it
+and resizing did not - scrolling notifies through Surface.queueRender, on
+the instance that has the waiter. And it explains why neither native apprt
+sees it: their asyncs are copyable, and both have a paint pump besides.
+
+The address taken is `&self.renderer_thread.wakeup`, not the local
+`render_thread` it is copied from - the local dies with the scope, and the
+render thread is spawned on `&self.renderer_thread`, so that is the
+instance whose waiter is set.
+
+zig build test passes.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/Surface.zig               |  9 ++++++++-
+ src/termio/Options.zig        | 12 +++++++++++-
+ src/termio/Termio.zig         |  2 +-
+ src/termio/stream_handler.zig |  2 +-
+ 4 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 827e75174..ebd313104 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -29,6 +29,7 @@ const termio = @import("termio.zig");
+ const font = @import("font/main.zig");
+ const Command = @import("Command.zig");
+ const terminal = @import("terminal/main.zig");
++const render_diag = @import("renderer/render_diag.zig");
+ const configpkg = @import("config.zig");
+ const Duration = configpkg.Config.Duration;
+ const input = @import("input.zig");
+@@ -702,7 +703,12 @@ pub fn init(
+             .backend = io_backend,
+             .mailbox = io_mailbox,
+             .renderer_state = &self.renderer_state,
+-            .renderer_wakeup = render_thread.wakeup,
++            // &self.renderer_thread, not the local `render_thread`: the
++            // local is copied into self a few lines above and its address
++            // dies with this scope. The render thread is spawned on
++            // &self.renderer_thread, so that is the async whose waiter is
++            // set - and on Windows the waiter *is* the async's identity.
++            .renderer_wakeup = &self.renderer_thread.wakeup,
+             .renderer_mailbox = render_thread.mailbox,
+             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+         });
+@@ -2537,6 +2543,7 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
+ /// isn't guaranteed to happen immediately but it will happen as soon as
+ /// practical.
+ fn queueRender(self: *Surface) !void {
++    render_diag.notify();
+     try self.renderer_thread.wakeup.notify();
+ }
+ 
+diff --git a/src/termio/Options.zig b/src/termio/Options.zig
+index a6bf8c4d4..24fdd5333 100644
+--- a/src/termio/Options.zig
++++ b/src/termio/Options.zig
+@@ -32,7 +32,17 @@ renderer_state: *renderer.State,
+ 
+ /// A handle to wake up the renderer. This hints to the renderer that
+ /// a repaint should happen.
+-renderer_wakeup: xev.Async,
++/// A pointer, not a copy, and that is load-bearing on Windows.
++///
++/// libxev's async is an OS handle on Linux (an eventfd) and macOS (a mach
++/// port), so copying the struct copies the handle and a notify on the copy
++/// still reaches the loop. The IOCP implementation keeps its state in the
++/// struct itself - `waiter` is set by `wait()` on the instance the loop owns -
++/// so a copy has `waiter == null`, and `notify()` on it silently sets a bool
++/// nobody reads and returns success.
++///
++/// Held by value, this meant pty output never woke the renderer on Windows.
++renderer_wakeup: *xev.Async,
+ 
+ /// The mailbox for renderer messages.
+ renderer_mailbox: *renderer.Thread.Mailbox,
+diff --git a/src/termio/Termio.zig b/src/termio/Termio.zig
+index e3b564bc9..b2313e7dc 100644
+--- a/src/termio/Termio.zig
++++ b/src/termio/Termio.zig
+@@ -47,7 +47,7 @@ renderer_state: *renderer.State,
+ 
+ /// A handle to wake up the renderer. This hints to the renderer that
+ /// a repaint should happen.
+-renderer_wakeup: xev.Async,
++renderer_wakeup: *xev.Async,
+ 
+ /// The mailbox for notifying the renderer of things.
+ renderer_mailbox: *renderer.Thread.Mailbox,
+diff --git a/src/termio/stream_handler.zig b/src/termio/stream_handler.zig
+index ddc5eb82b..b8322b261 100644
+--- a/src/termio/stream_handler.zig
++++ b/src/termio/stream_handler.zig
+@@ -39,7 +39,7 @@ pub const StreamHandler = struct {
+ 
+     /// A handle to wake up the renderer. This hints to the renderer that
+     /// a repaint should happen.
+-    renderer_wakeup: xev.Async,
++    renderer_wakeup: *xev.Async,
+ 
+     /// The response to use for ENQ requests. The memory is owned by
+     /// whoever owns StreamHandler.
