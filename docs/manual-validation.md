@@ -34,6 +34,23 @@ Note precisely what unstuck it - the first time this was found, resizing did
 *not* force a redraw and scrolling did, which is what identified the wakeup
 rather than the swap chain.
 
+> **Re-check this whenever the render throttle changes.** Phase 7 replaced the
+> per-chunk `render_now` this step exists to guard with an 8 ms trailing
+> throttle, which is exactly the shape of change that could bring the freeze
+> back.
+>
+> **Checked 2026-08-07, focused pane, passes.** `dir /s C:\Windows\System32`
+> followed by a marker echo: photographed at 3 s (mid-scroll, actively moving)
+> and at 8 s (complete - 25,005 files, the marker, and the prompt back), with
+> no scroll, resize or keystroke in between. The last batch reaching the screen
+> is the whole assertion: the freeze's signature is precisely that it does not.
+> Driven by `keyshot2.ps1` in the session scratchpad - launch, force focus,
+> type, photograph with `harness/wgc-shot` at fixed offsets.
+>
+> **The unfocused half of this step is still unchecked**, and it is the half
+> the original bug needed: the freeze was found in a pane that was not
+> focused. A split with focus elsewhere still wants a human.
+
 ## 2. Non-ASCII output
 
 Covered automatically for the harness (see below), but not for Windows
