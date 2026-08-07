@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 4 Aug 2026 14:11:45 -0700
+Subject: [PATCH] seam: pin IsBufferRowInViewport, and retract a wrong
+ justification
+
+Adds ControlCoreTests::TestIsBufferRowInViewport (viewport bounds at the
+bottom and scrolled back) and TestIsBufferRowInViewportAltBuffer.
+
+Writing the second test disproved the reason the first commit gave for
+this method existing. That commit claimed ICoreState::ScrollOffset +
+ViewHeight could not substitute, because Terminal::_VisibleStartIndex()
+short-circuits to 0 in the alt buffer while GetViewport().Top() does
+not. That was read out of the source and never measured. Measured, they
+agree everywhere: main buffer at the bottom 21/21, main buffer scrolled
+back 5/5, alt buffer 0/0. GetViewport() returns the *visible* viewport.
+
+The implementation does not change - it calls the same GetViewport() the
+escape did, so it is faithful regardless - and the real justification
+stands on its own: the escape read both bounds under a single console
+lock, and two property reads would take two. Only the stated reason was
+wrong. Comments in ControlCore.cpp and IControlCore.idl are corrected,
+and the alt-buffer test now asserts the agreement so a future divergence
+fails rather than becoming folklore.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ee27Fih3vSPYsqrUBpUoc
+---
+ src/cascadia/TerminalControl/ControlCore.cpp  | 10 +-
+ src/cascadia/TerminalControl/IControlCore.idl |  8 +-
+ .../UnitTests_Control/ControlCoreTests.cpp    | 93 +++++++++++++++++++
+ 3 files changed, 104 insertions(+), 7 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/ControlCore.cpp b/src/cascadia/TerminalControl/ControlCore.cpp
+index 58ebe1840..020f2fc75 100644
+--- a/src/cascadia/TerminalControl/ControlCore.cpp
++++ b/src/cascadia/TerminalControl/ControlCore.cpp
+@@ -1847,9 +1847,13 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     // Whether a buffer row is currently visible.
+     //
+     // Replaces a GetRenderData()->GetViewport() escape. Both bounds are read
+-    // under a single lock, as the original did. ICoreState::ScrollOffset is not
+-    // a substitute: Terminal::_VisibleStartIndex() reports 0 in the alt buffer
+-    // while GetViewport().Top() does not.
++    // under a single lock, as the original did - that atomicity is why this is
++    // one predicate rather than separate Top/Bottom accessors.
++    //
++    // Not because ICoreState::ScrollOffset + ViewHeight would give a different
++    // answer: measured, ScrollOffset tracks GetViewport().Top() in the main
++    // buffer (at the bottom and scrolled back) and in the alt buffer alike.
++    // ControlCoreTests::TestIsBufferRowInViewportAltBuffer pins that.
+     bool ControlCore::IsBufferRowInViewport(int32_t bufferRow) const
+     {
+         const auto lock = _terminal->LockForReading();
+diff --git a/src/cascadia/TerminalControl/IControlCore.idl b/src/cascadia/TerminalControl/IControlCore.idl
+index 5363c3553..026fe8434 100644
+--- a/src/cascadia/TerminalControl/IControlCore.idl
++++ b/src/cascadia/TerminalControl/IControlCore.idl
+@@ -212,10 +212,10 @@ namespace Microsoft.Terminal.Control
+         // GetRenderData()->GetViewport() while holding the console lock.
+         //
+         // Deliberately a single predicate rather than separate Top/Bottom
+-        // accessors: the original read both bounds under one lock, and
+-        // ICoreState's ScrollOffset cannot substitute because
+-        // Terminal::_VisibleStartIndex() special-cases the alt buffer to 0
+-        // while GetViewport().Top() does not.
++        // accessors: the original read both bounds under one lock, and two
++        // property reads would take two locks. (ICoreState::ScrollOffset does
++        // in fact track GetViewport().Top() everywhere measured, including the
++        // alt buffer - atomicity is the reason here, not a value mismatch.)
+         Boolean IsBufferRowInViewport(Int32 bufferRow);
+ 
+         // These events are called from some background thread
+diff --git a/src/cascadia/UnitTests_Control/ControlCoreTests.cpp b/src/cascadia/UnitTests_Control/ControlCoreTests.cpp
+index 7a0ef5134..da0ffa365 100644
+--- a/src/cascadia/UnitTests_Control/ControlCoreTests.cpp
++++ b/src/cascadia/UnitTests_Control/ControlCoreTests.cpp
+@@ -48,6 +48,9 @@ namespace ControlUnitTests
+ 
+         TEST_METHOD(TestSimpleClickSelection);
+ 
++        TEST_METHOD(TestIsBufferRowInViewport);
++        TEST_METHOD(TestIsBufferRowInViewportAltBuffer);
++
+         TEST_CLASS_SETUP(ModuleSetup)
+         {
+             winrt::init_apartment(winrt::apartment_type::single_threaded);
+@@ -239,6 +242,96 @@ namespace ControlUnitTests
+         VERIFY_ARE_EQUAL(L"Impact", std::wstring_view{ core->_actualFont.GetFaceName() });
+     }
+ 
++    // IsBufferRowInViewport replaced a get_self escape that reached
++    // GetRenderData()->GetViewport() (ADR 0001). These two tests pin the
++    // behaviour it has to preserve.
++    void ControlCoreTests::TestIsBufferRowInViewport()
++    {
++        auto [settings, conn] = _createSettingsAndConnection();
++        auto core = createCore(*settings, *conn);
++        VERIFY_IS_NOT_NULL(core);
++        _standardInit(core);
++
++        // 20 rows tall, nothing printed yet, so the viewport is rows 0-19.
++        VERIFY_IS_TRUE(core->IsBufferRowInViewport(0));
++        VERIFY_IS_TRUE(core->IsBufferRowInViewport(19));
++        VERIFY_IS_FALSE(core->IsBufferRowInViewport(20));
++        VERIFY_IS_FALSE(core->IsBufferRowInViewport(-1));
++
++        // Scroll the buffer so the viewport no longer starts at row 0. Row 0
++        // has left the top of the screen; the bottom has moved down.
++        for (auto i = 0; i < 40; ++i)
++        {
++            conn->WriteInput(winrt_wstring_to_array_view(L"Foo\r\n"));
++        }
++
++        {
++            const auto viewport = core->_terminal->GetViewport();
++            VERIFY_IS_GREATER_THAN(viewport.Top(), 0, L"the viewport should have scrolled");
++
++            VERIFY_IS_FALSE(core->IsBufferRowInViewport(0), L"row 0 has scrolled off the top");
++            VERIFY_IS_TRUE(core->IsBufferRowInViewport(viewport.Top()));
++            VERIFY_IS_TRUE(core->IsBufferRowInViewport(viewport.BottomInclusive()));
++            VERIFY_IS_FALSE(core->IsBufferRowInViewport(viewport.Top() - 1));
++            VERIFY_IS_FALSE(core->IsBufferRowInViewport(viewport.BottomInclusive() + 1));
++        }
++
++        // Scrolling back must move the answer with the visible viewport.
++        core->UserScrollViewport(5);
++        {
++            const auto viewport = core->_terminal->GetViewport();
++            VERIFY_ARE_EQUAL(5, viewport.Top());
++
++            VERIFY_IS_TRUE(core->IsBufferRowInViewport(viewport.Top()));
++            VERIFY_IS_TRUE(core->IsBufferRowInViewport(viewport.BottomInclusive()));
++            VERIFY_IS_FALSE(core->IsBufferRowInViewport(viewport.Top() - 1));
++            VERIFY_IS_FALSE(core->IsBufferRowInViewport(viewport.BottomInclusive() + 1));
++        }
++    }
++
++    // Records how ICoreState::ScrollOffset relates to GetViewport().Top() in the
++    // alt buffer.
++    //
++    // An earlier note here claimed the two diverge, because
++    // Terminal::_VisibleStartIndex() short-circuits to 0 in the alt buffer.
++    // Measured, they agree - GetViewport() returns the *visible* viewport, which
++    // is 0-based in the alt buffer too. They also agree in the main buffer, both
++    // at the bottom and scrolled back.
++    //
++    // So the derivation is not the reason IsBufferRowInViewport exists. The
++    // reason is atomicity: the escape it replaced read both bounds under a
++    // single console lock, and two separate property reads would take two.
++    // This test exists to catch a future divergence, not to assert one.
++    void ControlCoreTests::TestIsBufferRowInViewportAltBuffer()
++    {
++        auto [settings, conn] = _createSettingsAndConnection();
++        auto core = createCore(*settings, *conn);
++        VERIFY_IS_NOT_NULL(core);
++        _standardInit(core);
++
++        // Scroll first, so the main-buffer viewport top is genuinely non-zero.
++        for (auto i = 0; i < 40; ++i)
++        {
++            conn->WriteInput(winrt_wstring_to_array_view(L"Foo\r\n"));
++        }
++
++        // Enter the alt buffer (DECSET 1049).
++        conn->WriteInput(winrt_wstring_to_array_view(L"\x1b[?1049h"));
++
++        const auto viewport = core->_terminal->GetViewport();
++        const auto scrollOffset = core->ScrollOffset();
++
++        Log::Comment(NoThrowString().Format(
++            L"alt buffer: GetViewport().Top()=%d, ScrollOffset()=%d", viewport.Top(), scrollOffset));
++        VERIFY_ARE_EQUAL(viewport.Top(), scrollOffset,
++                         L"measured: these agree in the alt buffer, contrary to an earlier assumption");
++
++        // Whatever the relationship, the predicate follows the real viewport.
++        VERIFY_IS_TRUE(core->IsBufferRowInViewport(viewport.Top()));
++        VERIFY_IS_TRUE(core->IsBufferRowInViewport(viewport.BottomInclusive()));
++        VERIFY_IS_FALSE(core->IsBufferRowInViewport(viewport.BottomInclusive() + 1));
++    }
++
+     void ControlCoreTests::TestClearScrollback()
+     {
+         auto [settings, conn] = _createSettingsAndConnection();

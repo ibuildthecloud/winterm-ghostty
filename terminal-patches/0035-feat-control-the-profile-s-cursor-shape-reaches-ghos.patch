@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Thu, 6 Aug 2026 14:42:05 -0700
+Subject: [PATCH] feat(control): the profile's cursor shape reaches ghostty
+
+Found by hand: a ghostty pane drew a block cursor beside a cascadia pane
+drawing a bar. Not a configuration problem - cursorShape was simply never
+forwarded, so ghostty used its own default and the profile's setting applied to
+one pane out of two.
+
+ghostty has four shapes to WT's six. Bar, Underscore, FilledBox and EmptyBox map
+exactly; Vintage and DoubleUnderscore both become an underline, and the test
+lists them as approximations rather than leaving that to be discovered. Vintage
+is why CursorHeight is not forwarded either - ghostty has no height control for
+an underline, so sending the height would imply an effect it cannot have.
+
+This sets the default only. A program can still ask for another shape with
+DECSCUSR on either engine, and ghostty's shell integration puts a bar at the
+prompt regardless, so a profile's cursorShape is the starting point rather than
+the last word.
+
+WT suites: unitControl 62/62.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BgDGqEqRBB8L5Ueoq1uuxy
+---
+ .../GhosttySettingsTranslator.cpp             | 36 ++++++++++++++++
+ .../GhosttySettingsTests.cpp                  | 41 ++++++++++++++++++-
+ 2 files changed, 76 insertions(+), 1 deletion(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+index ce1b9199f..f17f9769d 100644
+--- a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
++++ b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+@@ -106,6 +106,42 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // clipboard - measured, because that was the regression to fear.
+         set("selection-trim-line", "false");
+ 
++        // --- Cursor -------------------------------------------------------
++        // Found by hand: a ghostty pane drew a block where the cascadia pane
++        // beside it drew a bar, because the profile's cursorShape was never
++        // forwarded and ghostty used its own default.
++        //
++        // ghostty offers four shapes to WT's six. DoubleUnderscore and Vintage
++        // both become an underline - Vintage is a short underscore and ghostty
++        // has no height control for it, which is also why CursorHeight is not
++        // forwarded at all. Those two are the approximations; the other four
++        // are exact.
++        //
++        // Only the default is set here. A program can still ask for a different
++        // shape with DECSCUSR, on either engine, and ghostty's shell
++        // integration puts a bar at the prompt regardless - so a profile's
++        // cursorShape is the starting point rather than the last word.
++        if (const auto appearance = settings.try_as<Core::ICoreAppearance>())
++        {
++            switch (appearance.CursorShape())
++            {
++            case Core::CursorStyle::Bar:
++                set("cursor-style", "bar");
++                break;
++            case Core::CursorStyle::Underscore:
++            case Core::CursorStyle::DoubleUnderscore:
++            case Core::CursorStyle::Vintage:
++                set("cursor-style", "underline");
++                break;
++            case Core::CursorStyle::EmptyBox:
++                set("cursor-style", "block_hollow");
++                break;
++            case Core::CursorStyle::FilledBox:
++                set("cursor-style", "block");
++                break;
++            }
++        }
++
+         // --- Padding ------------------------------------------------------
+         // WT already insets the SwapChainPanel by this same padding, so asking
+         // ghostty to pad as well would double it. Ours is therefore zero, and
+diff --git a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+index d148aafa9..cd44a051d 100644
+--- a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
++++ b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+@@ -39,7 +39,8 @@ namespace ControlUnitTests
+         TEST_METHOD(PaddingIsZeroBecauseWindowsTerminalAlreadyPads);
+         TEST_METHOD(SchemeProducesForegroundBackgroundAndFullPalette);
+         TEST_METHOD(WordDelimitersReachTheEngine);
+-        TEST_METHOD(TripleClickHighlightsTheWholeLine);
++        TEST_METHOD(TripleClickHighlightsTheWholeLine);
++        TEST_METHOD(CursorShapeIsForwarded);
+         TEST_METHOD(BackslashesAreDoubledForTheWordCharsFieldOnly);
+         TEST_METHOD(NullSettingsProduceNothing);
+ 
+@@ -183,6 +184,44 @@ namespace ControlUnitTests
+                        L"a triple click must highlight the full width of the line");
+     }
+ 
++    // Found by hand: a ghostty pane drew a block cursor beside a cascadia pane
++    // drawing a bar, because the profile's cursorShape was never forwarded.
++    //
++    // ghostty has four shapes to WT's six. Vintage and DoubleUnderscore both
++    // land on underline - those two are approximations and the mapping should
++    // say so out loud rather than be discovered later.
++    void GhosttySettingsTests::CursorShapeIsForwarded()
++    {
++        struct Case
++        {
++            Core::CursorStyle shape;
++            std::string_view expected;
++        };
++        static constexpr Case cases[] = {
++            { Core::CursorStyle::Bar, "bar" },
++            { Core::CursorStyle::FilledBox, "block" },
++            { Core::CursorStyle::EmptyBox, "block_hollow" },
++            { Core::CursorStyle::Underscore, "underline" },
++            // Approximations: ghostty has neither.
++            { Core::CursorStyle::DoubleUnderscore, "underline" },
++            { Core::CursorStyle::Vintage, "underline" },
++        };
++
++        for (const auto& c : cases)
++        {
++            auto s = _settings();
++            s->CursorShape(c.shape);
++
++            const auto entries = Control::implementation::TranslateGhosttySettings(*s);
++
++            VERIFY_IS_TRUE(_has(entries, "cursor-style", c.expected),
++                           fmt::format(L"cursor shape {} must become '{}'",
++                                       static_cast<int>(c.shape),
++                                       til::u8u16(c.expected))
++                               .c_str());
++        }
++    }
++
+     // The one escaping rule left, and it belongs to the field rather than to
+     // the entry. ghostty parses selection-word-chars as a Zig string literal,
+     // so a lone backslash starts an escape sequence there - and WT's default

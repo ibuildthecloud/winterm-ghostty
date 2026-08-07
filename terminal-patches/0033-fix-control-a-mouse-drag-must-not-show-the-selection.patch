@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Thu, 6 Aug 2026 10:40:13 -0700
+Subject: [PATCH] fix(control): a mouse drag must not show the selection
+ markers
+
+Found by hand, one commit after it was introduced: a rightward drag on a
+ghostty pane left a white sliver in the top-left corner of the pane.
+
+It was not a rendering artifact. The selection markers are Windows Terminal's
+touch-drag handles - XAML drawn over the swapchain, which is why nothing the
+harness captures could ever contain them. Cascadia raises UpdateSelectionMarkers
+on every selection change but with ClearMarkers *true* unless the selection is
+a keyboard or mark-mode one, so a mouse drag hides them. The raise added for
+copy-on-select passed false, which means show them - and TermControl places them
+from SelectionInfo(), which this engine cannot fill in, so both handles landed
+at cell (0,0).
+
+False looks like the obviously-correct value there; the comment now says why it
+is not.
+
+Nothing automated could have caught this. Every selection check measures what
+ghostty selected - text and cell spans - and none of them look at the pixels WT
+draws on top of the pane. Recorded as a coverage gap rather than papered over.
+
+WT suites: terminalCore 54/54, unitSettingsModel 159/159, unitControl 60/60,
+terminalApp 51/51.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BgDGqEqRBB8L5Ueoq1uuxy
+---
+ src/cascadia/TerminalControl/GhosttyControlCore.cpp | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 833f2e6a8..93932f33e 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -946,7 +946,15 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // A drag is about to make a selection, and ControlInteractivity decides
+         // whether to copy it on release from this event - the click that began
+         // the drag had nothing to copy yet and said so.
+-        UpdateSelectionMarkers.raise(*this, winrt::make<implementation::UpdateSelectionMarkersEventArgs>(false));
++        //
++        // ClearMarkers is *true*, as it is on cascadia for a mouse drag: the
++        // markers are the keyboard/mark-mode affordance, and ControlCore only
++        // asks for them when SelectionMode() >= Keyboard. Passing false instead
++        // told TermControl to show them, and it places them from SelectionInfo(),
++        // which this engine cannot fill in - so both handles were drawn at cell
++        // (0,0) and a stray sliver appeared at the top-left of the pane on every
++        // rightward drag.
++        UpdateSelectionMarkers.raise(*this, winrt::make<implementation::UpdateSelectionMarkersEventArgs>(true));
+     }
+ 
+     void GhosttyControlCore::SetEndSelectionPoint(const Core::Point positionCore)

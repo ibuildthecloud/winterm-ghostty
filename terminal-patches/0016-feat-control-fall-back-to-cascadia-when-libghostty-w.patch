@@ -1,0 +1,365 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Wed, 5 Aug 2026 13:46:33 -0700
+Subject: [PATCH] feat(control): fall back to cascadia when libghostty will not
+ start
+
+PLAN lists this as a Phase 5 deliverable and two comments claimed it already
+worked. It did not. GhosttyControlCore::Initialize returning false raises
+RendererEnteredErrorState and TermControl gives up on the pane - the user is
+told, and then left with a dead one. Nothing anywhere swapped in cascadia.
+
+The fallback can only work before anything binds to the core, so it moves
+into the engine factory: ControlInteractivity asks GhosttyEngine::TryGet()
+first, and builds a cascadia core if the engine is not there. By the time
+Initialize() can report a failure, TermControl has wired its events to the
+core it was handed and there is nothing left to swap.
+
+A surface that fails later still takes the Initialize/error-state route. That
+failure is per-pane and the session may already have output in it; changing
+engine underneath it would be worse than reporting.
+
+GhosttyEngine gains _unavailableForTests, in the shape ControlCore already
+uses for _inUnitTests: a machine where libghostty will not start is not a
+state a test can reach by asking, and an untested fallback is one nobody has
+seen work. Four tests in GhosttyEngineSelectionTests cover the factory, and
+the fallback one is mutation-verified - removing the TryGet check fails it
+and nothing else. The suite log also shows libghostty really does bootstrap
+inside the TAEF host, so the ghostty branch is genuinely exercised rather
+than always falling back.
+
+unitControl 42/42, unitSettingsModel 159/159.
+---
+ src/cascadia/TerminalControl/ControlCore.h    |   3 +
+ .../TerminalControl/ControlInteractivity.cpp  |  22 ++-
+ .../TerminalControl/ControlInteractivity.h    |   5 +-
+ .../TerminalControl/GhosttyControlCore.cpp    |  10 +-
+ .../TerminalControl/GhosttyEngine.cpp         |  11 ++
+ src/cascadia/TerminalControl/GhosttyEngine.h  |  13 ++
+ .../Control.UnitTests.vcxproj                 |   1 +
+ .../GhosttyEngineSelectionTests.cpp           | 136 ++++++++++++++++++
+ 8 files changed, 192 insertions(+), 9 deletions(-)
+ create mode 100644 src/cascadia/UnitTests_Control/GhosttyEngineSelectionTests.cpp
+
+diff --git a/src/cascadia/TerminalControl/ControlCore.h b/src/cascadia/TerminalControl/ControlCore.h
+index 536f996ba..376964bbc 100644
+--- a/src/cascadia/TerminalControl/ControlCore.h
++++ b/src/cascadia/TerminalControl/ControlCore.h
+@@ -38,6 +38,7 @@ namespace ControlUnitTests
+ {
+     class ControlCoreTests;
+     class ControlInteractivityTests;
++    class GhosttyEngineSelectionTests;
+ };
+ 
+ #define RUNTIME_SETTING(type, name, setting)                 \
+@@ -465,6 +466,8 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         friend class ControlUnitTests::ControlCoreTests;
+         friend class ControlUnitTests::ControlInteractivityTests;
++        // Needs _inUnitTests, so a core it builds can be torn down in a test host.
++        friend class ControlUnitTests::GhosttyEngineSelectionTests;
+         bool _inUnitTests{ false };
+     };
+ }
+diff --git a/src/cascadia/TerminalControl/ControlInteractivity.cpp b/src/cascadia/TerminalControl/ControlInteractivity.cpp
+index 2b18f8f64..ad1665754 100644
+--- a/src/cascadia/TerminalControl/ControlInteractivity.cpp
++++ b/src/cascadia/TerminalControl/ControlInteractivity.cpp
+@@ -54,15 +54,25 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // already fallen back to the default and raised
+         // SettingsLoadWarnings::UnknownEngine.
+         //
+-        // A ghostty core that cannot bring libghostty up does not throw here -
+-        // it fails from Initialize(), which is the path TermControl already
+-        // handles, and the pane falls back to cascadia rather than the window
+-        // failing to open.
++        // The engine is asked for before the core is committed to it. If
++        // libghostty cannot be brought up at all - no DLL, a failed
++        // ghostty_init - a ghostty core could only fail from Initialize(), and
++        // by then TermControl has bound its events to it: that path reports
++        // the error but leaves a dead pane behind. Choosing here, before
++        // anything binds, is what makes ADR 0007's fallback real. A surface
++        // that fails later still goes the Initialize()/RendererEnteredErrorState
++        // route, because by then there is a pane to report it on.
+         switch (settings.Engine())
+         {
+         case Control::TerminalEngine::Ghostty:
+-            _core = winrt::make<GhosttyControlCore>(settings, unfocusedAppearance, connection);
+-            break;
++            if (GhosttyEngine::TryGet())
++            {
++                _core = winrt::make<GhosttyControlCore>(settings, unfocusedAppearance, connection);
++                break;
++            }
++            // The engine logs why once. This says what was done about it.
++            LOG_HR_MSG(E_FAIL, "libghostty is unavailable; this pane falls back to the cascadia engine");
++            [[fallthrough]];
+ 
+         case Control::TerminalEngine::Cascadia:
+         default:
+diff --git a/src/cascadia/TerminalControl/ControlInteractivity.h b/src/cascadia/TerminalControl/ControlInteractivity.h
+index 6fb4eceb3..b8a6b5656 100644
+--- a/src/cascadia/TerminalControl/ControlInteractivity.h
++++ b/src/cascadia/TerminalControl/ControlInteractivity.h
+@@ -20,13 +20,14 @@
+ #include "EventArgs.h"
+ #include "../buffer/out/search.h"
+ 
+-#include "ControlCore.h"
++#include "ControlCore.h"
+ #include "../../renderer/uia/UiaRenderer.hpp"
+ 
+ namespace ControlUnitTests
+ {
+     class ControlCoreTests;
+     class ControlInteractivityTests;
++    class GhosttyEngineSelectionTests;
+ };
+ 
+ namespace winrt::Microsoft::Terminal::Control::implementation
+@@ -176,6 +177,8 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         friend class ControlUnitTests::ControlCoreTests;
+         friend class ControlUnitTests::ControlInteractivityTests;
++        // Needs _cascadiaCore() to tell which engine the factory picked.
++        friend class ControlUnitTests::GhosttyEngineSelectionTests;
+     };
+ }
+ 
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 8cf240a5f..b97123998 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -43,8 +43,14 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+     // The engine is resolved here rather than in the constructor so a failure
+     // has somewhere to be reported: Initialize returning false is the signal
+-    // TermControl already understands, and ControlInteractivity turns it into
+-    // the cascadia fallback.
++    // TermControl already understands.
++    //
++    // Reaching this with no engine is the unlikely case - ControlInteractivity
++    // only builds a ghostty core once TryGet has succeeded, so the engine
++    // would have to have gone away in between. The common failure here is a
++    // surface that cannot be created, which is per-pane and has no fallback:
++    // the pane reports the error state rather than silently changing engine
++    // under a session that may already have output in it.
+     bool GhosttyControlCore::Initialize(const float actualWidth,
+                                         const float actualHeight,
+                                         const float compositionScale)
+diff --git a/src/cascadia/TerminalControl/GhosttyEngine.cpp b/src/cascadia/TerminalControl/GhosttyEngine.cpp
+index 2d10dc1c2..aecfbf7da 100644
+--- a/src/cascadia/TerminalControl/GhosttyEngine.cpp
++++ b/src/cascadia/TerminalControl/GhosttyEngine.cpp
+@@ -7,8 +7,19 @@
+ 
+ namespace winrt::Microsoft::Terminal::Control::implementation
+ {
++    bool GhosttyEngine::_unavailableForTests = false;
++
+     GhosttyEngine* GhosttyEngine::TryGet() noexcept
+     {
++        // The fallback to cascadia only runs on a machine where libghostty
++        // will not start, which is not a state a test can reach by asking. It
++        // is checked before the cached engine so a test can force it either
++        // way regardless of what ran first.
++        if (_unavailableForTests)
++        {
++            return nullptr;
++        }
++
+         // Deliberately leaked: libghostty's app owns threads that outlive any
+         // sensible teardown point in a process that is exiting anyway, and
+         // running its destructor during static destruction would race them.
+diff --git a/src/cascadia/TerminalControl/GhosttyEngine.h b/src/cascadia/TerminalControl/GhosttyEngine.h
+index 11c4db7cb..c27da6888 100644
+--- a/src/cascadia/TerminalControl/GhosttyEngine.h
++++ b/src/cascadia/TerminalControl/GhosttyEngine.h
+@@ -17,6 +17,11 @@
+ 
+ #include <ghostty.h>
+ 
++namespace ControlUnitTests
++{
++    class GhosttyEngineSelectionTests;
++};
++
+ namespace winrt::Microsoft::Terminal::Control::implementation
+ {
+     struct GhosttyControlCore;
+@@ -53,6 +58,12 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         GhosttyEngine() = default;
+         bool _initialize() noexcept;
+ 
++        // Makes TryGet answer as it would on a machine without a working
++        // libghostty. The cascadia fallback is otherwise unreachable from a
++        // test, and an untested fallback is a fallback nobody has seen work.
++        // Same shape as ControlCore::_inUnitTests.
++        static bool _unavailableForTests;
++
+         // libghostty wakes us from its own threads; ghostty_app_tick has to run
+         // on one consistent thread, so it gets a dedicated one rather than
+         // borrowing the UI thread (which would tie engine liveness to XAML
+@@ -91,5 +102,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         static void _closeSurface(void* userdata, bool processAlive) noexcept;
+         static void _writePty(void* userdata, const uint8_t* data, size_t len) noexcept;
+         static void _resizePty(void* userdata, uint16_t columns, uint16_t rows) noexcept;
++
++        friend class ControlUnitTests::GhosttyEngineSelectionTests;
+     };
+ }
+diff --git a/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj b/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
+index 24d0354ec..fdf10b5b7 100644
+--- a/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
++++ b/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
+@@ -36,6 +36,7 @@
+   <ItemGroup>
+     <ClCompile Include="ControlCoreTests.cpp" />
+     <ClCompile Include="GhosttySettingsTests.cpp" />
++    <ClCompile Include="GhosttyEngineSelectionTests.cpp" />
+     <!-- Compiled straight into the tests: it is a pure function with no
+          libghostty dependency, so the test binary needs no engine DLL. -->
+     <ClCompile Include="..\TerminalControl\GhosttySettingsTranslator.cpp" />
+diff --git a/src/cascadia/UnitTests_Control/GhosttyEngineSelectionTests.cpp b/src/cascadia/UnitTests_Control/GhosttyEngineSelectionTests.cpp
+new file mode 100644
+index 000000000..a873cc2b2
+--- /dev/null
++++ b/src/cascadia/UnitTests_Control/GhosttyEngineSelectionTests.cpp
+@@ -0,0 +1,136 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++//
++// The engine factory (ADR 0007): which core a profile's "engine" gets, and
++// what happens when the engine it asks for cannot be brought up.
++//
++// The fallback is the point. A profile asking for ghostty on a machine where
++// libghostty will not start must still open a working pane on the cascadia
++// engine - not a pane that reports an error and then sits there dead, which
++// is what deciding this any later than construction would give. By the time
++// Initialize() can report a failure, TermControl has bound its events to the
++// core it was handed, and there is no swapping it out underneath.
++
++#include "pch.h"
++#include "../TerminalControl/ControlInteractivity.h"
++#include "../TerminalControl/ControlCore.h"
++#include "../TerminalControl/GhosttyEngine.h"
++#include "MockControlSettings.h"
++#include "MockConnection.h"
++
++using namespace WEX::Logging;
++using namespace WEX::TestExecution;
++using namespace WEX::Common;
++
++using namespace winrt;
++using namespace winrt::Microsoft::Terminal;
++
++namespace ControlUnitTests
++{
++    class GhosttyEngineSelectionTests
++    {
++        BEGIN_TEST_CLASS(GhosttyEngineSelectionTests)
++            TEST_CLASS_PROPERTY(L"TestTimeout", L"0:1:00")
++        END_TEST_CLASS()
++
++        TEST_METHOD(DefaultEngineIsCascadia);
++        TEST_METHOD(CascadiaEngineGetsACascadiaCore);
++        TEST_METHOD(GhosttyEngineAlwaysGetsAUsableCore);
++        TEST_METHOD(GhosttyFallsBackToCascadiaWhenTheEngineIsUnavailable);
++
++    private:
++        // Puts the engine back however the test left it, including on failure.
++        struct EngineUnavailable
++        {
++            EngineUnavailable() noexcept
++            {
++                Control::implementation::GhosttyEngine::_unavailableForTests = true;
++            }
++            ~EngineUnavailable()
++            {
++                Control::implementation::GhosttyEngine::_unavailableForTests = false;
++            }
++        };
++
++        static winrt::com_ptr<Control::implementation::ControlInteractivity>
++        _interactivity(Control::TerminalEngine engine)
++        {
++            auto settings = winrt::make_self<MockControlSettings>();
++            settings->Engine(engine);
++            auto conn = winrt::make_self<MockConnection>();
++
++            auto interactivity = winrt::make_self<Control::implementation::ControlInteractivity>(
++                *settings, *settings, *conn);
++            VERIFY_IS_NOT_NULL(interactivity);
++
++            // Same as the rest of this suite: cascadia's core starts a real
++            // renderer otherwise, and tearing one down in a test host hangs.
++            if (const auto cascadia = interactivity->_cascadiaCore())
++            {
++                cascadia->_inUnitTests = true;
++            }
++            return interactivity;
++        }
++    };
++
++    // Cascadia is the default in ControlProperties.h, and it staying the
++    // default is what keeps a second engine opt-in.
++    void GhosttyEngineSelectionTests::DefaultEngineIsCascadia()
++    {
++        auto settings = winrt::make_self<MockControlSettings>();
++        VERIFY_ARE_EQUAL(Control::TerminalEngine::Cascadia, settings->Engine());
++    }
++
++    void GhosttyEngineSelectionTests::CascadiaEngineGetsACascadiaCore()
++    {
++        const auto interactivity = _interactivity(Control::TerminalEngine::Cascadia);
++        VERIFY_IS_NOT_NULL(interactivity->_cascadiaCore(),
++                           L"a cascadia profile must get cascadia's own core");
++    }
++
++    // Whichever way the engine goes, the pane gets a core it can use. If
++    // libghostty came up this is the ghostty core; if it did not, the factory
++    // fell back and this is cascadia's. Both are passes - what would fail is
++    // a null core, or one that throws the moment it is asked anything, which
++    // is what a ghostty core built against a dead engine would be.
++    void GhosttyEngineSelectionTests::GhosttyEngineAlwaysGetsAUsableCore()
++    {
++        const auto interactivity = _interactivity(Control::TerminalEngine::Ghostty);
++
++        const auto core = interactivity->Core();
++        VERIFY_IS_NOT_NULL(core, L"a ghostty profile must never end up with no core at all");
++
++        if (interactivity->_cascadiaCore())
++        {
++            Log::Comment(L"libghostty is unavailable here; the factory fell back to cascadia.");
++        }
++        else
++        {
++            Log::Comment(L"libghostty came up; this pane is on the ghostty engine.");
++        }
++
++        // Asked the things a pane is asked before it is initialized. The
++        // engine-specific answers differ; that any answer comes back at all
++        // is the invariant.
++        VERIFY_IS_NOT_NULL(core.Connection(), L"the connection must survive the choice of engine");
++        VERIFY_ARE_NOT_EQUAL(TerminalConnection::ConnectionState::Failed, core.ConnectionState());
++        VERIFY_IS_FALSE(core.IsInReadOnlyMode());
++    }
++
++    // The deliverable itself (PLAN Phase 5, ADR 0007): on a machine where
++    // libghostty will not start, a ghostty profile opens on cascadia instead
++    // of opening dead. Deciding this at construction is the whole point - by
++    // the time Initialize() could report the failure, TermControl has bound
++    // its events to the core and the pane cannot be re-engined.
++    void GhosttyEngineSelectionTests::GhosttyFallsBackToCascadiaWhenTheEngineIsUnavailable()
++    {
++        const EngineUnavailable noEngine;
++
++        const auto interactivity = _interactivity(Control::TerminalEngine::Ghostty);
++
++        VERIFY_IS_NOT_NULL(interactivity->_cascadiaCore(),
++                           L"with no engine, a ghostty profile must fall back to cascadia's core");
++        VERIFY_IS_NOT_NULL(interactivity->Core().Connection(),
++                           L"and it must keep the connection it was created with");
++    }
++}

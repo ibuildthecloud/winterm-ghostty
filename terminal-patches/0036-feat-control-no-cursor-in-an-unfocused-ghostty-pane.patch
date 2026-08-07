@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Thu, 6 Aug 2026 15:04:18 -0700
+Subject: [PATCH] feat(control): no cursor in an unfocused ghostty pane
+
+Cascadia draws no cursor at all when a pane loses focus; ghostty's default -
+like most terminals - is a hollow block. Side by side that did not read as a
+different convention, it read as the cursor setting being ignored, because every
+shape collapsed to the same hollow box the moment focus moved.
+
+cursor-style-unfocused = hidden (ghostty patch 30) asks for cascadia's
+behaviour. Nothing about the focused cursor changes.
+
+WT suites: unitControl 62/62.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BgDGqEqRBB8L5Ueoq1uuxy
+---
+ .../TerminalControl/GhosttySettingsTranslator.cpp         | 6 ++++++
+ src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp   | 8 ++++++++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+index f17f9769d..4d04dfe8b 100644
+--- a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
++++ b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+@@ -142,6 +142,12 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             }
+         }
+ 
++        // Cascadia draws no cursor at all in an unfocused pane; ghostty's
++        // default - like most terminals - is a hollow block, so every shape
++        // became the same hollow box the moment focus moved. Next to a cascadia
++        // pane that is simply wrong rather than merely different.
++        set("cursor-style-unfocused", "hidden");
++
+         // --- Padding ------------------------------------------------------
+         // WT already insets the SwapChainPanel by this same padding, so asking
+         // ghostty to pad as well would double it. Ours is therefore zero, and
+diff --git a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+index cd44a051d..73ad2b208 100644
+--- a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
++++ b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+@@ -220,6 +220,14 @@ namespace ControlUnitTests
+                                        til::u8u16(c.expected))
+                                .c_str());
+         }
++
++        // Whatever the shape, an unfocused pane shows no cursor - cascadia
++        // draws none, where ghostty's default is a hollow block. Without this
++        // every shape collapsed to the same hollow box the moment focus moved,
++        // which reads as the cursor setting being ignored.
++        VERIFY_IS_TRUE(_has(Control::implementation::TranslateGhosttySettings(*_settings()),
++                            "cursor-style-unfocused",
++                            "hidden"));
+     }
+ 
+     // The one escaping rule left, and it belongs to the field rather than to

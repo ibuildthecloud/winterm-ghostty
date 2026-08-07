@@ -1,0 +1,579 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 4 Aug 2026 16:38:12 -0700
+Subject: [PATCH] seam: hold IControlCore in ControlInteractivity
+
+Flips _core from com_ptr<ControlCore> to the projected IControlCore, so
+the constructor's engine switch is now the only place in the class that
+names a concrete engine. This completes the Phase 5 prerequisite: a
+ghostty pane can receive mouse and selection input once an engine exists
+to bind there.
+
+The UIA cluster (AttachUiaEngine/DetachUiaEngine/GetRenderData) stays on
+the concrete type by design - it trades in pointers to WT's own renderer
+objects, which is the coupling the interface exists to remove. It is
+reached through a new _cascadiaCore(), which QIs for the ControlCore
+*class* interface rather than IControlCore: since ControlCore became a
+marker class, [default_interface] gave it its own class-specific
+interface that only cascadia exposes. QI'ing for IControlCore would
+succeed for every engine and hand the wrong type to get_self.
+
+For a non-cascadia engine, OnCreateAutomationPeer returns null - which
+TermControl::OnCreateAutomationPeer has always handled as "no custom
+peer, use XAML's default" - and GetRenderData returns null. Screen-reader
+support on a second engine is Phase 8's, per PLAN.
+
+Two call sites needed adjusting beyond the mechanical -> to .:
+- The paste lambda captured _core and dereferenced it.
+- _mouseTransparencyHandler bound ControlCore's internal one-argument
+  AdjustOpacity, which is the relative overload. Only the two-argument
+  form is projected, so relative-ness is now explicit; same code runs.
+
+The interactivity tests reach into cascadia internals (_terminal,
+_inUnitTests), so their helper takes the concrete core through
+_cascadiaCore() - which means every test run exercises that QI.
+
+Tests: 295/295 (terminalCore 54, unitSettingsModel 158, unitControl 32,
+terminalApp 51), matching the Phase 4 baseline.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ee27Fih3vSPYsqrUBpUoc
+---
+ .../TerminalControl/ControlInteractivity.cpp  | 164 +++++++++++-------
+ .../TerminalControl/ControlInteractivity.h    |  10 +-
+ .../ControlInteractivityTests.cpp             |   8 +-
+ 3 files changed, 117 insertions(+), 65 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/ControlInteractivity.cpp b/src/cascadia/TerminalControl/ControlInteractivity.cpp
+index 828d2bcf0..1281556a6 100644
+--- a/src/cascadia/TerminalControl/ControlInteractivity.cpp
++++ b/src/cascadia/TerminalControl/ControlInteractivity.cpp
+@@ -1,4 +1,4 @@
+-﻿// Copyright (c) Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ 
+ #include "pch.h"
+@@ -54,11 +54,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         {
+         case Control::TerminalEngine::Cascadia:
+         default:
+-            _core = winrt::make_self<ControlCore>(settings, unfocusedAppearance, connection);
++            _core = winrt::make<ControlCore>(settings, unfocusedAppearance, connection);
+             break;
+         }
+ 
+-        _core->Attached([weakThis = get_weak()](auto&&, auto&&) {
++        _core.Attached([weakThis = get_weak()](auto&&, auto&&) {
+             if (auto self{ weakThis.get() })
+             {
+                 self->Attached.raise(*self, nullptr);
+@@ -69,10 +69,10 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // the selection through ControlCore, bypassing SetEndSelectionPoint.
+         // Listen for selection changes so _selectionNeedsToBeCopied is set
+         // for ALL selection types, not just mouse drag.
+-        _core->UpdateSelectionMarkers([weakThis = get_weak()](auto&&, auto&&) {
++        _core.UpdateSelectionMarkers([weakThis = get_weak()](auto&&, auto&&) {
+             if (auto self{ weakThis.get() })
+             {
+-                if (self->_core->HasSelection())
++                if (self->_core.HasSelection())
+                 {
+                     self->_selectionNeedsToBeCopied = true;
+                 }
+@@ -102,14 +102,17 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             // Simply disabling the UIA engine is not enough, because it's
+             // possible that it had already started presenting here.
+             LOG_IF_FAILED(_uiaEngine->Disable());
+-            _core->DetachUiaEngine(_uiaEngine.get());
++            if (const auto cascadia{ _cascadiaCore() })
++            {
++                cascadia->DetachUiaEngine(_uiaEngine.get());
++            }
+         }
+-        _core->Detach();
++        _core.Detach();
+     }
+ 
+     void ControlInteractivity::AttachToNewControl()
+     {
+-        _core->AttachToNewControl();
++        _core.AttachToNewControl();
+     }
+ 
+     // Method Description:
+@@ -135,7 +138,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+     Control::IControlCore ControlInteractivity::Core()
+     {
+-        return *_core;
++        return _core;
+     }
+ 
+     void ControlInteractivity::Close()
+@@ -143,7 +146,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         Closed.raise(*this, nullptr);
+         if (_core)
+         {
+-            _core->Close();
++            _core.Close();
+         }
+     }
+ 
+@@ -186,7 +189,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             THROW_IF_FAILED(_uiaEngine->Enable());
+         }
+ 
+-        _core->GotFocus();
++        _core.GotFocus();
+ 
+         _updateSystemParameterSettings();
+     }
+@@ -200,7 +203,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             THROW_IF_FAILED(_uiaEngine->Disable());
+         }
+ 
+-        _core->LostFocus();
++        _core.LostFocus();
+     }
+ 
+     // Method Description
+@@ -234,7 +237,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             // selection, returning false will indicate that the actions that
+             // triggered this should _not_ be marked as handled, so ctrl+c
+             // without a selection can still send ^C
+-            if (!_core->HasSelection())
++            if (!_core.HasSelection())
+             {
+                 return false;
+             }
+@@ -242,7 +245,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             // Mark the current selection as copied
+             _selectionNeedsToBeCopied = false;
+ 
+-            return _core->CopySelectionToClipboard(singleLine, withControlSequences, formats);
++            return _core.CopySelectionToClipboard(singleLine, withControlSequences, formats);
+         }
+ 
+         return false;
+@@ -254,9 +257,9 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     {
+         auto args = winrt::make<PasteFromClipboardEventArgs>(
+             [core = _core](const winrt::hstring& wstr) {
+-                core->PasteText(wstr);
++                core.PasteText(wstr);
+             },
+-            _core->BracketedPasteEnabled());
++            _core.BracketedPasteEnabled());
+ 
+         // send paste event up to TermApp
+         PasteFromClipboard.raise(*this, std::move(args));
+@@ -281,7 +284,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         _pointerPressedInBounds = true;
+ 
+         // GH#9396: we prioritize hyper-link over VT mouse events
+-        auto hyperlink = _core->GetHyperlink(terminalPosition.to_core_point());
++        auto hyperlink = _core.GetHyperlink(terminalPosition.to_core_point());
+         if (WI_IsFlagSet(buttonState, MouseButtonState::IsLeftButtonDown) &&
+             ctrlEnabled &&
+             !hyperlink.empty())
+@@ -311,7 +314,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             {
+                 _singleClickTouchdownPos = pixelPosition;
+ 
+-                if (!_core->HasSelection())
++                if (!_core.HasSelection())
+                 {
+                     _lastMouseClickPosNoSelection = pixelPosition;
+                 }
+@@ -322,15 +325,15 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             // Don't round in VT mouse mode; cell-level precision matters more.
+             // Only round for single-click: for double/triple-click, rounding
+             // can push the position to the next cell, selecting the wrong word.
+-            const auto round = multiClickMapper == 1 && !_core->IsVtMouseModeEnabled();
+-            _core->LeftClickOnTerminal(_getTerminalPosition(til::point{ pixelPosition }, round).to_core_point(),
++            const auto round = multiClickMapper == 1 && !_core.IsVtMouseModeEnabled();
++            _core.LeftClickOnTerminal(_getTerminalPosition(til::point{ pixelPosition }, round).to_core_point(),
+                                        multiClickMapper,
+                                        altEnabled,
+                                        shiftEnabled,
+                                        isOnOriginalPosition,
+                                        _selectionNeedsToBeCopied);
+ 
+-            if (_core->HasSelection())
++            if (_core.HasSelection())
+             {
+                 // GH#9787: if selection is active we don't want to track the touchdown position
+                 // so that dragging the mouse will extend the selection rather than starting the new one.
+@@ -338,7 +341,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+                 // can re-anchor the selection based on drag direction (the dx < 0 adjustment).
+                 // Without this, dragging left wouldn't include the initially clicked cell
+                 // because floored coordinates place the anchor on the cell's left edge.
+-                if (!_core->IsVtMouseModeEnabled())
++                if (!_core.IsVtMouseModeEnabled())
+                 {
+                     _singleClickTouchdownPos = std::nullopt;
+                 }
+@@ -346,12 +349,12 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         }
+         else if (WI_IsFlagSet(buttonState, MouseButtonState::IsRightButtonDown))
+         {
+-            if (_core->Settings().RightClickContextMenu())
++            if (_core.Settings().RightClickContextMenu())
+             {
+                 // Let the core know we're about to open a menu here. It has
+                 // some separate conditional logic based on _where_ the user
+                 // wanted to open the menu.
+-                _core->AnchorContextMenu(terminalPosition.to_core_point());
++                _core.AnchorContextMenu(terminalPosition.to_core_point());
+ 
+                 auto contextArgs = winrt::make<ContextMenuRequestedEventArgs>(til::point{ pixelPosition }.to_winrt_point());
+                 ContextMenuRequested.raise(*this, contextArgs);
+@@ -363,10 +366,10 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+                 // if the selection was made via mark mode or modified with
+                 // quick-edit keys (shift+arrow), since those paths never
+                 // triggered an automatic copy.
+-                const auto copied = (_selectionNeedsToBeCopied || !_core->CopyOnSelect()) &&
+-                                    CopySelectionToClipboard(shiftEnabled, false, _core->Settings().CopyFormatting());
+-                _core->ClearSelection();
+-                if (_core->CopyOnSelect() || !copied)
++                const auto copied = (_selectionNeedsToBeCopied || !_core.CopyOnSelect()) &&
++                                    CopySelectionToClipboard(shiftEnabled, false, _core.Settings().CopyFormatting());
++                _core.ClearSelection();
++                if (_core.CopyOnSelect() || !copied)
+                 {
+                     // CopyOnSelect: right-click always pastes.
+                     // Otherwise: no selection → paste.
+@@ -392,7 +395,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         bool handledCompletely = false;
+ 
+         // Short-circuit isReadOnly check to avoid warning dialog
+-        if (_focused && !_core->IsInReadOnlyMode() && _canSendVTMouseInput(modifiers))
++        if (_focused && !_core.IsInReadOnlyMode() && _canSendVTMouseInput(modifiers))
+         {
+             _sendMouseEventHelper(terminalPosition, pointerUpdateKind, modifiers, 0, buttonState);
+             handledCompletely = true;
+@@ -407,7 +410,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             {
+                 // Figure out if the user's moved a 1/4th of a cell's smaller axis
+                 // (practically always the width) away from the clickdown point.
+-                const auto fontSizeInDips = _core->FontSizeInDips();
++                const auto fontSizeInDips = _core.FontSizeInDips();
+                 const auto touchdownPoint = *_singleClickTouchdownPos;
+                 const auto dx = pixelPosition.X - touchdownPoint.X;
+                 const auto dy = pixelPosition.Y - touchdownPoint.Y;
+@@ -433,7 +436,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+                         //   side of the current cell.
+                         termPos.x++;
+                     }
+-                    _core->SetSelectionAnchor(termPos.to_core_point());
++                    _core.SetSelectionAnchor(termPos.to_core_point());
+ 
+                     // stop tracking the touchdown point
+                     _singleClickTouchdownPos = std::nullopt;
+@@ -443,7 +446,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             SetEndSelectionPoint(pixelPosition);
+         }
+ 
+-        _core->SetHoveredCell(terminalPosition.to_core_point());
++        _core.SetHoveredCell(terminalPosition.to_core_point());
+         return handledCompletely;
+     }
+ 
+@@ -456,7 +459,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+             // Our actualFont's size is in pixels, convert to DIPs, which the
+             // rest of the Points here are in.
+-            const auto fontSizeInDips{ _core->FontSizeInDips() };
++            const auto fontSizeInDips{ _core.FontSizeInDips() };
+ 
+             // Get the difference between the point we've dragged to and the start of the touch.
+             const auto dy = static_cast<float>(newTouchPoint.Y - anchor.Y);
+@@ -470,7 +473,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+                 // panning down)
+                 const auto numRows = dy / -fontSizeInDips.Height;
+ 
+-                const auto currentOffset = _core->ScrollOffset();
++                const auto currentOffset = _core.ScrollOffset();
+                 const auto newValue = numRows + currentOffset;
+ 
+                 // Update the Core's viewport position, and raise a
+@@ -493,7 +496,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         const auto terminalPosition = _getTerminalPosition(til::point{ pixelPosition }, false);
+         // Short-circuit isReadOnly check to avoid warning dialog
+-        if (!_core->IsInReadOnlyMode() && _canSendVTMouseInput(modifiers))
++        if (!_core.IsInReadOnlyMode() && _canSendVTMouseInput(modifiers))
+         {
+             _sendMouseEventHelper(terminalPosition, pointerUpdateKind, modifiers, 0, buttonState);
+             return;
+@@ -503,14 +506,14 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // Right clicks and middle clicks should not need to do anything when released.
+         const auto isLeftMouseRelease = pointerUpdateKind == WM_LBUTTONUP;
+ 
+-        if (_core->CopyOnSelect() &&
++        if (_core.CopyOnSelect() &&
+             isLeftMouseRelease &&
+             _selectionNeedsToBeCopied)
+         {
+             // IMPORTANT!
+             // DO NOT clear the selection here!
+             // Otherwise, the selection will be cleared immediately after you make it.
+-            CopySelectionToClipboard(false, false, _core->Settings().CopyFormatting());
++            CopySelectionToClipboard(false, false, _core.Settings().CopyFormatting());
+         }
+ 
+         _singleClickTouchdownPos = std::nullopt;
+@@ -546,7 +549,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // where the terminal sends arrow keys when the user mouse wheels, but
+         // the client app doesn't care for other mouse input. It's tracked
+         // separately from _canSendVTMouseInput.
+-        if (!_core->IsInReadOnlyMode() &&
++        if (!_core.IsInReadOnlyMode() &&
+             (_canSendVTMouseInput(modifiers) || _shouldSendAlternateScroll(modifiers, delta)))
+         {
+             // Most mouse event handlers call
+@@ -564,11 +567,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         const auto ctrlPressed = modifiers.IsCtrlPressed();
+         const auto shiftPressed = modifiers.IsShiftPressed();
+ 
+-        if (ctrlPressed && shiftPressed && _core->Settings().ScrollToChangeOpacity())
++        if (ctrlPressed && shiftPressed && _core.Settings().ScrollToChangeOpacity())
+         {
+             _mouseTransparencyHandler(delta.Y);
+         }
+-        else if (ctrlPressed && !shiftPressed && _core->Settings().ScrollToZoom())
++        else if (ctrlPressed && !shiftPressed && _core.Settings().ScrollToZoom())
+         {
+             _mouseZoomHandler(delta.Y);
+         }
+@@ -588,7 +591,10 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     {
+         // Transparency is on a scale of [0.0,1.0], so only increment by .01.
+         const auto effectiveDelta = mouseDelta < 0 ? -.01f : .01f;
+-        _core->AdjustOpacity(effectiveDelta);
++        // This used to bind ControlCore's internal one-argument overload, which
++        // is the relative one. Only the two-argument form is projected, so the
++        // relative-ness is now explicit; it dispatches to the same code.
++        _core.AdjustOpacity(effectiveDelta, true);
+     }
+ 
+     // Method Description:
+@@ -599,7 +605,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     void ControlInteractivity::_mouseZoomHandler(const int32_t mouseDelta) const
+     {
+         const auto fontDelta = mouseDelta < 0 ? -1.0f : 1.0f;
+-        _core->AdjustFontSize(fontDelta);
++        _core.AdjustFontSize(fontDelta);
+     }
+ 
+     // Method Description:
+@@ -624,7 +630,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // another ScrollPositionChanged handler. If the scrollbar should be
+         // somewhere other than where it is currently, then start from that row.
+         const auto currentInternalRow = std::lround(_internalScrollbarPosition);
+-        const auto currentCoreRow = _core->ScrollOffset();
++        const auto currentCoreRow = _core.ScrollOffset();
+         const auto currentOffset = currentInternalRow == currentCoreRow ?
+                                        _internalScrollbarPosition :
+                                        currentCoreRow;
+@@ -638,7 +644,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // WHEEL_PAGESCROLL is a Win32 constant that represents the "scroll one page
+         // at a time" setting. If we ignore it, we will scroll a truly absurd number
+         // of rows.
+-        const auto rowsToScroll{ _rowsToScroll == WHEEL_PAGESCROLL ? _core->ViewHeight() : _rowsToScroll };
++        const auto rowsToScroll{ _rowsToScroll == WHEEL_PAGESCROLL ? _core.ViewHeight() : _rowsToScroll };
+         const auto newValue = rowsToScroll * rowDelta + currentOffset;
+ 
+         // Update the Core's viewport position, and raise a
+@@ -674,21 +680,21 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // Set this as the new value of our internal scrollbar representation.
+         // We're doing this so we can accumulate fractional amounts of a row to
+         // scroll each time the mouse scrolls.
+-        _internalScrollbarPosition = std::clamp(newValue, 0.0f, static_cast<float>(_core->BufferHeight()));
++        _internalScrollbarPosition = std::clamp(newValue, 0.0f, static_cast<float>(_core.BufferHeight()));
+ 
+         // If the new scrollbar position, rounded to an int, is at a different
+         // row, then actually update the scroll position in the core, and raise
+         // a ScrollPositionChanged to inform the control.
+         const auto viewTop = std::lround(_internalScrollbarPosition);
+-        if (viewTop != _core->ScrollOffset())
++        if (viewTop != _core.ScrollOffset())
+         {
+-            _core->UserScrollViewport(viewTop);
++            _core.UserScrollViewport(viewTop);
+ 
+-            // _core->ScrollOffset() is now set to newValue
++            // _core.ScrollOffset() is now set to newValue
+             ScrollPositionChanged.raise(*this,
+-                                        winrt::make<ScrollPositionChangedArgs>(_core->ScrollOffset(),
+-                                                                               _core->ViewHeight(),
+-                                                                               _core->BufferHeight()));
++                                        winrt::make<ScrollPositionChangedArgs>(_core.ScrollOffset(),
++                                                                               _core.ViewHeight(),
++                                                                               _core.BufferHeight()));
+         }
+     }
+ 
+@@ -705,7 +711,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         {
+             return false;
+         }
+-        return _core->IsVtMouseModeEnabled();
++        return _core.IsVtMouseModeEnabled();
+     }
+ 
+     bool ControlInteractivity::_shouldSendAlternateScroll(const ::Microsoft::Terminal::Core::ControlKeyStates modifiers, const Core::Point delta)
+@@ -718,11 +724,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         }
+         if (delta.Y != 0)
+         {
+-            return _core->ShouldSendAlternateScroll(WM_MOUSEWHEEL, delta.Y);
++            return _core.ShouldSendAlternateScroll(WM_MOUSEWHEEL, delta.Y);
+         }
+         else
+         {
+-            return _core->ShouldSendAlternateScroll(WM_MOUSEHWHEEL, delta.X);
++            return _core.ShouldSendAlternateScroll(WM_MOUSEHWHEEL, delta.X);
+         }
+     }
+ 
+@@ -733,8 +739,8 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     void ControlInteractivity::SetEndSelectionPoint(const Core::Point pixelPosition)
+     {
+         // Don't round in VT mouse mode; cell-level precision matters more
+-        const auto round = !_core->IsVtMouseModeEnabled();
+-        _core->SetEndSelectionPoint(_getTerminalPosition(til::point{ pixelPosition }, round).to_core_point());
++        const auto round = !_core.IsVtMouseModeEnabled();
++        _core.SetEndSelectionPoint(_getTerminalPosition(til::point{ pixelPosition }, round).to_core_point());
+         _selectionNeedsToBeCopied = true;
+     }
+ 
+@@ -757,7 +763,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // returns a non-projectable FontInfo - never needed promoting. The only
+         // difference is the type: Windows::Foundation::Size carries floats and
+         // capitalised members, where til::size carried CoordTypes.
+-        const auto fontSizeF{ _core->FontSize() };
++        const auto fontSizeF{ _core.FontSize() };
+         const til::size fontSize{ gsl::narrow_cast<til::CoordType>(fontSizeF.Width),
+                                   gsl::narrow_cast<til::CoordType>(fontSizeF.Height) };
+ 
+@@ -779,10 +785,10 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+                                                      const SHORT wheelDelta,
+                                                      Control::MouseButtonState buttonState)
+     {
+-        const auto adjustment = _core->BufferHeight() - _core->ScrollOffset() - _core->ViewHeight();
++        const auto adjustment = _core.BufferHeight() - _core.ScrollOffset() - _core.ViewHeight();
+         // If the click happened outside the active region, core should get a chance to filter it out or clamp it.
+         const auto adjustedY = terminalPosition.y - adjustment;
+-        return _core->SendMouseEvent(til::point{ terminalPosition.x, adjustedY }.to_core_point(), pointerUpdateKind, modifiers, wheelDelta, buttonState);
++        return _core.SendMouseEvent(til::point{ terminalPosition.x, adjustedY }.to_core_point(), pointerUpdateKind, modifiers, wheelDelta, buttonState);
+     }
+ 
+     // Method Description:
+@@ -799,13 +805,24 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     Control::InteractivityAutomationPeer ControlInteractivity::OnCreateAutomationPeer()
+     try
+     {
++        // Accessibility is cascadia-only for now: the UIA engine is one of
++        // WT's own render engines and the peer reads WT's IRenderData, neither
++        // of which another engine can supply. A null peer here is a supported
++        // outcome - TermControl::OnCreateAutomationPeer already treats it as
++        // "no custom peer" and hands XAML the default one.
++        const auto cascadia{ _cascadiaCore() };
++        if (!cascadia)
++        {
++            return nullptr;
++        }
++
+         const auto autoPeer = winrt::make_self<implementation::InteractivityAutomationPeer>(this);
+         if (_uiaEngine)
+         {
+-            _core->DetachUiaEngine(_uiaEngine.get());
++            cascadia->DetachUiaEngine(_uiaEngine.get());
+         }
+         _uiaEngine = std::make_unique<::Microsoft::Console::Render::UiaEngine>(autoPeer.get());
+-        _core->AttachUiaEngine(_uiaEngine.get());
++        cascadia->AttachUiaEngine(_uiaEngine.get());
+         return *autoPeer;
+     }
+     catch (...)
+@@ -816,6 +833,29 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+     ::Microsoft::Console::Render::IRenderData* ControlInteractivity::GetRenderData() const
+     {
+-        return _core->GetRenderData();
++        const auto cascadia{ _cascadiaCore() };
++        return cascadia ? cascadia->GetRenderData() : nullptr;
++    }
++
++    // The three UIA members - AttachUiaEngine, DetachUiaEngine and
++    // GetRenderData - are deliberately NOT on IControlCore: they trade in
++    // pointers to WT's own renderer types (UiaEngine, IRenderData), which is
++    // exactly the coupling the interface exists to remove. So they stay on the
++    // concrete cascadia type, reached through here, and any other engine gets
++    // null (see docs/phase-5-readiness.md; accessibility for a second engine is
++    // Phase 8's job).
++    //
++    // The QI is for the ControlCore *class* interface, not IControlCore - every
++    // engine implements the latter, so testing for it would hand a ghostty core
++    // to get_self<ControlCore> and reinterpret it as the wrong type.
++    //
++    // The returned pointer is owned by _core, which outlives every use here.
++    ControlCore* ControlInteractivity::_cascadiaCore() const noexcept
++    {
++        if (const auto projected{ _core.try_as<Control::ControlCore>() })
++        {
++            return winrt::get_self<ControlCore>(projected);
++        }
++        return nullptr;
+     }
+ }
+diff --git a/src/cascadia/TerminalControl/ControlInteractivity.h b/src/cascadia/TerminalControl/ControlInteractivity.h
+index 69f86db79..8d8585212 100644
+--- a/src/cascadia/TerminalControl/ControlInteractivity.h
++++ b/src/cascadia/TerminalControl/ControlInteractivity.h
+@@ -109,7 +109,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // (C++ class members are destroyed in reverse order.)
+         std::unique_ptr<::Microsoft::Console::Render::UiaEngine> _uiaEngine;
+ 
+-        winrt::com_ptr<ControlCore> _core{ nullptr };
++        // The engine, held as the interface rather than the concrete cascadia
++        // type (ADR 0001), so a second engine can be bound in the constructor's
++        // factory switch. Everything this class calls is on IControlCore or
++        // ICoreState except the UIA cluster - see _cascadiaCore().
++        Control::IControlCore _core{ nullptr };
+         UINT _rowsToScroll = 3;
+         float _internalScrollbarPosition = 0;
+ 
+@@ -145,6 +149,10 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         bool _focused{ false };
+         bool _pointerPressedInBounds{ false };
+ 
++        // The concrete cascadia core, or null for any other engine. Only the
++        // UIA cluster needs it; see the definition.
++        ControlCore* _cascadiaCore() const noexcept;
++
+         unsigned int _numberOfClicks(Core::Point clickPos, Timestamp clickTime);
+         void _updateSystemParameterSettings() noexcept;
+ 
+diff --git a/src/cascadia/UnitTests_Control/ControlInteractivityTests.cpp b/src/cascadia/UnitTests_Control/ControlInteractivityTests.cpp
+index 1b538b850..de7d134ff 100644
+--- a/src/cascadia/UnitTests_Control/ControlInteractivityTests.cpp
++++ b/src/cascadia/UnitTests_Control/ControlInteractivityTests.cpp
+@@ -78,9 +78,13 @@ namespace ControlUnitTests
+             Log::Comment(L"Create ControlInteractivity object");
+             auto interactivity = winrt::make_self<Control::implementation::ControlInteractivity>(settings, settings, conn);
+             VERIFY_IS_NOT_NULL(interactivity);
+-            auto core = interactivity->_core;
+-            core->_inUnitTests = true;
++            // _core is the IControlCore interface now; these tests reach into
++            // cascadia's implementation details (_terminal, _inUnitTests), so
++            // they take the concrete core the same way the UIA cluster does.
++            winrt::com_ptr<Control::implementation::ControlCore> core;
++            core.copy_from(interactivity->_cascadiaCore());
+             VERIFY_IS_NOT_NULL(core);
++            core->_inUnitTests = true;
+ 
+             return { core, interactivity };
+         }

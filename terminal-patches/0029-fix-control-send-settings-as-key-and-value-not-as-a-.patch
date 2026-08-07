@@ -1,0 +1,590 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Thu, 6 Aug 2026 00:54:31 -0700
+Subject: [PATCH] fix(control): send settings as key and value, not as a config
+ line
+
+The translator was formatting `key = "value"` because the entry point took a
+config-file line, so every value had to survive that file's syntax on the way
+out. It didn't: WT's default wordDelimiters contains a backslash and a double
+quote, the value lost its meaning to the quoting, and ghostty rejected it
+through a diagnostic that libghostty built without an app runtime never
+surfaces. The setting looked forwarded while ghostty kept its own word
+boundaries - visible only as a double click keeping a trailing "." that
+cascadia dropped.
+
+ghostty_config_set_kv takes the key and the value separately and parses
+neither, so the quoting and the escaping here go away entirely and values
+reach the engine as the profile holds them.
+
+One escaping rule survives, and it belongs somewhere else: selection-word-chars
+is parsed as a Zig string literal by the *field*, so a lone backslash starts an
+escape sequence there and WT's delimiters contain one that is not valid. That
+is this key's own syntax, not the entry's, and the comment and the test now say
+so. Nothing else is touched, backslashes and quotes included.
+
+Covered by the symptom rather than by the shape: scripts/smoke-harness.ps1
+feeds "Microsoft Corporation. Ltd" into the real engine with WT's delimiters
+and requires a double click to come back "Corporation".
+
+WT suites: terminalCore 54/54, unitSettingsModel 159/159, unitControl 54/54,
+terminalApp 51/51.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BgDGqEqRBB8L5Ueoq1uuxy
+---
+ .../TerminalControl/GhosttyControlCore.cpp    |   8 +-
+ .../GhosttySettingsTranslator.cpp             | 256 +++++++++---------
+ .../GhosttySettingsTranslator.h               |  66 +++--
+ .../GhosttySettingsTests.cpp                  |  95 ++++---
+ 4 files changed, 232 insertions(+), 193 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index decd3bea6..e40ddb833 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -134,18 +134,18 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+     void GhosttyControlCore::_applySettingsToConfig(ghostty_config_t config) const
+     {
+-        for (const auto& entry : TranslateGhosttySettings(_settings))
++        for (const auto& [key, value] : TranslateGhosttySettings(_settings))
+         {
+             // A rejected entry is worth a log line but not a failed pane: the
+             // rest of the configuration is still worth applying.
+-            if (!ghostty_config_set(config, entry.c_str()))
++            if (!ghostty_config_set_kv(config, key.data(), key.size(), value.data(), value.size()))
+             {
+                 LOG_HR_MSG(E_INVALIDARG, "ghostty rejected config entry");
+-                _trace(L"REJECTED %hs", entry.c_str());
++                _trace(L"REJECTED %hs = %hs", key.c_str(), value.c_str());
+             }
+             else
+             {
+-                _trace(L"set %hs", entry.c_str());
++                _trace(L"set %hs = %hs", key.c_str(), value.c_str());
+             }
+         }
+     }
+diff --git a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+index e3a8b8769..b7e9001bd 100644
+--- a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
++++ b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+@@ -1,123 +1,133 @@
+-// Copyright (c) Microsoft Corporation.
+-// Licensed under the MIT license.
+-
+-#include "pch.h"
+-#include "GhosttySettingsTranslator.h"
+-
+-using namespace winrt::Microsoft::Terminal;
+-
+-namespace winrt::Microsoft::Terminal::Control::implementation
+-{
+-    // Settings -> the `key = value` entries ghostty's config parser takes.
+-    //
+-    // The MVP scope is deliberately five fields (font, size, scheme,
+-    // scrollback, padding): the ones without which a pane is visibly wrong
+-    // rather than merely unstyled. Everything else - opacity, acrylic,
+-    // background image, bell style - is Phase 6 parity work and is left at
+-    // ghostty's defaults on purpose, so a half-applied setting never looks
+-    // like a translator bug.
+-    //
+-    // Pure on purpose, and in its own file so that file can be compiled into
+-    // the unit tests: it touches no engine state, so it needs no libghostty,
+-    // no GPU and no pty - unlike everything else in GhosttyControlCore, which
+-    // needs a live surface. Every rule encoded here (quoting, the
+-    // negative-history case, padding pinned to zero) was learned from a bug,
+-    // so each one is worth pinning down in a test.
+-    std::vector<std::string> TranslateGhosttySettings(const Control::IControlSettings& settings)
+-    {
+-        std::vector<std::string> entries;
+-        if (!settings)
+-        {
+-            return entries;
+-        }
+-
+-        // Values may contain spaces (font families especially), and the entry
+-        // syntax is the config file's, so they are quoted the way a file would.
+-        //
+-        // The escaping is not decorative. WT's default wordDelimiters is
+-        //     ./\()"'-:,.;<>~!@#$%^&*|+=[]{}~?
+-        // which contains both a backslash and a double quote, so an unescaped
+-        // value ends its own quoted string early and ghostty receives a
+-        // truncated set - which is precisely how `.` went missing from a
+-        // ghostty pane's word boundaries while the setting looked forwarded.
+-        // ghostty's own documentation quotes values with \" inside them.
+-        const auto setQuoted = [&entries](std::string_view key, std::wstring_view value) {
+-            if (value.empty())
+-            {
+-                return;
+-            }
+-
+-            std::string escaped;
+-            for (const auto c : til::u16u8(value))
+-            {
+-                if (c == '\\' || c == '"')
+-                {
+-                    escaped.push_back('\\');
+-                }
+-                escaped.push_back(c);
+-            }
+-            entries.push_back(fmt::format("{} = \"{}\"", key, escaped));
+-        };
+-        const auto set = [&entries](std::string entry) {
+-            entries.push_back(std::move(entry));
+-        };
+-
+-        // --- Font ---------------------------------------------------------
+-        setQuoted("font-family", settings.FontFace());
+-        if (const auto size = settings.FontSize(); size > 0)
+-        {
+-            set(fmt::format("font-size = {}", size));
+-        }
+-
+-        // --- Scrollback ---------------------------------------------------
+-        // WT counts lines; ghostty's byte limit is separate and left alone.
+-        // A negative HistorySize means "infinite" in WT, which is ghostty's
+-        // default for the line limit, so it is simply not set.
+-        if (const auto history = settings.HistorySize(); history >= 0)
+-        {
+-            set(fmt::format("scrollback-limit-lines = {}", history));
+-        }
+-
+-        // --- Selection ----------------------------------------------------
+-        // WT's wordDelimiters is global, so both engines' panes already agree
+-        // on it in the settings file - but ghostty never saw it and used its
+-        // own default set, which is why a double click picked out different
+-        // words in the two panes (WT's set includes `.`, ghostty's does not).
+-        //
+-        // Both are "the characters that end a word", despite ghostty's name.
+-        setQuoted("selection-word-chars", settings.WordDelimiters());
+-
+-        // --- Padding ------------------------------------------------------
+-        // WT already insets the SwapChainPanel by this same padding, so asking
+-        // ghostty to pad as well would double it. Ours is therefore zero, and
+-        // the pane's padding is whatever WT drew around us.
+-        set("window-padding-x = 0");
+-        set("window-padding-y = 0");
+-        set("window-padding-balance = false");
+-
+-        // --- Colour scheme ------------------------------------------------
+-        if (const auto scheme = settings.try_as<Core::ICoreScheme>())
+-        {
+-            const auto hex = [](const Core::Color& c) {
+-                return fmt::format("#{:02x}{:02x}{:02x}", c.R, c.G, c.B);
+-            };
+-
+-            set(fmt::format("background = {}", hex(scheme.DefaultBackground())));
+-            set(fmt::format("foreground = {}", hex(scheme.DefaultForeground())));
+-            set(fmt::format("selection-background = {}", hex(scheme.SelectionBackground())));
+-            set(fmt::format("cursor-color = {}", hex(scheme.CursorColor())));
+-
+-            // The 16 ANSI entries. ghostty takes them as `palette = N=#rrggbb`,
+-            // one entry per line, which is why this is a loop rather than one
+-            // string - the same shape a config file would have.
+-            winrt::com_array<Core::Color> table;
+-            scheme.GetColorTable(table);
+-            for (uint32_t i = 0; i < table.size(); ++i)
+-            {
+-                set(fmt::format("palette = {}={}", i, hex(table[i])));
+-            }
+-        }
+-
+-        return entries;
+-    }
+-}
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++
++#include "pch.h"
++#include "GhosttySettingsTranslator.h"
++
++using namespace winrt::Microsoft::Terminal;
++
++namespace winrt::Microsoft::Terminal::Control::implementation
++{
++    // Settings -> the key/value pairs ghostty's config takes.
++    //
++    // The MVP scope is deliberately five fields (font, size, scheme,
++    // scrollback, padding): the ones without which a pane is visibly wrong
++    // rather than merely unstyled. Everything else - opacity, acrylic,
++    // background image, bell style - is Phase 6 parity work and is left at
++    // ghostty's defaults on purpose, so a half-applied setting never looks
++    // like a translator bug.
++    //
++    // Pure on purpose, and in its own file so that file can be compiled into
++    // the unit tests: it touches no engine state, so it needs no libghostty,
++    // no GPU and no pty - unlike everything else in GhosttyControlCore, which
++    // needs a live surface. Every rule encoded here (the negative-history
++    // case, padding pinned to zero, the one field whose own syntax still needs
++    // escaping) was learned from a bug, so each is worth pinning in a test.
++    std::vector<GhosttySetting> TranslateGhosttySettings(const Control::IControlSettings& settings)
++    {
++        std::vector<GhosttySetting> entries;
++        if (!settings)
++        {
++            return entries;
++        }
++
++        // Values go over as they are. There is no entry syntax to escape for:
++        // ghostty_config_set_kv takes the key and the value separately and
++        // parses neither, so a font family with spaces, or a delimiter set full
++        // of punctuation, needs nothing done to it on the way out.
++        const auto setText = [&entries](std::string_view key, std::wstring_view value) {
++            if (value.empty())
++            {
++                return;
++            }
++            entries.emplace_back(std::string{ key }, til::u16u8(value));
++        };
++        const auto set = [&entries](std::string_view key, std::string value) {
++            entries.emplace_back(std::string{ key }, std::move(value));
++        };
++
++        // --- Font ---------------------------------------------------------
++        setText("font-family", settings.FontFace());
++        if (const auto size = settings.FontSize(); size > 0)
++        {
++            set("font-size", fmt::format("{}", size));
++        }
++
++        // --- Scrollback ---------------------------------------------------
++        // WT counts lines; ghostty's byte limit is separate and left alone.
++        // A negative HistorySize means "infinite" in WT, which is ghostty's
++        // default for the line limit, so it is simply not set.
++        if (const auto history = settings.HistorySize(); history >= 0)
++        {
++            set("scrollback-limit-lines", fmt::format("{}", history));
++        }
++
++        // --- Selection ----------------------------------------------------
++        // WT's wordDelimiters is global, so both engines' panes already agree
++        // on it in the settings file - but ghostty never saw it and used its
++        // own default set, which is why a double click picked out different
++        // words in the two panes (WT's set includes `.`, ghostty's does not).
++        //
++        // Both are "the characters that end a word", despite ghostty's name.
++        //
++        // The one value that still needs escaping, and for a different reason
++        // than the old entry syntax did. selection-word-chars is parsed as a
++        // Zig string literal by the *field*, so a lone backslash starts an
++        // escape sequence there - and WT's default delimiters contain `\(`,
++        // which is not a valid one. The field rejects the whole value and says
++        // so only through a diagnostic, which libghostty built without an app
++        // runtime never surfaces: the setting looks forwarded and ghostty
++        // quietly keeps its own defaults, which is how a double click came back
++        // with the trailing `.` that cascadia left out.
++        //
++        // Doubling the backslashes is therefore about *this key's* syntax, not
++        // about how the value is delivered. Nothing else here needs it.
++        {
++            std::string chars;
++            for (const auto c : til::u16u8(settings.WordDelimiters()))
++            {
++                if (c == '\\')
++                {
++                    chars.push_back('\\');
++                }
++                chars.push_back(c);
++            }
++            if (!chars.empty())
++            {
++                set("selection-word-chars", std::move(chars));
++            }
++        }
++
++        // --- Padding ------------------------------------------------------
++        // WT already insets the SwapChainPanel by this same padding, so asking
++        // ghostty to pad as well would double it. Ours is therefore zero, and
++        // the pane's padding is whatever WT drew around us.
++        set("window-padding-x", "0");
++        set("window-padding-y", "0");
++        set("window-padding-balance", "false");
++
++        // --- Colour scheme ------------------------------------------------
++        if (const auto scheme = settings.try_as<Core::ICoreScheme>())
++        {
++            const auto hex = [](const Core::Color& c) {
++                return fmt::format("#{:02x}{:02x}{:02x}", c.R, c.G, c.B);
++            };
++
++            set("background", hex(scheme.DefaultBackground()));
++            set("foreground", hex(scheme.DefaultForeground()));
++            set("selection-background", hex(scheme.SelectionBackground()));
++            set("cursor-color", hex(scheme.CursorColor()));
++
++            // The 16 ANSI entries. ghostty's palette key takes one `N=#rrggbb`
++            // per entry, which is why this is a loop rather than one value.
++            winrt::com_array<Core::Color> table;
++            scheme.GetColorTable(table);
++            for (uint32_t i = 0; i < table.size(); ++i)
++            {
++                set("palette", fmt::format("{}={}", i, hex(table[i])));
++            }
++        }
++
++        return entries;
++    }
++}
+diff --git a/src/cascadia/TerminalControl/GhosttySettingsTranslator.h b/src/cascadia/TerminalControl/GhosttySettingsTranslator.h
+index 5dd3556e7..7a4d6d673 100644
+--- a/src/cascadia/TerminalControl/GhosttySettingsTranslator.h
++++ b/src/cascadia/TerminalControl/GhosttySettingsTranslator.h
+@@ -1,30 +1,36 @@
+-// Copyright (c) Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-// Module Name:
+-// - GhosttySettingsTranslator.h
+-//
+-// Abstract:
+-// - Turns a WT profile into the `key = value` entries ghostty's config parser
+-//   takes (ADR 0003, PLAN Phase 5).
+-//
+-// - Deliberately free of any libghostty dependency: it produces strings and
+-//   nothing else. That is what lets it be unit tested with a mock settings
+-//   object, with no engine, GPU or pty involved. Everything else in
+-//   GhosttyControlCore needs a live surface and cannot be reached from a unit
+-//   test, so the part that *can* be tested is kept separable on purpose.
+-
+-#pragma once
+-
+-#include <string>
+-#include <vector>
+-
+-// The projection, not the implementation type: this file is compiled into the
+-// unit tests as well, where no implementation exists.
+-#include <winrt/Microsoft.Terminal.Core.h>
+-#include <winrt/Microsoft.Terminal.Control.h>
+-
+-namespace winrt::Microsoft::Terminal::Control::implementation
+-{
+-    std::vector<std::string> TranslateGhosttySettings(const Control::IControlSettings& settings);
+-}
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++//
++// Module Name:
++// - GhosttySettingsTranslator.h
++//
++// Abstract:
++// - Turns a WT profile into the key/value pairs ghostty's config takes
++//   (ADR 0003, PLAN Phase 5).
++//
++// - Deliberately free of any libghostty dependency: it produces strings and
++//   nothing else. That is what lets it be unit tested with a mock settings
++//   object, with no engine, GPU or pty involved. Everything else in
++//   GhosttyControlCore needs a live surface and cannot be reached from a unit
++//   test, so the part that *can* be tested is kept separable on purpose.
++
++#pragma once
++
++#include <string>
++#include <utility>
++#include <vector>
++
++// The projection, not the implementation type: this file is compiled into the
++// unit tests as well, where no implementation exists.
++#include <winrt/Microsoft.Terminal.Core.h>
++#include <winrt/Microsoft.Terminal.Control.h>
++
++namespace winrt::Microsoft::Terminal::Control::implementation
++{
++    // Key first, value second. Both go to ghostty exactly as they are - the
++    // entry point takes them separately and parses neither, so nothing here
++    // has to encode a value to survive a text format.
++    using GhosttySetting = std::pair<std::string, std::string>;
++
++    std::vector<GhosttySetting> TranslateGhosttySettings(const Control::IControlSettings& settings);
++}
+diff --git a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+index 55567ec7c..3d57ca2d4 100644
+--- a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
++++ b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+@@ -3,10 +3,12 @@
+ //
+ // Regression tests for the settings -> ghostty config translation.
+ //
+-// Every rule pinned here came out of a bug found by hand, not by review:
+-// values with spaces need the config file's quoting, WT's "infinite"
+-// scrollback is a negative number that must not be forwarded, and ghostty's
+-// padding has to be zero because Windows Terminal already insets the pane.
++// Every rule pinned here came out of a bug found by hand, not by review: a
++// value has to arrive exactly as WT holds it, WT's "infinite" scrollback is a
++// negative number that must not be forwarded, ghostty's padding has to be zero
++// because Windows Terminal already insets the pane, and one key - only one -
++// still needs escaping, for its own field's syntax rather than for the way the
++// entry is delivered.
+ //
+ // The translation is deliberately a pure function so it can be tested here at
+ // all. The rest of GhosttyControlCore needs a live engine, a GPU and a pty; a
+@@ -31,25 +33,29 @@ namespace ControlUnitTests
+             TEST_CLASS_PROPERTY(L"TestTimeout", L"0:0:10")
+         END_TEST_CLASS()
+ 
+-        TEST_METHOD(FontFamilyIsQuoted);
++        TEST_METHOD(FontFamilyArrivesVerbatim);
+         TEST_METHOD(InfiniteScrollbackIsNotForwarded);
+         TEST_METHOD(FiniteScrollbackIsForwarded);
+         TEST_METHOD(PaddingIsZeroBecauseWindowsTerminalAlreadyPads);
+         TEST_METHOD(SchemeProducesForegroundBackgroundAndFullPalette);
+         TEST_METHOD(WordDelimitersReachTheEngine);
+-        TEST_METHOD(QuotesAndBackslashesInAValueAreEscaped);
++        TEST_METHOD(BackslashesAreDoubledForTheWordCharsFieldOnly);
+         TEST_METHOD(NullSettingsProduceNothing);
+ 
+     private:
+-        static bool _has(const std::vector<std::string>& entries, std::string_view entry)
++        using Settings = std::vector<Control::implementation::GhosttySetting>;
++
++        static bool _has(const Settings& entries, std::string_view key, std::string_view value)
+         {
+-            return std::find(entries.begin(), entries.end(), entry) != entries.end();
++            return std::any_of(entries.begin(), entries.end(), [&](const auto& e) {
++                return e.first == key && e.second == value;
++            });
+         }
+ 
+-        static bool _hasPrefix(const std::vector<std::string>& entries, std::string_view prefix)
++        static bool _hasKey(const Settings& entries, std::string_view key)
+         {
+-            return std::any_of(entries.begin(), entries.end(), [&](const std::string& e) {
+-                return e.rfind(prefix, 0) == 0;
++            return std::any_of(entries.begin(), entries.end(), [&](const auto& e) {
++                return e.first == key;
+             });
+         }
+ 
+@@ -63,21 +69,23 @@ namespace ControlUnitTests
+         }
+     };
+ 
+-    // A font family with a space in it is the case a naive implementation gets
+-    // wrong: unquoted, ghostty's parser sees "Cascadia" and drops "Mono".
+-    void GhosttySettingsTests::FontFamilyIsQuoted()
++    // The value goes over as the profile holds it - no quotes added, nothing
++    // escaped. A font family with a space in it used to need the config file's
++    // quoting; with a key and a value there is no entry syntax to defend
++    // against, so adding quotes would now make them part of the font's name.
++    void GhosttySettingsTests::FontFamilyArrivesVerbatim()
+     {
+         const auto entries = Control::implementation::TranslateGhosttySettings(
+             *_settings());
+ 
+-        VERIFY_IS_TRUE(_has(entries, "font-family = \"Cascadia Mono\""),
+-                       L"font family must carry the config file's quoting");
+-        VERIFY_IS_TRUE(_has(entries, "font-size = 12"));
++        VERIFY_IS_TRUE(_has(entries, "font-family", "Cascadia Mono"),
++                       L"the font family must arrive exactly as WT holds it");
++        VERIFY_IS_TRUE(_has(entries, "font-size", "12"));
+     }
+ 
+     // WT spells "infinite scrollback" as a negative historySize. ghostty's line
+     // limit is already unlimited by default, so the entry must be omitted
+-    // rather than forwarded - "scrollback-limit-lines = -1" is not a thing.
++    // rather than forwarded - a negative line limit is not a thing.
+     void GhosttySettingsTests::InfiniteScrollbackIsNotForwarded()
+     {
+         auto s = _settings();
+@@ -85,7 +93,7 @@ namespace ControlUnitTests
+ 
+         const auto entries = Control::implementation::TranslateGhosttySettings(*s);
+ 
+-        VERIFY_IS_FALSE(_hasPrefix(entries, "scrollback-limit-lines"),
++        VERIFY_IS_FALSE(_hasKey(entries, "scrollback-limit-lines"),
+                         L"a negative historySize means infinite; do not forward it");
+     }
+ 
+@@ -94,20 +102,25 @@ namespace ControlUnitTests
+         const auto entries = Control::implementation::TranslateGhosttySettings(
+             *_settings());
+ 
+-        VERIFY_IS_TRUE(_has(entries, "scrollback-limit-lines = 9001"));
++        VERIFY_IS_TRUE(_has(entries, "scrollback-limit-lines", "9001"));
+     }
+ 
+     // Windows Terminal already insets the SwapChainPanel by the profile's
+     // padding. If ghostty pads as well the pane is inset twice, which is what
+     // made the first working pane look like it had a border round it.
++    //
++    // It is load-bearing for the mouse too: ghostty subtracts the surface's
++    // left padding before deciding which side of a cell the pointer is on, and
++    // GhosttyControlCore::_mouseTo has no padding term because of these three
++    // entries. See docs/selection-geometry.md.
+     void GhosttySettingsTests::PaddingIsZeroBecauseWindowsTerminalAlreadyPads()
+     {
+         const auto entries = Control::implementation::TranslateGhosttySettings(
+             *_settings());
+ 
+-        VERIFY_IS_TRUE(_has(entries, "window-padding-x = 0"));
+-        VERIFY_IS_TRUE(_has(entries, "window-padding-y = 0"));
+-        VERIFY_IS_TRUE(_has(entries, "window-padding-balance = false"));
++        VERIFY_IS_TRUE(_has(entries, "window-padding-x", "0"));
++        VERIFY_IS_TRUE(_has(entries, "window-padding-y", "0"));
++        VERIFY_IS_TRUE(_has(entries, "window-padding-balance", "false"));
+     }
+ 
+     // The colours matter for more than looks: while the pane was drawn in
+@@ -128,14 +141,15 @@ namespace ControlUnitTests
+ 
+         const auto entries = Control::implementation::TranslateGhosttySettings(*s);
+ 
+-        VERIFY_IS_TRUE(_has(entries, "background = #0c0c0c"));
+-        VERIFY_IS_TRUE(_has(entries, "foreground = #cccccc"));
++        VERIFY_IS_TRUE(_has(entries, "background", "#0c0c0c"));
++        VERIFY_IS_TRUE(_has(entries, "foreground", "#cccccc"));
+ 
+-        // All sixteen, each as its own entry - the shape a config file has.
++        // All sixteen, each as its own entry - ghostty's palette key takes one
++        // index per value.
+         for (uint32_t i = 0; i < 16; ++i)
+         {
+-            const auto expected = fmt::format("palette = {}=#{:02x}2030", i, i);
+-            VERIFY_IS_TRUE(_has(entries, expected),
++            const auto expected = fmt::format("{}=#{:02x}2030", i, i);
++            VERIFY_IS_TRUE(_has(entries, "palette", expected),
+                            fmt::format(L"missing palette entry {}", i).c_str());
+         }
+     }
+@@ -151,23 +165,32 @@ namespace ControlUnitTests
+ 
+         const auto entries = Control::implementation::TranslateGhosttySettings(*s);
+ 
+-        VERIFY_IS_TRUE(_has(entries, "selection-word-chars = \" ./-\""),
++        VERIFY_IS_TRUE(_has(entries, "selection-word-chars", " ./-"),
+                        L"ghostty's word boundaries must come from WT's setting");
+     }
+ 
+-    // WT's default wordDelimiters contains both a backslash and a double
+-    // quote. Unescaped, the value ends its own quoted string early and ghostty
+-    // gets a truncated set - which is exactly how `.` went missing from a
+-    // ghostty pane's word boundaries while the setting looked forwarded.
+-    void GhosttySettingsTests::QuotesAndBackslashesInAValueAreEscaped()
++    // The one escaping rule left, and it belongs to the field rather than to
++    // the entry. ghostty parses selection-word-chars as a Zig string literal,
++    // so a lone backslash starts an escape sequence there - and WT's default
++    // delimiters contain a backslash followed by an open bracket, which is not
++    // a valid one. The field rejects the whole value through a diagnostic that
++    // libghostty built without an app runtime never surfaces, so the setting
++    // looks forwarded while ghostty quietly keeps its own defaults.
++    //
++    // The double quote, by contrast, needs nothing now: it was only ever syntax
++    // for the entry format that no longer exists.
++    void GhosttySettingsTests::BackslashesAreDoubledForTheWordCharsFieldOnly()
+     {
+         auto s = _settings();
+         s->WordDelimiters(L" .\\\"x");
++        s->FontFace(L"Back\\slash \"Quoted\"");
+ 
+         const auto entries = Control::implementation::TranslateGhosttySettings(*s);
+ 
+-        VERIFY_IS_TRUE(_has(entries, "selection-word-chars = \" .\\\\\\\"x\""),
+-                       L"the backslash and the quote must both be escaped");
++        VERIFY_IS_TRUE(_has(entries, "selection-word-chars", " .\\\\\"x"),
++                       L"the backslash is doubled for the field's own parser; the quote is not");
++        VERIFY_IS_TRUE(_has(entries, "font-family", "Back\\slash \"Quoted\""),
++                       L"every other value is untouched, backslash and all");
+     }
+ 
+     void GhosttySettingsTests::NullSettingsProduceNothing()

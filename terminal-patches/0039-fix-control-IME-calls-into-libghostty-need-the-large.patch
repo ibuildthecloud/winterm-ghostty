@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Thu, 6 Aug 2026 18:46:10 -0700
+Subject: [PATCH] fix(control): IME calls into libghostty need the large stack
+
+Typing a single character into a ghostty pane through an IME took the whole
+window down. Symbolized with harness/pdbaddr rather than guessed: `__chkstk`,
+the stack probe, which means a stack overflow.
+
+ghostty_surface_preedit needs more stack than the 1 MB MSVC gives Windows
+Terminal's UI thread. GhosttyEngine::RunWithEngineStack exists for exactly this
+and reserves 16 MB, and PLAN's ledger has said since 2026-08-04 that "any future
+call into libghostty from a WT-owned thread has to be checked against this". I
+added two such calls and checked neither; both now run on the big stack.
+
+Verified by hand end to end afterwards: preedit at the cursor, candidate window,
+and committed text reaching the shell.
+
+The other half of that test is worth recording too - cascadia's IME kept working
+throughout, which is the regression check on the shared TSF refactor passing.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BgDGqEqRBB8L5Ueoq1uuxy
+---
+ .../TerminalControl/GhosttyControlCore.cpp      | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 166b4b50d..bd3575d51 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -1397,11 +1397,15 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             return {};
+         }
+ 
++        // Same reasoning as SetPreedit: this runs on WT's UI thread, and
++        // anything that walks into libghostty from there gets the big stack.
+         double x{};
+         double y{};
+         double width{};
+         double height{};
+-        ghostty_surface_ime_point(_surface, &x, &y, &width, &height);
++        GhosttyEngine::RunWithEngineStack([&]() {
++            ghostty_surface_ime_point(_surface, &x, &y, &width, &height);
++        });
+ 
+         // imePoint is in DIPs; _cellSize is physical.
+         const auto cellWidth = _cellSize.Width / _compositionScale;
+@@ -1424,8 +1428,17 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             return;
+         }
+ 
++        // On a large-stack thread, like every other call into libghostty that
++        // does real work. ghostty_surface_preedit needs more than the 1 MB MSVC
++        // gives WT's UI thread, and typing a single character into a ghostty
++        // pane through an IME took the whole window down with a stack overflow
++        // in __chkstk. The ledger already warned about this - "any future call
++        // into libghostty from a WT-owned thread has to be checked against
++        // this" - and this is the call that did not check.
+         const auto utf8 = til::u16u8(text);
+-        ghostty_surface_preedit(_surface, utf8.data(), utf8.size());
++        GhosttyEngine::RunWithEngineStack([&]() {
++            ghostty_surface_preedit(_surface, utf8.data(), utf8.size());
++        });
+         _renderNow();
+     }
+     bool GhosttyControlCore::ForceCursorVisible() const noexcept { return false; }

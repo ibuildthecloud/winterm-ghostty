@@ -1,0 +1,294 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Wed, 5 Aug 2026 20:16:55 -0700
+Subject: [PATCH] feat(control): selection and copy on a ghostty pane
+
+First Phase 6 increment. Selection is driven through ghostty's own mouse
+handling, because that is the only thing that both sets the selection and
+draws it - read-back can report a selection but never show one.
+
+The mapping from WT's semantic calls: SetSelectionAnchor presses,
+SetEndSelectionPoint moves, and cell coordinates become pixels through
+_cellSize with the viewport as the shared frame of reference.
+
+numberOfClicks is deliberately not forwarded. ghostty counts its own clicks
+from the press events - double selects a word, triple a line - so passing
+WT's count as well would double it and turn a double click into a line
+select.
+
+Two places where WT's model and ghostty's do not line up, both handled and
+both worth knowing about:
+
+  - WT never reports a button release outside VT mouse mode, and selection is
+    the non-VT path. The release is synthesised lazily, immediately before
+    anything that starts or ends a selection. Between the user letting go and
+    that next action no mouse events are sent at all, so ghostty believing a
+    drag is live has nothing to act on.
+  - ghostty has no clear-selection binding, so ClearSelection imitates what
+    collapses a selection in its own mouse handling: a press and release
+    without movement. That is behaviour-by-imitation and would break if
+    ghostty's click handling changed; a real binding upstream would be better.
+
+Copy goes through copy_to_clipboard rather than read-back, which is what
+makes HTML possible: the action emits an array of {mime, data} through the
+runtime clipboard callback, while read-back carries no attributes at all. A
+request for RTF degrades to plain rather than silently producing HTML, since
+ghostty has no RTF.
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 187 +++++++++++++++++-
+ .../TerminalControl/GhosttyControlCore.h      |  18 ++
+ 2 files changed, 195 insertions(+), 10 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index c94b6fcea..61a0fbd85 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -763,10 +763,186 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         }
+ 
+         const auto action = fmt::format("scroll_to_row:{}", std::max(0, viewTop));
++        _bindingAction(action);
++    }
++
++    // Most of what an embedder needs from libghostty has no C entry point and
++    // is reached through a *named binding action* instead - the same route
++    // ghostty's own keybindings take. `scroll_to_row` in Phase 5 was the first;
++    // selection, search and copy in Phase 6 all arrive the same way.
++    void GhosttyControlCore::_renderNow() const
++    {
++        if (_surface)
++        {
++            ghostty_surface_render_now(_surface);
++        }
++    }
++
++    bool GhosttyControlCore::_bindingAction(const std::string_view action) const
++    {
++        if (!_surface)
++        {
++            return false;
++        }
+         if (!ghostty_surface_binding_action(_surface, action.data(), action.size()))
+         {
+-            _trace(L"scroll_to_row rejected (%hs)", action.c_str());
++            _trace(L"binding action rejected (%.*hs)", gsl::narrow_cast<int>(action.size()), action.data());
++            return false;
++        }
++        return true;
++    }
++
++#pragma endregion
++
++#pragma region Selection
++
++    // WT hands out selection endpoints in cells; ghostty takes mouse positions
++    // in pixels, relative to the surface. The viewport is the shared frame of
++    // reference - both sides mean "row 0 is the top of what is on screen".
++    void GhosttyControlCore::_mouseTo(const Core::Point cell) const
++    {
++        if (!_surface)
++        {
++            return;
++        }
++        const auto x = (static_cast<double>(cell.X) + 0.5) * _cellSize.Width;
++        const auto y = (static_cast<double>(cell.Y) + 0.5) * _cellSize.Height;
++        ghostty_surface_mouse_pos(_surface, x, y, GHOSTTY_MODS_NONE);
++    }
++
++    // Windows Terminal never tells the core that the button came up: only VT
++    // mouse mode sees a release, and selection is the non-VT path. ghostty
++    // needs one, or it treats the next pointer move as a continued drag.
++    //
++    // So the release is synthesised lazily - immediately before anything that
++    // starts or ends a selection. Between the user letting go and that next
++    // action, no mouse events are sent at all, so ghostty's belief that a drag
++    // is still live has nothing to act on.
++    void GhosttyControlCore::_releaseMouseIfHeld() const
++    {
++        if (!_surface || !_mouseDown)
++        {
++            return;
++        }
++        ghostty_surface_mouse_button(_surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
++        _mouseDown = false;
++    }
++
++    void GhosttyControlCore::SetSelectionAnchor(const Core::Point positionCore)
++    {
++        if (!_surface)
++        {
++            return;
++        }
++        _releaseMouseIfHeld();
++        _mouseTo(positionCore);
++        ghostty_surface_mouse_button(_surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
++        _mouseDown = true;
++    }
++
++    void GhosttyControlCore::SetEndSelectionPoint(const Core::Point positionCore)
++    {
++        // Only meaningful mid-drag, which is the only time WT calls it.
++        _mouseTo(positionCore);
++        _renderNow();
++    }
++
++    // The click that begins a selection. ghostty counts its own clicks from the
++    // press events - a double click selects a word, a triple selects a line -
++    // so numberOfClicks is deliberately not forwarded: passing WT's count as
++    // well would double the count and turn a double click into a line select.
++    void GhosttyControlCore::LeftClickOnTerminal(const Core::Point terminalPositionCore,
++                                                 const int32_t /*numberOfClicks*/,
++                                                 const bool /*altEnabled*/,
++                                                 const bool /*shiftEnabled*/,
++                                                 const bool /*isOnOriginalPosition*/,
++                                                 bool& selectionNeedsToBeCopied)
++    {
++        SetSelectionAnchor(terminalPositionCore);
++        _renderNow();
++        selectionNeedsToBeCopied = CopyOnSelect();
++    }
++
++    bool GhosttyControlCore::HasSelection() const
++    {
++        return _surface && ghostty_surface_has_selection(_surface);
++    }
++
++    winrt::hstring GhosttyControlCore::SelectedText(bool /*trimTrailingWhitespace*/) const
++    {
++        if (!_surface)
++        {
++            return {};
++        }
++
++        ghostty_text_s text{};
++        if (!ghostty_surface_read_selection(_surface, &text))
++        {
++            return {};
++        }
++        // The engine owns the buffer until it is handed back.
++        const auto release = wil::scope_exit([&]() { ghostty_surface_free_text(_surface, &text); });
++
++        if (!text.text || text.text_len == 0)
++        {
++            return {};
++        }
++        return winrt::hstring{ til::u8u16(std::string_view{ text.text, text.text_len }) };
++    }
++
++    bool GhosttyControlCore::HasMultiLineSelection() const
++    {
++        const auto text = SelectedText(false);
++        return std::wstring_view{ text }.find(L'\n') != std::wstring_view::npos;
++    }
++
++    void GhosttyControlCore::ClearSelection()
++    {
++        if (!_surface)
++        {
++            return;
++        }
++        _releaseMouseIfHeld();
++
++        // ghostty has no clear-selection binding. A press and release without
++        // movement is what collapses a selection in its own mouse handling, so
++        // that is what this does. Worth replacing with a real binding upstream:
++        // this is behaviour-by-imitation and would break if ghostty's click
++        // handling ever changed.
++        ghostty_surface_mouse_button(_surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
++        ghostty_surface_mouse_button(_surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
++        _renderNow();
++    }
++
++    void GhosttyControlCore::SelectAll()
++    {
++        _releaseMouseIfHeld();
++        _bindingAction("select_all");
++        _renderNow();
++    }
++
++    // Copy goes through ghostty rather than through read-back, because the
++    // styled representations only exist on that path: copy_to_clipboard emits
++    // an array of {mime, data} through the runtime's clipboard callback, which
++    // is how HTML reaches the clipboard alongside plain text. Read-back
++    // (SelectedText) carries no attributes and could never produce it.
++    bool GhosttyControlCore::CopySelectionToClipboard(bool /*singleLine*/,
++                                                      bool withControlSequences,
++                                                      const CopyFormat formats)
++    {
++        if (!HasSelection())
++        {
++            return false;
+         }
++        _releaseMouseIfHeld();
++
++        // `vt` keeps the escape sequences; `mixed` puts plain and HTML on
++        // together, which is what WT wants whenever HTML is asked for; `plain`
++        // is the honest answer for everything else. ghostty has no RTF, so a
++        // request for it degrades to plain rather than silently producing HTML.
++        const auto wantsHtml = WI_IsFlagSet(formats, CopyFormat::HTML);
++        const auto* which = withControlSequences ? "vt" : (wantsHtml ? "mixed" : "plain");
++        return _bindingAction(fmt::format("copy_to_clipboard:{}", which));
+     }
+ 
+ #pragma endregion
+@@ -855,13 +1031,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     // history surface are Phase 6 (interaction parity). Each returns the
+     // "nothing here" answer its caller already handles for an empty terminal,
+     // so the shell degrades to a pane you can type in rather than misbehaving.
+-    bool GhosttyControlCore::HasSelection() const { return false; }
+-    bool GhosttyControlCore::HasMultiLineSelection() const { return false; }
+-    winrt::hstring GhosttyControlCore::SelectedText(bool /*trimTrailingWhitespace*/) const { return {}; }
+     bool GhosttyControlCore::CopyOnSelect() const { return false; }
+-    bool GhosttyControlCore::CopySelectionToClipboard(bool /*singleLine*/, bool /*withControlSequences*/, const CopyFormat /*formats*/) { return false; }
+-    void GhosttyControlCore::SelectAll() {}
+-    void GhosttyControlCore::ClearSelection() {}
+     bool GhosttyControlCore::ToggleBlockSelection() { return false; }
+     void GhosttyControlCore::ToggleMarkMode() {}
+     Control::SelectionInteractionMode GhosttyControlCore::SelectionMode() const { return Control::SelectionInteractionMode::None; }
+@@ -869,10 +1039,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     bool GhosttyControlCore::ExpandSelectionToWord() { return false; }
+     bool GhosttyControlCore::TryMarkModeKeybinding(const WORD /*vkey*/, const ControlKeyStates /*modifiers*/) { return false; }
+     Control::SelectionData GhosttyControlCore::SelectionInfo() const { return {}; }
+-    void GhosttyControlCore::SetSelectionAnchor(const Core::Point /*positionCore*/) {}
+-    void GhosttyControlCore::SetEndSelectionPoint(const Core::Point /*positionCore*/) {}
+     void GhosttyControlCore::AnchorContextMenu(const Core::Point /*position*/) {}
+-    void GhosttyControlCore::LeftClickOnTerminal(const Core::Point /*terminalPositionCore*/, const int32_t /*numberOfClicks*/, const bool /*altEnabled*/, const bool /*shiftEnabled*/, const bool /*isOnOriginalPosition*/, bool& selectionNeedsToBeCopied) { selectionNeedsToBeCopied = false; }
+ 
+     SearchResults GhosttyControlCore::Search(const SearchRequest& /*request*/) { return {}; }
+     Windows::Foundation::Collections::IVector<int32_t> GhosttyControlCore::SearchResultRows() const { return winrt::single_threaded_vector<int32_t>(); }
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.h b/src/cascadia/TerminalControl/GhosttyControlCore.h
+index fa1ed49d9..99c136525 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.h
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.h
+@@ -244,6 +244,19 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // a debugger attached; shows up in cdb with one.
+         static void _trace(const wchar_t* format, ...);
+         void _pushSize();
++
++        // Named binding actions are how most of libghostty is reached from an
++        // embedder; see the definition.
++        bool _bindingAction(std::string_view action) const;
++
++        // Selection is driven through ghostty's mouse handling, because that
++        // is the only thing that both sets the selection *and* draws it.
++        void _mouseTo(Core::Point cell) const;
++        void _releaseMouseIfHeld() const;
++
++        // Output has to draw itself; libghostty's wakeup coalesces. Same
++        // reasoning as _connectionOutputHandler's render.
++        void _renderNow() const;
+         void _raiseSwapChainChanged();
+         void _raiseOnUiThread(std::function<void()> action);
+ 
+@@ -289,6 +302,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         float _panelHeight{ 0 };
+         float _compositionScale{ 1.0f };
+ 
++        // Whether ghostty believes the left button is down. WT never reports
++        // a release outside VT mouse mode, so this tracks it - see
++        // _releaseMouseIfHeld.
++        mutable bool _mouseDown{ false };
++
+         // Scroll state, from the SCROLLBAR action.
+         int32_t _scrollOffset{ 0 };
+         int32_t _viewHeight{ 0 };

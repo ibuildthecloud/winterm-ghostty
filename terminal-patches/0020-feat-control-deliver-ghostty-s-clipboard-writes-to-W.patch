@@ -1,0 +1,299 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Wed, 5 Aug 2026 20:24:34 -0700
+Subject: [PATCH] feat(control): deliver ghostty's clipboard writes to Windows
+ Terminal
+
+The previous commit made copy_to_clipboard fire, but the runtime's
+write_clipboard callback was still the Phase 5 stub that dropped the payload -
+so copy would have looked implemented and done nothing. Found by reading the
+path back rather than by running it, which is the only reason it did not reach
+the user's hands that way.
+
+The callback now walks the MIME-tagged array ghostty sends, picks out
+text/plain and text/html, and raises WriteToClipboard - the same event
+cascadia's core raises, so TermControl needs no engine-specific handling. An
+untagged representation is treated as plain rather than dropped. It arrives on
+libghostty's thread and is marshalled, like every other event from that side.
+
+RTF is sent empty rather than substituted: ghostty has no RTF, and putting
+HTML in that slot would paste markup as literal tags.
+
+The CopyFormat -> action-name mapping is extracted to GhosttyCopyFormat.h and
+pinned by three tests. The one worth having is that HTML maps to `mixed`, not
+`html`: asking ghostty for html alone puts only markup on the clipboard, so
+the plain-text flavour most paste targets use would vanish.
+
+unitControl 46/46 -> 49/49.
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 33 +++++++++---
+ .../TerminalControl/GhosttyControlCore.h      |  5 ++
+ .../TerminalControl/GhosttyCopyFormat.h       | 39 ++++++++++++++
+ .../TerminalControl/GhosttyEngine.cpp         | 45 ++++++++++++++--
+ .../TerminalControlLib.vcxproj                |  1 +
+ .../Control.UnitTests.vcxproj                 |  1 +
+ .../GhosttyCopyFormatTests.cpp                | 53 +++++++++++++++++++
+ 7 files changed, 166 insertions(+), 11 deletions(-)
+ create mode 100644 src/cascadia/TerminalControl/GhosttyCopyFormat.h
+ create mode 100644 src/cascadia/UnitTests_Control/GhosttyCopyFormatTests.cpp
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 61a0fbd85..d2bee9a30 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -4,7 +4,8 @@
+ #include "pch.h"
+ #include "GhosttyControlCore.h"
+ #include "GhosttySettingsTranslator.h"
+-#include "GhosttyKeyTranslator.h"
++#include "GhosttyKeyTranslator.h"
++#include "GhosttyCopyFormat.h"
+ 
+ #include "GhosttyControlCore.g.cpp"
+ 
+@@ -211,6 +212,29 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         _raiseOnUiThread([this]() { CloseTerminalRequested.raise(*this, nullptr); });
+     }
+ 
++    void GhosttyControlCore::WriteClipboard(std::string&& plain, std::string&& html) noexcept
++    try
++    {
++        if (plain.empty() && html.empty())
++        {
++            return;
++        }
++
++        auto args = winrt::make<WriteToClipboardEventArgs>(
++            winrt::hstring{ til::u8u16(plain) },
++            std::move(html),
++            // ghostty has no RTF. Sending an empty one is honest: the
++            // clipboard simply carries no RTF flavour.
++            std::string{});
++
++        // Arrives on libghostty's thread; the event is one TermControl expects
++        // on the UI thread.
++        _raiseOnUiThread([this, args = std::move(args)]() {
++            WriteToClipboard.raise(*this, args);
++        });
++    }
++    CATCH_LOG()
++
+ #pragma region Connection
+ 
+     TerminalConnection::ITerminalConnection GhosttyControlCore::Connection()
+@@ -936,12 +960,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         }
+         _releaseMouseIfHeld();
+ 
+-        // `vt` keeps the escape sequences; `mixed` puts plain and HTML on
+-        // together, which is what WT wants whenever HTML is asked for; `plain`
+-        // is the honest answer for everything else. ghostty has no RTF, so a
+-        // request for it degrades to plain rather than silently producing HTML.
+-        const auto wantsHtml = WI_IsFlagSet(formats, CopyFormat::HTML);
+-        const auto* which = withControlSequences ? "vt" : (wantsHtml ? "mixed" : "plain");
++        const auto which = GhosttyCopyAction(withControlSequences, WI_IsFlagSet(formats, CopyFormat::HTML));
+         return _bindingAction(fmt::format("copy_to_clipboard:{}", which));
+     }
+ 
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.h b/src/cascadia/TerminalControl/GhosttyControlCore.h
+index 99c136525..a7016e6bb 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.h
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.h
+@@ -201,6 +201,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         void ResizeConnection(uint16_t columns, uint16_t rows) noexcept;
+         void RequestClose() noexcept;
+ 
++        // A copy_to_clipboard binding action, or OSC 52 from inside the
++        // terminal. Raised as WriteToClipboard - the same event cascadia's
++        // core raises, so TermControl needs no engine-specific handling.
++        void WriteClipboard(std::string&& plain, std::string&& html) noexcept;
++
+         // -------------------------------- WinRT Events ---------------------------------
+         // clang-format off
+         til::typed_event<IInspectable, Control::FontSizeChangedArgs> FontSizeChanged;
+diff --git a/src/cascadia/TerminalControl/GhosttyCopyFormat.h b/src/cascadia/TerminalControl/GhosttyCopyFormat.h
+new file mode 100644
+index 000000000..e4d660b04
+--- /dev/null
++++ b/src/cascadia/TerminalControl/GhosttyCopyFormat.h
+@@ -0,0 +1,39 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++//
++// Module Name:
++// - GhosttyCopyFormat.h
++//
++// Abstract:
++// - Windows Terminal's CopyFormat -> the argument of ghostty's
++//   `copy_to_clipboard` binding action. Pure, so it can be tested without an
++//   engine; the rest of the copy path needs a live selection.
++
++#pragma once
++
++#include <string_view>
++
++namespace winrt::Microsoft::Terminal::Control::implementation
++{
++    // ghostty offers exactly four: plain, vt, html, mixed.
++    //
++    // `vt` wins over everything because it is a different *question* - the
++    // caller asked for the escape sequences, not for a presentation format.
++    //
++    // `mixed` is the answer whenever HTML is wanted, because it puts plain and
++    // HTML on the clipboard together, each MIME-tagged; asking for `html`
++    // alone would strip the plain-text flavour that most paste targets use.
++    //
++    // RTF has no ghostty equivalent, so a request for RTF alone degrades to
++    // plain. That is deliberate: silently substituting HTML would put markup
++    // where an application asked for RTF and get pasted as literal tags.
++    constexpr std::string_view GhosttyCopyAction(const bool withControlSequences,
++                                                 const bool wantsHtml) noexcept
++    {
++        if (withControlSequences)
++        {
++            return "vt";
++        }
++        return wantsHtml ? "mixed" : "plain";
++    }
++}
+diff --git a/src/cascadia/TerminalControl/GhosttyEngine.cpp b/src/cascadia/TerminalControl/GhosttyEngine.cpp
+index aecfbf7da..2fd9e1b45 100644
+--- a/src/cascadia/TerminalControl/GhosttyEngine.cpp
++++ b/src/cascadia/TerminalControl/GhosttyEngine.cpp
+@@ -245,12 +245,49 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     {
+     }
+ 
+-    void GhosttyEngine::_writeClipboard(void* userdata, ghostty_clipboard_e /*loc*/, const ghostty_clipboard_content_s* /*content*/, size_t /*len*/, bool /*confirm*/) noexcept
++    // Everything ghostty puts on the clipboard arrives here: a copy_to_clipboard
++    // binding action, and OSC 52 from inside the terminal. The payload is an
++    // array of MIME-tagged representations - `mixed` sends plain and HTML
++    // together - which is the only place styled copy exists, since read-back
++    // carries no attributes.
++    void GhosttyEngine::_writeClipboard(void* userdata,
++                                        ghostty_clipboard_e /*loc*/,
++                                        const ghostty_clipboard_content_s* content,
++                                        size_t len,
++                                        bool /*confirm*/) noexcept
++    try
+     {
+-        // OSC 52. Phase 6 wires this to WriteToClipboard; until then a clipboard
+-        // write from inside the terminal is dropped rather than half-applied.
+-        UNREFERENCED_PARAMETER(userdata);
++        const auto core = static_cast<GhosttyControlCore*>(userdata);
++        if (!core || !content)
++        {
++            return;
++        }
++
++        std::string plain;
++        std::string html;
++        for (size_t i = 0; i < len; ++i)
++        {
++            const auto& one = content[i];
++            if (!one.mime || !one.data)
++            {
++                continue;
++            }
++            const std::string_view mime{ one.mime };
++            // text/plain wins over anything unrecognised, and an untagged
++            // representation is treated as plain rather than dropped.
++            if (mime.starts_with("text/html"))
++            {
++                html = one.data;
++            }
++            else if (mime.starts_with("text/plain") || mime.empty())
++            {
++                plain = one.data;
++            }
++        }
++
++        core->WriteClipboard(std::move(plain), std::move(html));
+     }
++    CATCH_LOG()
+ 
+     void GhosttyEngine::_closeSurface(void* userdata, bool /*processAlive*/) noexcept
+     {
+diff --git a/src/cascadia/TerminalControl/TerminalControlLib.vcxproj b/src/cascadia/TerminalControl/TerminalControlLib.vcxproj
+index b832fac18..72ab6d5d4 100644
+--- a/src/cascadia/TerminalControl/TerminalControlLib.vcxproj
++++ b/src/cascadia/TerminalControl/TerminalControlLib.vcxproj
+@@ -34,6 +34,7 @@
+     <ClInclude Include="GhosttyEngine.h" />
+     <ClInclude Include="GhosttySettingsTranslator.h" />
+     <ClInclude Include="GhosttyKeyTranslator.h" />
++    <ClInclude Include="GhosttyCopyFormat.h" />
+     <ClInclude Include="GhosttyControlCore.h">
+       <DependentUpon>GhosttyControlCore.idl</DependentUpon>
+     </ClInclude>
+diff --git a/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj b/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
+index e2bb73c49..bc3ce5a93 100644
+--- a/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
++++ b/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
+@@ -38,6 +38,7 @@
+     <ClCompile Include="GhosttySettingsTests.cpp" />
+     <ClCompile Include="GhosttyEngineSelectionTests.cpp" />
+     <ClCompile Include="GhosttyKeyTests.cpp" />
++    <ClCompile Include="GhosttyCopyFormatTests.cpp" />
+     <!-- Compiled straight into the tests: it is a pure function with no
+          libghostty dependency, so the test binary needs no engine DLL. -->
+     <ClCompile Include="..\TerminalControl\GhosttySettingsTranslator.cpp" />
+diff --git a/src/cascadia/UnitTests_Control/GhosttyCopyFormatTests.cpp b/src/cascadia/UnitTests_Control/GhosttyCopyFormatTests.cpp
+new file mode 100644
+index 000000000..5b53efe4a
+--- /dev/null
++++ b/src/cascadia/UnitTests_Control/GhosttyCopyFormatTests.cpp
+@@ -0,0 +1,53 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++//
++// Windows Terminal's CopyFormat has four flags; ghostty's copy_to_clipboard
++// takes one of four names, and they do not line up. This pins the mapping.
++//
++// The rest of the copy path needs a live selection and a real clipboard, so
++// this is the part a unit test can reach.
++
++#include "pch.h"
++#include "../TerminalControl/GhosttyCopyFormat.h"
++
++using namespace WEX::Logging;
++using namespace WEX::TestExecution;
++using namespace WEX::Common;
++
++using namespace winrt::Microsoft::Terminal::Control::implementation;
++
++namespace ControlUnitTests
++{
++    class GhosttyCopyFormatTests
++    {
++        BEGIN_TEST_CLASS(GhosttyCopyFormatTests)
++            TEST_CLASS_PROPERTY(L"TestTimeout", L"0:0:10")
++        END_TEST_CLASS()
++
++        TEST_METHOD(PlainIsTheDefault);
++        TEST_METHOD(HtmlBecomesMixedSoPlainSurvives);
++        TEST_METHOD(ControlSequencesWinOverEverything);
++    };
++
++    void GhosttyCopyFormatTests::PlainIsTheDefault()
++    {
++        VERIFY_ARE_EQUAL("plain", GhosttyCopyAction(false, false));
++    }
++
++    // Not "html". Asking ghostty for html alone puts *only* markup on the
++    // clipboard, so pasting into anything that wants text gets tags. `mixed`
++    // sends both, each MIME-tagged, which is what WT's own copy does.
++    void GhosttyCopyFormatTests::HtmlBecomesMixedSoPlainSurvives()
++    {
++        VERIFY_ARE_EQUAL("mixed", GhosttyCopyAction(false, true));
++        VERIFY_ARE_NOT_EQUAL("html", GhosttyCopyAction(false, true));
++    }
++
++    // `vt` is a different question from the presentation formats - the caller
++    // asked for the escape sequences - so it is not overridden by HTML.
++    void GhosttyCopyFormatTests::ControlSequencesWinOverEverything()
++    {
++        VERIFY_ARE_EQUAL("vt", GhosttyCopyAction(true, false));
++        VERIFY_ARE_EQUAL("vt", GhosttyCopyAction(true, true));
++    }
++}

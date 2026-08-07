@@ -1,0 +1,324 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Wed, 5 Aug 2026 15:28:16 -0700
+Subject: [PATCH] test(control): pin the two key-translation rules
+
+Both came out of the keycode bug, and neither is reachable through
+GhosttyControlCore from a test - it needs a live surface - so they move into
+their own translation unit alongside the settings translator.
+
+KeycodeIsTheScanCodeNotTheVirtualKey spells out the numbers that made the bug
+visible: KeyA is scan code 0x1E, and asserting it is NOT 0x41 is the actual
+guard, because a virtual key is exactly what used to be passed.
+ExtendedKeysCarryTheE000Prefix covers Home, the arrows and Delete, which
+resolve as their numpad twins without the prefix.
+
+ControlCharactersAreNotText is the load-bearing one: a control character in
+the utf8 field does not duplicate ghostty's encoding of the key, it replaces
+it, and the modes that encoding depends on are invisible from this side. It
+also pins that one control character poisons the whole string rather than
+being stripped, since a mixed result would short circuit just as hard.
+
+Mutation-verified: dropping the 0xE000 prefix fails exactly
+ExtendedKeysCarryTheE000Prefix, and letting control characters through fails
+exactly ControlCharactersAreNotText. Both mutations had to be written to
+compile - the project promotes unreferenced parameters and constant
+conditions to errors, and the first attempt at each silently left a stale
+test binary passing.
+
+unitControl 42/42 -> 46/46, unitSettingsModel 159/159.
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 36 +-------
+ .../TerminalControl/GhosttyKeyTranslator.cpp  | 39 ++++++++
+ .../TerminalControl/GhosttyKeyTranslator.h    | 38 ++++++++
+ .../TerminalControlLib.vcxproj                |  2 +
+ .../Control.UnitTests.vcxproj                 |  2 +
+ .../UnitTests_Control/GhosttyKeyTests.cpp     | 91 +++++++++++++++++++
+ 6 files changed, 177 insertions(+), 31 deletions(-)
+ create mode 100644 src/cascadia/TerminalControl/GhosttyKeyTranslator.cpp
+ create mode 100644 src/cascadia/TerminalControl/GhosttyKeyTranslator.h
+ create mode 100644 src/cascadia/UnitTests_Control/GhosttyKeyTests.cpp
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 36016d96a..c94b6fcea 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -4,6 +4,7 @@
+ #include "pch.h"
+ #include "GhosttyControlCore.h"
+ #include "GhosttySettingsTranslator.h"
++#include "GhosttyKeyTranslator.h"
+ 
+ #include "GhosttyControlCore.g.cpp"
+ 
+@@ -627,23 +628,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             return {};
+         }
+ 
+-        // Control characters are not text. Backspace, Tab, Enter, Escape and
+-        // ctrl+letter all come back from ToUnicode as 0x01-0x1A/0x1B/0x7F, but
+-        // they are keys whose terminal encoding ghostty owns and which depend
+-        // on modes we know nothing about here (backspace-is-delete, the kitty
+-        // keyboard protocol, application cursor keys). Forwarding them is
+-        // destructive rather than redundant: ghostty's key_encode short
+-        // circuits on a non-empty utf8 field, so a control character here
+-        // would *replace* ghostty's own encoding of the key.
+-        const std::wstring_view text{ buf, gsl::narrow_cast<size_t>(n) };
+-        for (const auto c : text)
+-        {
+-            if (c < 0x20 || c == 0x7F)
+-            {
+-                return {};
+-            }
+-        }
+-        return til::u16u8(text);
++        return GhosttyKeyText(std::wstring_view{ buf, gsl::narrow_cast<size_t>(n) });
+     }
+ 
+     bool GhosttyControlCore::TrySendKeyEvent(const WORD vkey,
+@@ -659,20 +644,9 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         ghostty_input_key_s ev{};
+         ev.action = keyDown ? GHOSTTY_ACTION_PRESS : GHOSTTY_ACTION_RELEASE;
+ 
+-        // ghostty's keycode is the *native* platform keycode, not a value from
+-        // ghostty_input_key_e and not a virtual key. On Windows its table
+-        // (src/input/keycodes.zig) stores the scan code, with 0xE000 set for
+-        // the extended keys:
+-        //
+-        //     //   USB     evdev    XKB     Win     Mac   Code
+-        //     .{ 0x070004, 0x001e, 0x0026, 0x001e, 0x0000, "KeyA" },
+-        //     .{ 0x07004a, 0x0066, 0x006e, 0xe047, 0x0073, "Home" },
+-        //
+-        // Passing the virtual key here instead resolves to whatever unrelated
+-        // key shares that number - which is why typing `d` used to arrive as a
+-        // different key entirely and eat a character.
+-        const auto extended = (modifiers.Value() & ENHANCED_KEY) != 0;
+-        ev.keycode = extended ? (0xE000u | scanCode) : scanCode;
++        // Native keycode, not the virtual key - see GhosttyKeyTranslator.h for
++        // why, and what happened when it was the virtual key.
++        ev.keycode = GhosttyNativeKeycode(scanCode, (modifiers.Value() & ENHANCED_KEY) != 0);
+         ev.composing = false;
+ 
+         auto mods = GHOSTTY_MODS_NONE;
+diff --git a/src/cascadia/TerminalControl/GhosttyKeyTranslator.cpp b/src/cascadia/TerminalControl/GhosttyKeyTranslator.cpp
+new file mode 100644
+index 000000000..80c4980f0
+--- /dev/null
++++ b/src/cascadia/TerminalControl/GhosttyKeyTranslator.cpp
+@@ -0,0 +1,39 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++
++#include "pch.h"
++#include "GhosttyKeyTranslator.h"
++
++namespace winrt::Microsoft::Terminal::Control::implementation
++{
++    std::string GhosttyKeyText(const std::wstring_view translated)
++    {
++        if (translated.empty())
++        {
++            return {};
++        }
++
++        // Control characters are not text. Backspace, Tab, Enter, Escape and
++        // ctrl+letter all come back from the keyboard layout as
++        // 0x01-0x1A/0x1B/0x7F, but they are keys whose terminal encoding
++        // ghostty owns, and which depend on modes nothing here knows about -
++        // backspace-is-delete, the kitty keyboard protocol, application cursor
++        // keys.
++        //
++        // Forwarding them is destructive rather than merely redundant:
++        // ghostty's key_encode short circuits on a non-empty utf8 field
++        // (`if (event.utf8.len > 0) return try writer.writeAll(event.utf8);`),
++        // so a control character here would *replace* ghostty's own encoding
++        // of the key. ghostty guards the same hazard internally with
++        // isControlUtf8.
++        for (const auto c : translated)
++        {
++            if (c < 0x20 || c == 0x7F)
++            {
++                return {};
++            }
++        }
++
++        return til::u16u8(translated);
++    }
++}
+diff --git a/src/cascadia/TerminalControl/GhosttyKeyTranslator.h b/src/cascadia/TerminalControl/GhosttyKeyTranslator.h
+new file mode 100644
+index 000000000..c34dff75b
+--- /dev/null
++++ b/src/cascadia/TerminalControl/GhosttyKeyTranslator.h
+@@ -0,0 +1,38 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++//
++// Module Name:
++// - GhosttyKeyTranslator.h
++//
++// Abstract:
++// - The two rules a Windows key event has to satisfy before libghostty will
++//   make sense of it. Both were learned from a bug; both are pure functions so
++//   they can be unit tested without an engine, a surface or a keyboard.
++
++#pragma once
++
++#include <string>
++#include <string_view>
++
++namespace winrt::Microsoft::Terminal::Control::implementation
++{
++    // ghostty_input_key_s::keycode is the *native* platform keycode - not a
++    // virtual key, and not a value from ghostty_input_key_e. On Windows its
++    // table (ghostty's src/input/keycodes.zig) stores the scan code, with
++    // 0xE000 set for the extended keys:
++    //
++    //     //   USB     evdev    XKB     Win     Mac   Code
++    //     .{ 0x070004, 0x001e, 0x0026, 0x001e, 0x0000, "KeyA" },
++    //     .{ 0x07004a, 0x0066, 0x006e, 0xe047, 0x0073, "Home" },
++    //
++    // Passing the virtual key instead resolves to whatever unrelated key
++    // shares that number, which is how `d` came to behave like Delete.
++    constexpr uint32_t GhosttyNativeKeycode(const uint16_t scanCode, const bool extended) noexcept
++    {
++        return extended ? (0xE000u | scanCode) : scanCode;
++    }
++
++    // The text to hand to libghostty with a key, given what the keyboard
++    // layout translated it to. Empty means "this key produces no text".
++    std::string GhosttyKeyText(std::wstring_view translated);
++}
+diff --git a/src/cascadia/TerminalControl/TerminalControlLib.vcxproj b/src/cascadia/TerminalControl/TerminalControlLib.vcxproj
+index c761be934..b832fac18 100644
+--- a/src/cascadia/TerminalControl/TerminalControlLib.vcxproj
++++ b/src/cascadia/TerminalControl/TerminalControlLib.vcxproj
+@@ -33,6 +33,7 @@
+     <ClInclude Include="pch.h" />
+     <ClInclude Include="GhosttyEngine.h" />
+     <ClInclude Include="GhosttySettingsTranslator.h" />
++    <ClInclude Include="GhosttyKeyTranslator.h" />
+     <ClInclude Include="GhosttyControlCore.h">
+       <DependentUpon>GhosttyControlCore.idl</DependentUpon>
+     </ClInclude>
+@@ -77,6 +78,7 @@
+     </ClCompile>
+     <ClCompile Include="GhosttyEngine.cpp" />
+     <ClCompile Include="GhosttySettingsTranslator.cpp" />
++    <ClCompile Include="GhosttyKeyTranslator.cpp" />
+     <ClCompile Include="GhosttyControlCore.cpp">
+       <DependentUpon>GhosttyControlCore.idl</DependentUpon>
+     </ClCompile>
+diff --git a/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj b/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
+index fdf10b5b7..e2bb73c49 100644
+--- a/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
++++ b/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
+@@ -37,9 +37,11 @@
+     <ClCompile Include="ControlCoreTests.cpp" />
+     <ClCompile Include="GhosttySettingsTests.cpp" />
+     <ClCompile Include="GhosttyEngineSelectionTests.cpp" />
++    <ClCompile Include="GhosttyKeyTests.cpp" />
+     <!-- Compiled straight into the tests: it is a pure function with no
+          libghostty dependency, so the test binary needs no engine DLL. -->
+     <ClCompile Include="..\TerminalControl\GhosttySettingsTranslator.cpp" />
++    <ClCompile Include="..\TerminalControl\GhosttyKeyTranslator.cpp" />
+     <ClCompile Include="ControlInteractivityTests.cpp" />
+     <ClCompile Include="pch.cpp">
+       <PrecompiledHeader>Create</PrecompiledHeader>
+diff --git a/src/cascadia/UnitTests_Control/GhosttyKeyTests.cpp b/src/cascadia/UnitTests_Control/GhosttyKeyTests.cpp
+new file mode 100644
+index 000000000..939f2fd8c
+--- /dev/null
++++ b/src/cascadia/UnitTests_Control/GhosttyKeyTests.cpp
+@@ -0,0 +1,91 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++//
++// Regression tests for the two rules a Windows key event has to satisfy before
++// libghostty makes sense of it. Both came out of one bug, found by typing `cd`
++// into a ghostty pane and landing in cmd's F9 prompt.
++//
++// Neither rule is reachable from a unit test through GhosttyControlCore - it
++// needs a live surface - which is why they live in their own translation unit.
++
++#include "pch.h"
++#include "../TerminalControl/GhosttyKeyTranslator.h"
++
++using namespace WEX::Logging;
++using namespace WEX::TestExecution;
++using namespace WEX::Common;
++
++using namespace winrt::Microsoft::Terminal::Control::implementation;
++
++namespace ControlUnitTests
++{
++    class GhosttyKeyTests
++    {
++        BEGIN_TEST_CLASS(GhosttyKeyTests)
++            TEST_CLASS_PROPERTY(L"TestTimeout", L"0:0:10")
++        END_TEST_CLASS()
++
++        TEST_METHOD(KeycodeIsTheScanCodeNotTheVirtualKey);
++        TEST_METHOD(ExtendedKeysCarryTheE000Prefix);
++        TEST_METHOD(PrintableTextPassesThrough);
++        TEST_METHOD(ControlCharactersAreNotText);
++    };
++
++    // The scan code passes through untouched. Spelled out with the values that
++    // made the original bug visible: ghostty's table gives KeyA scan code
++    // 0x1E, and `A`'s *virtual* key is 0x41 - so if a virtual key is ever
++    // passed here again, this is the number that will be wrong.
++    void GhosttyKeyTests::KeycodeIsTheScanCodeNotTheVirtualKey()
++    {
++        VERIFY_ARE_EQUAL(0x1Eu, GhosttyNativeKeycode(0x1E, false), L"KeyA is scan code 0x1E");
++        VERIFY_ARE_NOT_EQUAL(0x41u, GhosttyNativeKeycode(0x1E, false), L"...not virtual key 0x41");
++
++        // `D` - the key that used to behave like Delete because 0x44 was sent
++        // as a native keycode.
++        VERIFY_ARE_EQUAL(0x20u, GhosttyNativeKeycode(0x20, false), L"KeyD is scan code 0x20");
++    }
++
++    // ghostty's table stores the extended keys with 0xE0 in the high byte:
++    //     .{ 0x07004a, 0x0066, 0x006e, 0xe047, 0x0073, "Home" }
++    // Home, the arrows, Delete and the navigation cluster all live there, so
++    // dropping the prefix makes them resolve as their numpad twins.
++    void GhosttyKeyTests::ExtendedKeysCarryTheE000Prefix()
++    {
++        VERIFY_ARE_EQUAL(0xE047u, GhosttyNativeKeycode(0x47, true), L"Home is 0xE047, not 0x47");
++        VERIFY_ARE_EQUAL(0xE04Bu, GhosttyNativeKeycode(0x4B, true), L"ArrowLeft");
++        VERIFY_ARE_EQUAL(0xE053u, GhosttyNativeKeycode(0x53, true), L"Delete");
++
++        // The same scan code without the extended bit is a different key.
++        VERIFY_ARE_NOT_EQUAL(GhosttyNativeKeycode(0x47, true), GhosttyNativeKeycode(0x47, false));
++    }
++
++    void GhosttyKeyTests::PrintableTextPassesThrough()
++    {
++        VERIFY_ARE_EQUAL("d", GhosttyKeyText(L"d"));
++        VERIFY_ARE_EQUAL("D", GhosttyKeyText(L"D"));
++
++        // Non-ASCII has to survive as UTF-8, since that is what the field is.
++        VERIFY_ARE_EQUAL("\xC3\xA9", GhosttyKeyText(L"é"), L"e-acute as UTF-8");
++    }
++
++    // The load-bearing one. ghostty's key_encode short circuits on a non-empty
++    // utf8 field, so a control character here does not merely duplicate
++    // ghostty's encoding of the key - it *replaces* it, and the modes that
++    // encoding depends on (backspace-is-delete, the kitty keyboard protocol,
++    // application cursor keys) are invisible from this side.
++    void GhosttyKeyTests::ControlCharactersAreNotText()
++    {
++        VERIFY_IS_TRUE(GhosttyKeyText(L"\x08").empty(), L"Backspace");
++        VERIFY_IS_TRUE(GhosttyKeyText(L"\x09").empty(), L"Tab");
++        VERIFY_IS_TRUE(GhosttyKeyText(L"\x0d").empty(), L"Enter");
++        VERIFY_IS_TRUE(GhosttyKeyText(L"\x1b").empty(), L"Escape");
++        VERIFY_IS_TRUE(GhosttyKeyText(L"\x03").empty(), L"ctrl+c");
++        VERIFY_IS_TRUE(GhosttyKeyText(L"\x7f").empty(), L"Delete");
++        VERIFY_IS_TRUE(GhosttyKeyText(L"").empty(), L"a key that produces nothing");
++
++        // One control character poisons the whole string rather than being
++        // stripped out of it: a mixed result would still short circuit
++        // ghostty's encoding, just less obviously.
++        VERIFY_IS_TRUE(GhosttyKeyText(L"a\x08").empty());
++    }
++}

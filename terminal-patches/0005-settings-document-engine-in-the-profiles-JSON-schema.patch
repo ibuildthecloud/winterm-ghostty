@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 4 Aug 2026 14:46:12 -0700
+Subject: [PATCH] settings: document "engine" in the profiles JSON schema
+
+The setting was wired through the model but never described in
+profiles.schema.json, so editors gave no completion or validation for it
+- a real gap in "end to end".
+
+Lists "cascadia" only. "ghostty" is deliberately absent: PLAN Phase 4
+scopes this to cascadia-only, and advertising a value in the schema that
+the app then rejects with a warning would be worse than not offering it.
+It joins the enum in Phase 5, when an engine actually answers to it.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ee27Fih3vSPYsqrUBpUoc
+---
+ doc/cascadia/profiles.schema.json | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/doc/cascadia/profiles.schema.json b/doc/cascadia/profiles.schema.json
+index d6f1c898c..8ee130a92 100644
+--- a/doc/cascadia/profiles.schema.json
++++ b/doc/cascadia/profiles.schema.json
+@@ -2980,6 +2980,14 @@
+           "default": false,
+           "description": "When true, this profile should always open in an elevated context. If the window isn't running as an Administrator, then a new elevated window will be created."
+         },
++        "engine": {
++          "default": "cascadia",
++          "description": "Selects the terminal engine backing panes created from this profile. The engine is bound when the pane is created, so changing this takes effect on the next tab or pane rather than the current one. An unrecognized value falls back to \"cascadia\" with a warning.",
++          "enum": [
++            "cascadia"
++          ],
++          "type": "string"
++        },
+         "environment": {
+           "description": "Key-value pairs representing environment variables to set. Environment variable names are not case-sensitive. You can reference existing environment variable names by enclosing them in literal percent characters (e.g. %PATH%).",
+           "type": "object",

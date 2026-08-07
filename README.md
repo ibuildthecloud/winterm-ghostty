@@ -29,18 +29,14 @@ This repo holds the **documentation, the test harnesses, the build scripts and t
 patch series**. It does *not* contain the two forks — they are separate clones, gitignored
 here:
 
-| | |
-|---|---|
-| `ghostty/` | fork of `ghostty-org/ghostty`, branch `windows`. **Reconstructable from this repo**: pinned upstream commit + the 31 patches in `ghostty-patches/` (ADR 0004). |
-| `terminal/` | fork of `microsoft/terminal`. **Not reconstructable from this repo** — see the warning below. |
+| | | |
+|---|---|---|
+| `ghostty/` | fork of `ghostty-org/ghostty`, branch `windows` | 31 patches in `ghostty-patches/` |
+| `terminal/` | fork of `microsoft/terminal`, branch `windows` | 39 patches in `terminal-patches/` |
 
-> [!WARNING]
-> **The Windows Terminal fork is not published here.** It is 39 commits on top of
-> `microsoft/terminal` at pin `ca7996296`, and this repository exports no patches for it.
-> Without those commits there is no `engine` setting, no `IControlCore` seam and no
-> `GhosttyControlCore` — so **you cannot build a working Windows Terminal from this repo
-> alone.** Publishing that fork, or adding a `terminal-patches/` export beside
-> `ghostty-patches/`, is outstanding work.
+Both are reconstructable from this repo — pinned upstream commit plus the exported series
+(ADR 0004), which is what §1 below does. The clones themselves are gitignored; the patches
+are the reviewable artifact.
 
 Everything else — why the design is what it is, what was measured, what is knowingly
 different from cascadia — is in `docs/`.
@@ -56,7 +52,8 @@ docs/sessions/        one report per session: what was built, what was not, what
 docs/documented-diffs.md   every way a ghostty pane differs from a cascadia one
 docs/selection-geometry.md both engines' selection rules, measured
 docs/manual-validation.md  the checks that still need a human
-ghostty-patches/      the fork as an ordered, rebasable patch series
+ghostty-patches/      the ghostty fork as an ordered, rebasable patch series
+terminal-patches/     the Windows Terminal fork, likewise
 harness/              small hosts and tools that exercise libghostty directly
 scripts/              build, test, patch-export and rebase wrappers
 ```
@@ -83,12 +80,22 @@ cd winterm-ghostty
 # ghostty, reconstructed from the pin plus the patch series
 git clone https://github.com/ghostty-org/ghostty
 git -C ghostty checkout -b windows 4d605bf0d819df901a0332bbb320dc849fdd82e4
-git -C ghostty am ../ghostty-patches/*.patch
+git -C ghostty am --keep-cr ../ghostty-patches/*.patch
 
-# Windows Terminal - see the warning above; the fork's commits are not here
+# Windows Terminal, the same way
 git clone https://github.com/microsoft/terminal
-git -C terminal checkout ca7996296a48322c1c7310af59d4ee2949421679
+git -C terminal checkout -b windows ca7996296a48322c1c7310af59d4ee2949421679
+git -C terminal am --keep-cr ../terminal-patches/*.patch
 ```
+
+**`--keep-cr` is not optional.** Windows Terminal marks its sources `-text`, so the blobs
+really are CRLF, and `git am` strips trailing CRs by default — a mail-transport habit that
+here makes every patch fail to apply. Both series were verified by replaying them into a
+scratch clone: 31 and 39 patches, each producing a tree byte-identical to the fork it came
+from.
+
+`scripts\export-patches.ps1` regenerates both series from the clones, and `-Check` fails
+if either has drifted — worth running before a commit that touched a fork.
 
 ### 2. libghostty
 
@@ -158,8 +165,9 @@ ctrl-click, bracketed paste always off, mouse reporting unwired, no keyboard sel
 Each phase is one largely-unattended agent session against the contract in `PROCESS.md`,
 with a human gate between phases. Every session ends with a report in `docs/sessions/`
 saying what worked, what did not, and what was left unmet — including the failures. The
-patch series in `ghostty-patches/` is the reviewable artifact of the ghostty fork: one
-commit per topic, each building and passing tests on its own (ADR 0004).
+patch series in `ghostty-patches/` and `terminal-patches/` are the reviewable artifact of
+each fork: one commit per topic, and on the ghostty side each patch builds and passes tests
+on its own (ADR 0004).
 
 If you read one thing beyond this file, make it a session report — they are written to be
 read after the fact by someone who was not there.

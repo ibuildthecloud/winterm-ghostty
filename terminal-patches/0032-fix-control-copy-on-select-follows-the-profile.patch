@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Thu, 6 Aug 2026 07:30:56 -0700
+Subject: [PATCH] fix(control): copy-on-select follows the profile
+
+CopyOnSelect() returned a hard false, so a ghostty pane ignored the setting
+while a cascadia pane in the same window honoured it. The value is only ever
+read back through LeftClickOnTerminal, so nothing else would have shown it up.
+
+The out-param it feeds was wrong for a second reason: cascadia sets it to mean
+"there is now a selection worth copying when the button comes up", not "copy on
+select is enabled". A single click clears the selection and sets it false; a
+double or triple click makes one and sets it true. A drag makes one too, and
+now says so from SetSelectionAnchor, which is where a drag's selection begins -
+the click that started the drag had nothing to copy yet.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BgDGqEqRBB8L5Ueoq1uuxy
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 21 +++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 37bb4820a..833f2e6a8 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -942,6 +942,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         _mouseTo(positionCore);
+         ghostty_surface_mouse_button(_surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+         _mouseDown = true;
++
++        // A drag is about to make a selection, and ControlInteractivity decides
++        // whether to copy it on release from this event - the click that began
++        // the drag had nothing to copy yet and said so.
++        UpdateSelectionMarkers.raise(*this, winrt::make<implementation::UpdateSelectionMarkersEventArgs>(false));
+     }
+ 
+     void GhosttyControlCore::SetEndSelectionPoint(const Core::Point positionCore)
+@@ -994,7 +999,15 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         }
+ 
+         _renderNow();
+-        selectionNeedsToBeCopied = CopyOnSelect();
++
++        // Cascadia's meaning, not "is copy-on-select on": the flag says whether
++        // there is now a selection worth copying when the button comes up. A
++        // single click cleared one, so there is nothing; a double or triple
++        // click just made one.
++        //
++        // A drag makes one too, and says so from SetSelectionAnchor - the
++        // release that would copy it comes long after this call.
++        selectionNeedsToBeCopied = numberOfClicks > 1;
+     }
+ 
+     bool GhosttyControlCore::HasSelection() const
+@@ -1153,7 +1166,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     // history surface are Phase 6 (interaction parity). Each returns the
+     // "nothing here" answer its caller already handles for an empty terminal,
+     // so the shell degrades to a pane you can type in rather than misbehaving.
+-    bool GhosttyControlCore::CopyOnSelect() const { return false; }
++    // The profile's setting, not a constant. Returning false here meant a
++    // ghostty pane silently ignored copyOnSelect while a cascadia pane in the
++    // same window honoured it - and the value is only ever read back out
++    // through LeftClickOnTerminal, so nothing else would have shown it up.
++    bool GhosttyControlCore::CopyOnSelect() const { return _settings && _settings.CopyOnSelect(); }
+     bool GhosttyControlCore::ToggleBlockSelection() { return false; }
+     void GhosttyControlCore::ToggleMarkMode() {}
+     Control::SelectionInteractionMode GhosttyControlCore::SelectionMode() const { return Control::SelectionInteractionMode::None; }

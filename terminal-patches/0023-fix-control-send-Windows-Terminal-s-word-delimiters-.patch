@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Wed, 5 Aug 2026 22:07:10 -0700
+Subject: [PATCH] fix(control): send Windows Terminal's word delimiters to
+ ghostty
+
+Double-clicking picked out different words in a ghostty pane and a cascadia
+one - WT's set includes `.`, ghostty's default does not.
+
+The setting was never the problem: wordDelimiters is global in WT, so both
+profiles already agreed on it. It simply never reached the engine, and
+ghostty fell back to its own default. The translator now forwards it to
+selection-word-chars, which despite the name is the same concept - the
+characters that end a word.
+
+Also fixes the two-presses-per-click bug that made an ordinary drag select by
+word: WT calls LeftClickOnTerminal on press and SetSelectionAnchor when the
+drag starts, and a press was being sent for both. Two presses at nearly the
+same place and time is a double click to ghostty, which is why character
+selection only worked when the timing happened to fall outside its
+double-click window. The press now belongs to whichever call arrives first,
+and LeftClickOnTerminal releases any stale drag so a fresh click starts a new
+selection rather than extending the old one.
+
+unitControl 49/49 -> 50/50.
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 22 ++++++++++++++++++-
+ .../GhosttySettingsTranslator.cpp             |  9 ++++++++
+ .../GhosttySettingsTests.cpp                  | 16 ++++++++++++++
+ 3 files changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 46a2155a0..96ece4277 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -863,13 +863,28 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         _mouseDown = false;
+     }
+ 
++    // Windows Terminal calls this *as well as* LeftClickOnTerminal for a single
++    // physical click: the click presses, and then the first drag movement
++    // anchors. Pressing again here made two presses land at nearly the same
++    // place and time, which is a double click to ghostty - so an ordinary drag
++    // selected by word, and only selected by character when the timing happened
++    // to fall outside ghostty's double-click window.
++    //
++    // So a press already in flight is left alone and this only moves. The press
++    // belongs to whichever of the two calls arrives first.
+     void GhosttyControlCore::SetSelectionAnchor(const Core::Point positionCore)
+     {
+         if (!_surface)
+         {
+             return;
+         }
+-        _releaseMouseIfHeld();
++
++        if (_mouseDown)
++        {
++            _mouseTo(positionCore);
++            return;
++        }
++
+         _mouseTo(positionCore);
+         ghostty_surface_mouse_button(_surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+         _mouseDown = true;
+@@ -893,6 +908,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+                                                  const bool /*isOnOriginalPosition*/,
+                                                  bool& selectionNeedsToBeCopied)
+     {
++        // A new physical click ends whatever drag ghostty still thinks is in
++        // progress. Without this the press below is swallowed as a move and the
++        // click extends the previous selection instead of starting one.
++        _releaseMouseIfHeld();
++
+         SetSelectionAnchor(terminalPositionCore);
+         _renderNow();
+         selectionNeedsToBeCopied = CopyOnSelect();
+diff --git a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+index 7383149bd..6e518c114 100644
+--- a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
++++ b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+@@ -60,6 +60,15 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             set(fmt::format("scrollback-limit-lines = {}", history));
+         }
+ 
++        // --- Selection ----------------------------------------------------
++        // WT's wordDelimiters is global, so both engines' panes already agree
++        // on it in the settings file - but ghostty never saw it and used its
++        // own default set, which is why a double click picked out different
++        // words in the two panes (WT's set includes `.`, ghostty's does not).
++        //
++        // Both are "the characters that end a word", despite ghostty's name.
++        setQuoted("selection-word-chars", settings.WordDelimiters());
++
+         // --- Padding ------------------------------------------------------
+         // WT already insets the SwapChainPanel by this same padding, so asking
+         // ghostty to pad as well would double it. Ours is therefore zero, and
+diff --git a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+index fb0b1206a..348c081f9 100644
+--- a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
++++ b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+@@ -36,6 +36,7 @@ namespace ControlUnitTests
+         TEST_METHOD(FiniteScrollbackIsForwarded);
+         TEST_METHOD(PaddingIsZeroBecauseWindowsTerminalAlreadyPads);
+         TEST_METHOD(SchemeProducesForegroundBackgroundAndFullPalette);
++        TEST_METHOD(WordDelimitersReachTheEngine);
+         TEST_METHOD(NullSettingsProduceNothing);
+ 
+     private:
+@@ -138,6 +139,21 @@ namespace ControlUnitTests
+         }
+     }
+ 
++    // A double click picked out different words in a ghostty pane and a
++    // cascadia one, because WT's wordDelimiters is global - both panes agree on
++    // it in the settings file - but ghostty never received it and fell back to
++    // its own default set. WT's includes `.`; ghostty's does not.
++    void GhosttySettingsTests::WordDelimitersReachTheEngine()
++    {
++        auto s = _settings();
++        s->WordDelimiters(L" ./-");
++
++        const auto entries = Control::implementation::TranslateGhosttySettings(*s);
++
++        VERIFY_IS_TRUE(_has(entries, "selection-word-chars = \" ./-\""),
++                       L"ghostty's word boundaries must come from WT's setting");
++    }
++
+     void GhosttySettingsTests::NullSettingsProduceNothing()
+     {
+         const Control::IControlSettings none{ nullptr };

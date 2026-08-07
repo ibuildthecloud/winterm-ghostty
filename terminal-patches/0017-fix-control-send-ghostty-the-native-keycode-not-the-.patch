@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Wed, 5 Aug 2026 15:14:55 -0700
+Subject: [PATCH] fix(control): send ghostty the native keycode, not the
+ virtual key
+
+TrySendKeyEvent assigned the Win32 virtual key to ghostty_input_key_s's
+keycode. That field is the *native* platform keycode: on Windows the scan
+code, 0xE000-prefixed for extended keys, resolved against ghostty's own table
+in src/input/keycodes.zig. A virtual key there lands on whatever unrelated
+key happens to share the number, so `d` (VK 0x44) arrived as a different key
+entirely and ate a character, and typing `cd` opened cmd's F9 prompt.
+
+The right value was already a parameter, discarded one line below by
+UNREFERENCED_PARAMETER(scanCode).
+
+Printable text mostly still worked because it arrives separately through
+SendCharEvent, so the damage read as occasional dropped or stray characters
+rather than as input being broken - which is why a `dir` typed by hand looked
+like it proved input worked.
+
+The key now carries its text and unshifted codepoint too, ported from the
+harness's winkeys.c, which got this right and left the reasoning next to it:
+control characters must NOT be forwarded as text, because ghostty's
+key_encode short circuits on a non-empty utf8 field and they would replace
+its own encoding of the key. The text has to be there, because TermControl
+treats a handled key as translated and suppresses the CharacterReceived event
+that would otherwise carry the character.
+
+Found by hand in a defterm handoff pane; confirmed fixed the same way.
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 86 ++++++++++++++++++-
+ 1 file changed, 82 insertions(+), 4 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index b97123998..36016d96a 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -609,6 +609,43 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+ #pragma region Input
+ 
++    // The text a key press produces, as UTF-8, or empty for keys that produce
++    // none. ToUnicode rather than waiting for the CharacterReceived event, so
++    // the text arrives *with* the key ghostty is given rather than as a
++    // separate message that would have to be correlated back to it.
++    //
++    // The 1<<2 flag is load-bearing: it tells ToUnicode not to modify
++    // kernel-side keyboard state. Without it, probing a dead key here consumes
++    // it and the next key silently loses its accent.
++    static std::string _keyText(const WORD vkey, const WORD scanCode, const BYTE* keyboard)
++    {
++        wchar_t buf[8]{};
++        const auto n = ToUnicode(vkey, scanCode, keyboard, buf, ARRAYSIZE(buf), 1 << 2);
++        if (n <= 0)
++        {
++            // 0 is "no translation"; negative is a dead key.
++            return {};
++        }
++
++        // Control characters are not text. Backspace, Tab, Enter, Escape and
++        // ctrl+letter all come back from ToUnicode as 0x01-0x1A/0x1B/0x7F, but
++        // they are keys whose terminal encoding ghostty owns and which depend
++        // on modes we know nothing about here (backspace-is-delete, the kitty
++        // keyboard protocol, application cursor keys). Forwarding them is
++        // destructive rather than redundant: ghostty's key_encode short
++        // circuits on a non-empty utf8 field, so a control character here
++        // would *replace* ghostty's own encoding of the key.
++        const std::wstring_view text{ buf, gsl::narrow_cast<size_t>(n) };
++        for (const auto c : text)
++        {
++            if (c < 0x20 || c == 0x7F)
++            {
++                return {};
++            }
++        }
++        return til::u16u8(text);
++    }
++
+     bool GhosttyControlCore::TrySendKeyEvent(const WORD vkey,
+                                              const WORD scanCode,
+                                              const ControlKeyStates modifiers,
+@@ -621,10 +658,22 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         ghostty_input_key_s ev{};
+         ev.action = keyDown ? GHOSTTY_ACTION_PRESS : GHOSTTY_ACTION_RELEASE;
+-        ev.keycode = vkey;
+-        ev.text = nullptr;
++
++        // ghostty's keycode is the *native* platform keycode, not a value from
++        // ghostty_input_key_e and not a virtual key. On Windows its table
++        // (src/input/keycodes.zig) stores the scan code, with 0xE000 set for
++        // the extended keys:
++        //
++        //     //   USB     evdev    XKB     Win     Mac   Code
++        //     .{ 0x070004, 0x001e, 0x0026, 0x001e, 0x0000, "KeyA" },
++        //     .{ 0x07004a, 0x0066, 0x006e, 0xe047, 0x0073, "Home" },
++        //
++        // Passing the virtual key here instead resolves to whatever unrelated
++        // key shares that number - which is why typing `d` used to arrive as a
++        // different key entirely and eat a character.
++        const auto extended = (modifiers.Value() & ENHANCED_KEY) != 0;
++        ev.keycode = extended ? (0xE000u | scanCode) : scanCode;
+         ev.composing = false;
+-        ev.unshifted_codepoint = 0;
+ 
+         auto mods = GHOSTTY_MODS_NONE;
+         if (modifiers.IsShiftPressed()) { mods = static_cast<ghostty_input_mods_e>(mods | GHOSTTY_MODS_SHIFT); }
+@@ -633,7 +682,36 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         ev.mods = mods;
+         ev.consumed_mods = GHOSTTY_MODS_NONE;
+ 
+-        UNREFERENCED_PARAMETER(scanCode);
++        // The text has to travel with the key. TermControl treats a handled
++        // key as "the terminal translated it" and suppresses the
++        // CharacterReceived event that would otherwise carry the character, so
++        // a key reported as handled with no text would swallow it.
++        std::string text;
++        std::string unshifted;
++        if (keyDown)
++        {
++            BYTE keyboard[256];
++            if (GetKeyboardState(keyboard))
++            {
++                text = _keyText(vkey, scanCode, keyboard);
++
++                // What key bindings match against, so it has to ignore Shift
++                // and the lock keys - otherwise ctrl+shift+c would fail to
++                // match a binding written against `c`.
++                BYTE plain[256];
++                memcpy(plain, keyboard, sizeof(plain));
++                plain[VK_SHIFT] = plain[VK_LSHIFT] = plain[VK_RSHIFT] = 0;
++                plain[VK_CONTROL] = plain[VK_LCONTROL] = plain[VK_RCONTROL] = 0;
++                plain[VK_MENU] = plain[VK_LMENU] = plain[VK_RMENU] = 0;
++                plain[VK_CAPITAL] = 0;
++                unshifted = _keyText(vkey, scanCode, plain);
++            }
++        }
++        ev.text = text.empty() ? nullptr : text.c_str();
++        ev.unshifted_codepoint = (!unshifted.empty() && gsl::narrow_cast<unsigned char>(unshifted[0]) < 0x80) ?
++                                     gsl::narrow_cast<uint32_t>(gsl::narrow_cast<unsigned char>(unshifted[0])) :
++                                     0;
++
+         return ghostty_surface_key(_surface, ev);
+     }
+ 

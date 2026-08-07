@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Wed, 5 Aug 2026 20:57:16 -0700
+Subject: [PATCH] fix(control): selection positions are DIPs, not physical
+ pixels
+
+_mouseTo multiplied cell coordinates by _cellSize, which is in physical
+pixels. libghostty applies the content scale to mouse positions itself, so
+every selection landed scale-times too far across the screen - invisible at
+100%, and roughly twice as far right as the pointer at 200%.
+
+Measured rather than reasoned. Driving the same sequence through
+harness/hwnd-host with GHOSTTY_HARNESS_SELECT asked for cells 2..4 and got
+5..8 back, and asked for 5..9 and got 11..14; with a 19px cell on a 200%
+display that is exactly one factor of the scale.
+
+Worth noting how close this came to shipping as "selection feels off": it
+would have been dismissed as imprecise dragging on the machine where it was
+found, and been perfect on any 100% monitor a reviewer used.
+---
+ .../TerminalControl/GhosttyControlCore.cpp      | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 2e73b270e..46a2155a0 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -4,7 +4,7 @@
+ #include "pch.h"
+ #include "GhosttyControlCore.h"
+ #include "GhosttySettingsTranslator.h"
+-#include "GhosttyKeyTranslator.h"
++#include "GhosttyKeyTranslator.h"
+ #include "GhosttyCopyFormat.h"
+ 
+ #include "GhosttyControlCore.g.cpp"
+@@ -829,8 +829,19 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         {
+             return;
+         }
+-        const auto x = (static_cast<double>(cell.X) + 0.5) * _cellSize.Width;
+-        const auto y = (static_cast<double>(cell.Y) + 0.5) * _cellSize.Height;
++        // DIPs, not physical pixels. libghostty applies the content scale to
++        // mouse positions itself, and _cellSize is in pixels - so multiplying
++        // cells by it directly lands scale-times too far across the screen.
++        // On a 100% display that is invisible; at 200% a selection starts
++        // roughly twice as far right as the pointer.
++        //
++        // Measured, not reasoned: driving this sequence in harness/hwnd-host
++        // with GHOSTTY_HARNESS_SELECT on a 200% monitor asked for cells 2..4
++        // and got 5..8 back, and asked for 5..9 and got 11..14.
++        const auto cellWidth = _cellSize.Width / _compositionScale;
++        const auto cellHeight = _cellSize.Height / _compositionScale;
++        const auto x = (static_cast<double>(cell.X) + 0.5) * cellWidth;
++        const auto y = (static_cast<double>(cell.Y) + 0.5) * cellHeight;
+         ghostty_surface_mouse_pos(_surface, x, y, GHOSTTY_MODS_NONE);
+     }
+ 

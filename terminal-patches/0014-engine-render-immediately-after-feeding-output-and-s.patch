@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Wed, 5 Aug 2026 11:48:16 -0700
+Subject: [PATCH] engine: render immediately after feeding output, and survive
+ detach
+
+Three fixes to the same failure - a ghostty pane that stops repainting:
+
+1. Force a *render*, not a draw. ghostty_surface_draw only re-presents
+   already-built cells, so forcing it after new output redrew stale
+   content and the pane still froze. ghostty_surface_render_now rebuilds
+   from terminal state first. Verified in the configuration that was
+   failing: an unfocused ghostty pane beside a focused cascadia pane now
+   renders a full 4796-entry listing.
+
+2. Detach no longer revokes the connection subscriptions. Tearing a tab
+   into its own window detaches the content and re-attaches it, so
+   revoking there severed the pty for the rest of the session. Cascadia
+   does not touch its connection in Detach either.
+
+3. AttachToNewControl re-captures the dispatcher. A torn-off tab lands on
+   a *different* UI thread, and every marshalled event - title,
+   scrollbar, swap chain - was being enqueued to the old window's
+   dispatcher. Cascadia does the same via _setupDispatcherAndCallbacks;
+   its Detach comment says why: "on a possibly new UI thread". It also
+   re-raises SwapChainChanged so the new control can bind the handle.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ee27Fih3vSPYsqrUBpUoc
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 38 +++++++++++++++----
+ 1 file changed, 30 insertions(+), 8 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index befe27c1e..beb100d56 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -214,14 +214,33 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // separate "begin painting" gate to open.
+     }
+ 
++    // Detach happens when the content outlives its control - tearing a tab out
++    // into its own window is the everyday case. The core keeps running the
++    // whole time.
++    //
++    // The connection subscriptions therefore stay: revoking them here silently
++    // severed the pty for the rest of the session, so a torn-off tab never
++    // showed another byte. Cascadia does not touch its connection here either.
++    //
++    // What must go is anything bound to the UI thread we are leaving. The new
++    // control may live on a *different* UI thread, and events marshalled to the
++    // old dispatcher would never arrive.
+     void GhosttyControlCore::Detach()
+     {
+-        _connectionOutputRevoker.revoke();
+-        _connectionStateRevoker.revoke();
++        _dispatcher = nullptr;
+     }
+ 
+     void GhosttyControlCore::AttachToNewControl()
+     {
++        // Re-capture the dispatcher on whichever UI thread we have landed on.
++        // Cascadia does the same via _setupDispatcherAndCallbacks, and its
++        // comment on Detach says why: "on a possibly new UI thread".
++        _dispatcher = winrt::Windows::System::DispatcherQueue::GetForCurrentThread();
++
++        // The new control binds the swap chain from this event's args, so a
++        // torn-off pane needs the current handle pushed at it.
++        _raiseSwapChainChanged();
++
+         Attached.raise(*this, nullptr);
+     }
+ 
+@@ -324,12 +343,15 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // Measured: 80 notifies produced fewer than 20 wakes, and drawFrame
+         // stopped being called entirely while the parser kept running.
+         //
+-        // ghostty_surface_draw is drawFrame(sync = true), which skips the
+-        // needs_redraw gate and is documented as safe to call from another
+-        // thread. It is what hwnd-host does on WM_PAINT - which is why the
+-        // harness never showed this and a XAML pane, having no paint pump,
+-        // always did.
+-        ghostty_surface_draw(_surface);
++        // It must be render_now rather than draw: ghostty_surface_draw only
++        // re-presents the cells the render thread last built, so forcing it
++        // after new output just redraws stale content - measured, the pane
++        // still froze. render_now rebuilds from terminal state first.
++        //
++        // A pane in a XAML SwapChainPanel has no paint loop, so nothing else
++        // ever forces this. hwnd-host does it on WM_PAINT, which is why three
++        // phases of harness work never surfaced the problem.
++        ghostty_surface_render_now(_surface);
+     }
+ 
+     void GhosttyControlCore::_connectionStateChangedHandler()

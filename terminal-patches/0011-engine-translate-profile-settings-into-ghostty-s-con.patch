@@ -1,0 +1,408 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 4 Aug 2026 22:49:33 -0700
+Subject: [PATCH] engine: translate profile settings into ghostty's config
+
+Wires PLAN's five MVP fields now that ghostty_config_set exists: font
+face and size, scrollback (WT counts lines; a negative historySize means
+infinite, which is ghostty's default, so it is left unset), the colour
+scheme including all 16 palette entries, and padding.
+
+Padding is set to zero deliberately. WT already insets the
+SwapChainPanel by the profile's padding, so asking ghostty to pad as well
+would double it - and until the colours matched, WT's padding was drawn
+in the profile's background while the pane was drawn in ghostty's,
+which is what made it look like a border round the terminal.
+
+Two things this needed that were not obvious:
+
+- A surface is born with the *app's* config. The first version built a
+  config, translated into it, and never applied it - a silent no-op, and
+  the pane came up correct in every respect except that it ignored every
+  setting. ghostty_surface_update_config is what applies it.
+
+- Parsing config entries overflows WT's 1 MB UI thread stack, the same
+  way bringing the engine up did. Rather than fix the one call site,
+  GhosttyEngine::RunWithEngineStack now exists so that anything touching
+  libghostty deeply runs where it has room, and the constraint has one
+  documented home instead of being rediscovered as a crash.
+
+Also adds OutputDebugString tracing of the entries applied, the cell
+size, the pushed surface size and connection resizes. A packaged app has
+no stdout, and every sizing bug in this phase was invisible from outside;
+these are what turned the last one from guesswork into arithmetic.
+
+Verified from the traces: font-family "Cascadia Mono", font-size 12,
+scrollback 9001, background #0c0c0c and the full Campbell palette all
+accepted, cellSize 14x28, surface 1682x840, grid 119x29.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ee27Fih3vSPYsqrUBpUoc
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 190 +++++++++++++++---
+ .../TerminalControl/GhosttyControlCore.h      |  11 +
+ .../TerminalControl/GhosttyEngine.cpp         |  34 ++++
+ src/cascadia/TerminalControl/GhosttyEngine.h  |  12 ++
+ 4 files changed, 223 insertions(+), 24 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 1933db2e9..e3d887d06 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -87,11 +87,6 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     {
+         _compositionScale = scale;
+ 
+-        auto config = _engine->NewConfig();
+-        THROW_HR_IF_NULL(E_FAIL, config);
+-        const auto freeConfig = wil::scope_exit([&]() { ghostty_config_free(config); });
+-        _applySettingsToConfig(config);
+-
+         auto surfaceConfig = ghostty_surface_config_new();
+         surfaceConfig.platform_tag = GHOSTTY_PLATFORM_WINDOWS;
+ 
+@@ -113,6 +108,8 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         _surface = ghostty_surface_new(_engine->App(), &surfaceConfig);
+         THROW_HR_IF_NULL_MSG(E_FAIL, _surface, "ghostty_surface_new failed");
+ 
++        _pushSettings();
++
+         ghostty_surface_set_content_scale(_surface, scale, scale);
+         SizeChanged(width, height);
+     }
+@@ -132,13 +129,83 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     // acrylic, background image, cursor and selection colours, bell style - is
+     // Phase 6 parity work and is left at ghostty's defaults on purpose, so a
+     // half-applied setting never looks like a translator bug.
+-    void GhosttyControlCore::_applySettingsToConfig(ghostty_config_t /*config*/) const
++    void GhosttyControlCore::_applySettingsToConfig(ghostty_config_t config) const
+     {
+-        // TODO(phase-5): ghostty_config_set_* has no C entry point yet - the
+-        // config is populated from strings/CLI today. Wiring the five fields
+-        // needs a small additive C API on the ghostty side, which is a patch of
+-        // its own rather than something to fake here. Until then a ghostty pane
+-        // renders with ghostty's defaults, which is visibly a working terminal.
++        if (!_settings)
++        {
++            return;
++        }
++
++        const auto set = [config](const std::string& entry) {
++            // A rejected entry is worth a log line but not a failed pane: the
++            // rest of the configuration is still worth applying.
++            if (!ghostty_config_set(config, entry.c_str()))
++            {
++                LOG_HR_MSG(E_INVALIDARG, "ghostty rejected config entry");
++                _trace(L"REJECTED %hs", entry.c_str());
++            }
++            else
++            {
++                _trace(L"set %hs", entry.c_str());
++            }
++        };
++
++        // Values may contain spaces (font families especially), and the entry
++        // syntax is the config file's, so they are quoted the way a file would.
++        const auto setQuoted = [&set](std::string_view key, std::wstring_view value) {
++            if (value.empty())
++            {
++                return;
++            }
++            set(fmt::format("{} = \"{}\"", key, til::u16u8(value)));
++        };
++
++        // --- Font ---------------------------------------------------------
++        setQuoted("font-family", _settings.FontFace());
++        if (const auto size = _settings.FontSize(); size > 0)
++        {
++            set(fmt::format("font-size = {}", size));
++        }
++
++        // --- Scrollback ---------------------------------------------------
++        // WT counts lines; ghostty's byte limit is separate and left alone.
++        // A negative HistorySize means "infinite" in WT, which is ghostty's
++        // default for the line limit, so it is simply not set.
++        if (const auto history = _settings.HistorySize(); history >= 0)
++        {
++            set(fmt::format("scrollback-limit-lines = {}", history));
++        }
++
++        // --- Padding ------------------------------------------------------
++        // WT already insets the SwapChainPanel by this same padding, so asking
++        // ghostty to pad as well would double it. Ours is therefore zero, and
++        // the pane's padding is whatever WT drew around us.
++        set("window-padding-x = 0");
++        set("window-padding-y = 0");
++        set("window-padding-balance = false");
++
++        // --- Colour scheme ------------------------------------------------
++        if (const auto scheme = _settings.try_as<Core::ICoreScheme>())
++        {
++            const auto hex = [](const Core::Color& c) {
++                return fmt::format("#{:02x}{:02x}{:02x}", c.R, c.G, c.B);
++            };
++
++            set(fmt::format("background = {}", hex(scheme.DefaultBackground())));
++            set(fmt::format("foreground = {}", hex(scheme.DefaultForeground())));
++            set(fmt::format("selection-background = {}", hex(scheme.SelectionBackground())));
++            set(fmt::format("cursor-color = {}", hex(scheme.CursorColor())));
++
++            // The 16 ANSI entries. ghostty takes them as `palette = N=#rrggbb`,
++            // one entry per line, which is why this is a loop rather than one
++            // string - the same shape a config file would have.
++            winrt::com_array<Core::Color> table;
++            scheme.GetColorTable(table);
++            for (uint32_t i = 0; i < table.size(); ++i)
++            {
++                set(fmt::format("palette = {}={}", i, hex(table[i])));
++            }
++        }
+     }
+ 
+     void GhosttyControlCore::EnablePainting()
+@@ -275,6 +342,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         {
+             return;
+         }
++        _trace(L"resizeConnection %ux%u cells", columns, rows);
+         _connection.Resize(rows, columns);
+     }
+     CATCH_LOG()
+@@ -323,6 +391,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             // a size the terminal is not using.
+             const auto width = static_cast<float>(action.action.cell_size.width);
+             const auto height = static_cast<float>(action.action.cell_size.height);
++            _trace(L"cellSize %.0fx%.0f px", width, height);
+             _raiseOnUiThread([this, width, height]() {
+                 _cellSize = { width, height };
+                 FontSizeChanged.raise(*this, winrt::make<implementation::FontSizeChangedArgs>(static_cast<int>(width), static_cast<int>(height)));
+@@ -447,36 +516,80 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+ #pragma region Size and font
+ 
++    // TermControl hands out the panel's size in DIPs, but ghostty_surface_set_size
++    // takes physical pixels - it is sizing the swap chain, not a layout box.
++    // Passing DIPs makes an undersized swap chain that the panel then upscales
++    // by the composition scale: glyphs come out magnified and soft, and the
++    // edges do not quite reach, which reads as a border around the terminal.
++    // Cascadia does the same multiply (ControlCore.cpp: _panelWidth * _compositionScale).
+     void GhosttyControlCore::SizeChanged(const float width, const float height)
++    {
++        _panelWidth = width;
++        _panelHeight = height;
++        _pushSize();
++    }
++
++    void GhosttyControlCore::ScaleChanged(const float scale)
++    {
++        _compositionScale = scale;
++        if (_surface)
++        {
++            ghostty_surface_set_content_scale(_surface, scale, scale);
++        }
++        _pushSize();
++    }
++
++    void GhosttyControlCore::SizeOrScaleChanged(const float width, const float height, const float scale)
++    {
++        _compositionScale = scale;
++        _panelWidth = width;
++        _panelHeight = height;
++        if (_surface)
++        {
++            ghostty_surface_set_content_scale(_surface, scale, scale);
++        }
++        _pushSize();
++    }
++
++    void GhosttyControlCore::_pushSize()
+     {
+         if (!_surface)
+         {
+             return;
+         }
+-        const auto w = static_cast<uint32_t>(std::max(0.0f, width));
+-        const auto h = static_cast<uint32_t>(std::max(0.0f, height));
++
++        const auto w = static_cast<uint32_t>(std::lrint(std::max(0.0f, _panelWidth) * _compositionScale));
++        const auto h = static_cast<uint32_t>(std::lrint(std::max(0.0f, _panelHeight) * _compositionScale));
++
++        // Windows sends 0x0 on minimize, and a swap chain cannot be resized to
++        // zero.
+         if (w == 0 || h == 0)
+         {
+             return;
+         }
++
++        _trace(L"pushSize panel=%.1fx%.1f dips scale=%.3f -> %ux%u px", _panelWidth, _panelHeight, _compositionScale, w, h);
+         ghostty_surface_set_size(_surface, w, h);
+     }
+ 
+-    void GhosttyControlCore::ScaleChanged(const float scale)
++    // Sizing and DPI bugs here are invisible from the outside - the pane just
++    // looks wrong - and a packaged app has no stdout. OutputDebugString costs
++    // nothing when no debugger is attached and shows up in cdb when one is.
++    void GhosttyControlCore::_trace(const wchar_t* format, ...)
+     {
+-        _compositionScale = scale;
+-        if (_surface)
++        wchar_t buf[512];
++        va_list args;
++        va_start(args, format);
++        const auto n = _vsnwprintf_s(buf, _TRUNCATE, format, args);
++        va_end(args);
++        if (n > 0)
+         {
+-            ghostty_surface_set_content_scale(_surface, scale, scale);
++            OutputDebugStringW(L"[ghostty] ");
++            OutputDebugStringW(buf);
++            OutputDebugStringW(L"\n");
+         }
+     }
+ 
+-    void GhosttyControlCore::SizeOrScaleChanged(const float width, const float height, const float scale)
+-    {
+-        ScaleChanged(scale);
+-        SizeChanged(width, height);
+-    }
+-
+     uint64_t GhosttyControlCore::SwapChainHandle() const
+     {
+         if (!_surface)
+@@ -634,7 +747,36 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     {
+         _settings = settings;
+         _unfocusedAppearance = newAppearance;
+-        // Applying them needs the config C API; see _applySettingsToConfig.
++
++        _pushSettings();
++    }
++
++    // Translate the profile into a ghostty_config_t and apply it to the
++    // surface. A surface is born with the *app's* config, so without the
++    // update call this is a silent no-op - the pane comes up correct in every
++    // respect except that it ignores every setting, which is exactly how the
++    // first version of this shipped.
++    //
++    // All of it runs on a large-stack thread: parsing config entries overflows
++    // WT's UI thread. See GhosttyEngine::RunWithEngineStack.
++    void GhosttyControlCore::_pushSettings()
++    {
++        if (!_surface || !_engine)
++        {
++            return;
++        }
++
++        GhosttyEngine::RunWithEngineStack([this]() {
++            const auto config = _engine->NewConfig();
++            if (!config)
++            {
++                return;
++            }
++            const auto freeConfig = wil::scope_exit([&]() { ghostty_config_free(config); });
++
++            _applySettingsToConfig(config);
++            ghostty_surface_update_config(_surface, config);
++        });
+     }
+ 
+     void GhosttyControlCore::ApplyAppearance(const bool /*focused*/) {}
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.h b/src/cascadia/TerminalControl/GhosttyControlCore.h
+index 955343863..fa1ed49d9 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.h
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.h
+@@ -236,8 +236,14 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         void _createSurface(const float width, const float height, const float scale);
+         void _destroySurface() noexcept;
+         void _applySettingsToConfig(ghostty_config_t config) const;
++        void _pushSettings();
+         void _connectionOutputHandler(const winrt::array_view<const char16_t>& data);
+         void _connectionStateChangedHandler();
++        // Sizing and DPI faults here are invisible from outside - the pane just
++        // looks wrong - and a packaged app has no stdout. Costs nothing without
++        // a debugger attached; shows up in cdb with one.
++        static void _trace(const wchar_t* format, ...);
++        void _pushSize();
+         void _raiseSwapChainChanged();
+         void _raiseOnUiThread(std::function<void()> action);
+ 
+@@ -276,6 +282,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // and its must not diverge, or a resize tells the child a size the
+         // terminal is not using.
+         winrt::Windows::Foundation::Size _cellSize{ 0, 0 };
++
++        // The panel's size in DIPs, as TermControl reports it, kept separately
++        // from the pixel size handed to libghostty - see _pushSize().
++        float _panelWidth{ 0 };
++        float _panelHeight{ 0 };
+         float _compositionScale{ 1.0f };
+ 
+         // Scroll state, from the SCROLLBAR action.
+diff --git a/src/cascadia/TerminalControl/GhosttyEngine.cpp b/src/cascadia/TerminalControl/GhosttyEngine.cpp
+index 9d44c419b..2d10dc1c2 100644
+--- a/src/cascadia/TerminalControl/GhosttyEngine.cpp
++++ b/src/cascadia/TerminalControl/GhosttyEngine.cpp
+@@ -141,6 +141,40 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         return config;
+     }
+ 
++    void GhosttyEngine::RunWithEngineStack(const std::function<void()>& work) noexcept
++    {
++        struct Payload
++        {
++            const std::function<void()>* work;
++        } payload{ &work };
++
++        wil::unique_handle thread{ CreateThread(
++            nullptr,
++            EngineThreadStackReserve,
++            [](LPVOID param) -> DWORD {
++                const auto p = static_cast<Payload*>(param);
++                try
++                {
++                    (*p->work)();
++                }
++                CATCH_LOG();
++                return 0;
++            },
++            &payload,
++            STACK_SIZE_PARAM_IS_A_RESERVATION,
++            nullptr) };
++
++        if (!thread)
++        {
++            LOG_LAST_ERROR_MSG("could not start a large-stack thread for libghostty");
++            return;
++        }
++
++        // Synchronous by design: the caller is mid-construction and the work
++        // must be done before it continues. `payload` lives until then.
++        WaitForSingleObject(thread.get(), INFINITE);
++    }
++
+     void GhosttyEngine::_tickLoop() noexcept
+     {
+         while (!_stopping.load(std::memory_order_acquire))
+diff --git a/src/cascadia/TerminalControl/GhosttyEngine.h b/src/cascadia/TerminalControl/GhosttyEngine.h
+index 1feb978a3..11c4db7cb 100644
+--- a/src/cascadia/TerminalControl/GhosttyEngine.h
++++ b/src/cascadia/TerminalControl/GhosttyEngine.h
+@@ -35,6 +35,18 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // must ghostty_config_free it.
+         ghostty_config_t NewConfig() const noexcept;
+ 
++        // Run work that touches libghostty deeply, on a thread with enough
++        // stack for it, and wait for it.
++        //
++        // libghostty needs far more stack than the 1 MB MSVC gives WT's UI
++        // thread - Config is an enormous struct and parsing an entry copies it
++        // around. Bringing the engine up overflowed the UI thread first; then
++        // so did applying a config to a surface. Rather than discover the next
++        // one as a crash, anything that parses or applies configuration goes
++        // through here. Pane creation and settings changes are rare enough that
++        // a thread per call costs nothing worth optimising.
++        static void RunWithEngineStack(const std::function<void()>& work) noexcept;
++
+         ~GhosttyEngine();
+ 
+     private:

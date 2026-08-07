@@ -1,0 +1,1740 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 4 Aug 2026 20:43:33 -0700
+Subject: [PATCH] engine: GhosttyControlCore, the second IControlCore
+ implementation
+
+Adds the ghostty engine behind "engine": "ghostty" (ADR 0001/0003/0006).
+GhosttyEngine brings libghostty up once per process and routes its
+actions back to whichever core owns the surface; GhosttyControlCore is
+the IControlCore/ICoreState implementation over one libghostty surface.
+
+WT keeps the pty. Output arrives on the connection's thread, converts
+UTF-16 -> UTF-8 through a per-pane til::u16state, and goes into
+ghostty_surface_write_pty_output; the terminal's input comes back through
+the engine's write callback into ITerminalConnection::WriteInput. The
+grid size reaches the child through resize_pty_cb -> Connection.Resize,
+so libghostty's cell arithmetic is the only authority for it.
+
+Rendering is libghostty's, into a DirectComposition swap chain bound to
+the same SwapChainPanel path cascadia uses (Phase 2's proof).
+
+Two integration bugs, both found by running it rather than reading it:
+
+- ghostty_init needs more stack than the 1 MB MSVC gives a main thread.
+  Calling it on the UI thread killed WindowsTerminal.exe with
+  STATUS_STACK_OVERFLOW before any pane appeared - the same failure the
+  Phase 0 harness hit, which is why that links /STACK:16MB. The engine
+  now bootstraps on its own thread with a 16 MB reserve, which keeps the
+  requirement in the engine that has it instead of raising WT's reserve.
+
+- TsfDataProvider::_getCore did get_self<ControlCore> unconditionally.
+  That is the seventh escape ADR 0001 scoped per-engine, and it does not
+  fail safe: the cast yields a NON-null garbage pointer, so the null
+  check below it never fired and the first ghostty pane died in
+  Renderer::GetRenderData. It now QIs for the ControlCore class
+  interface. That alone was not enough either - TSF's Implementation
+  dereferences the renderer the provider returns without a null check
+  (Implementation.cpp:197) - so TermControl no longer registers with TSF
+  at all when the engine cannot back it. A ghostty pane has no IME,
+  which is where DESIGN.md already puts it.
+
+Verified in the deployed dev package: WT launches on a ghostty profile
+and stays up, with OpenConsole.exe --headless --width 56 --height 18 and
+cmd.exe beneath it - a real ConPTY, sized through our resize path, with a
+live shell in it. NOT verified: that the pane renders pixels, or that
+typing reaches the shell. WGC cannot capture on this session and stealing
+foreground to synthesize keystrokes was not safe to do unattended, so
+both are left for the human evaluation step.
+
+Known incomplete: the settings translator is a no-op (ghostty_config_t
+has no C setter API yet, so a pane renders with ghostty's defaults), and
+mouse/selection/search/marks return their empty answers - Phase 6 scope.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ee27Fih3vSPYsqrUBpUoc
+---
+ doc/cascadia/profiles.schema.json             |   3 +-
+ .../TerminalControl/ControlInteractivity.cpp  |  15 +-
+ .../TerminalControl/ControlInteractivity.h    |   3 +-
+ .../TerminalControl/GhosttyControlCore.cpp    | 700 ++++++++++++++++++
+ .../TerminalControl/GhosttyControlCore.h      | 292 ++++++++
+ .../TerminalControl/GhosttyControlCore.idl    |  26 +
+ .../TerminalControl/GhosttyEngine.cpp         | 233 ++++++
+ src/cascadia/TerminalControl/GhosttyEngine.h  |  83 +++
+ .../TerminalControl/IControlSettings.idl      |   5 +-
+ src/cascadia/TerminalControl/TermControl.cpp  |  50 +-
+ src/cascadia/TerminalControl/TermControl.h    |   2 +
+ .../TerminalControlLib.vcxproj                |  10 +
+ .../dll/TerminalControl.vcxproj               |   2 +
+ src/cascadia/TerminalControl/libghostty.props |  47 ++
+ .../TerminalSettingsSerializationHelpers.h    |   5 +-
+ 15 files changed, 1462 insertions(+), 14 deletions(-)
+ create mode 100644 src/cascadia/TerminalControl/GhosttyControlCore.cpp
+ create mode 100644 src/cascadia/TerminalControl/GhosttyControlCore.h
+ create mode 100644 src/cascadia/TerminalControl/GhosttyControlCore.idl
+ create mode 100644 src/cascadia/TerminalControl/GhosttyEngine.cpp
+ create mode 100644 src/cascadia/TerminalControl/GhosttyEngine.h
+ create mode 100644 src/cascadia/TerminalControl/libghostty.props
+
+diff --git a/doc/cascadia/profiles.schema.json b/doc/cascadia/profiles.schema.json
+index 8ee130a92..c644af78c 100644
+--- a/doc/cascadia/profiles.schema.json
++++ b/doc/cascadia/profiles.schema.json
+@@ -2984,7 +2984,8 @@
+           "default": "cascadia",
+           "description": "Selects the terminal engine backing panes created from this profile. The engine is bound when the pane is created, so changing this takes effect on the next tab or pane rather than the current one. An unrecognized value falls back to \"cascadia\" with a warning.",
+           "enum": [
+-            "cascadia"
++            "cascadia",
++            "ghostty"
+           ],
+           "type": "string"
+         },
+diff --git a/src/cascadia/TerminalControl/ControlInteractivity.cpp b/src/cascadia/TerminalControl/ControlInteractivity.cpp
+index 1281556a6..88c51e30b 100644
+--- a/src/cascadia/TerminalControl/ControlInteractivity.cpp
++++ b/src/cascadia/TerminalControl/ControlInteractivity.cpp
+@@ -47,11 +47,20 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // creation, because engines are parallel towers sharing no mutable
+         // state - a live session cannot be transplanted between them.
+         //
+-        // Only cascadia exists today. An unrecognised "engine" value never
+-        // reaches this switch: it has already fallen back to the default and
+-        // raised SettingsLoadWarnings::UnknownEngine.
++        // An unrecognised "engine" value never reaches this switch: it has
++        // already fallen back to the default and raised
++        // SettingsLoadWarnings::UnknownEngine.
++        //
++        // A ghostty core that cannot bring libghostty up does not throw here -
++        // it fails from Initialize(), which is the path TermControl already
++        // handles, and the pane falls back to cascadia rather than the window
++        // failing to open.
+         switch (settings.Engine())
+         {
++        case Control::TerminalEngine::Ghostty:
++            _core = winrt::make<GhosttyControlCore>(settings, unfocusedAppearance, connection);
++            break;
++
+         case Control::TerminalEngine::Cascadia:
+         default:
+             _core = winrt::make<ControlCore>(settings, unfocusedAppearance, connection);
+diff --git a/src/cascadia/TerminalControl/ControlInteractivity.h b/src/cascadia/TerminalControl/ControlInteractivity.h
+index 8d8585212..d9c759745 100644
+--- a/src/cascadia/TerminalControl/ControlInteractivity.h
++++ b/src/cascadia/TerminalControl/ControlInteractivity.h
+@@ -20,7 +20,8 @@
+ #include "EventArgs.h"
+ #include "../buffer/out/search.h"
+ 
+-#include "ControlCore.h"
++#include "ControlCore.h"
++#include "GhosttyControlCore.h"
+ #include "../../renderer/uia/UiaRenderer.hpp"
+ 
+ namespace ControlUnitTests
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+new file mode 100644
+index 000000000..04a2cdfae
+--- /dev/null
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -0,0 +1,700 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++
++#include "pch.h"
++#include "GhosttyControlCore.h"
++
++#include "GhosttyControlCore.g.cpp"
++
++using namespace ::Microsoft::Terminal::Core;
++using namespace winrt::Windows::Foundation;
++using namespace winrt::Microsoft::Terminal::TerminalConnection;
++
++namespace winrt::Microsoft::Terminal::Control::implementation
++{
++    GhosttyControlCore::GhosttyControlCore(Control::IControlSettings settings,
++                                           Control::IControlAppearance unfocusedAppearance,
++                                           TerminalConnection::ITerminalConnection connection) :
++        _settings{ settings },
++        _unfocusedAppearance{ unfocusedAppearance }
++    {
++        // Captured on the thread that creates the pane, which is the UI thread.
++        // Actions arrive on libghostty's threads and the WinRT events they turn
++        // into are ones TermControl expects on the UI thread, so this is how
++        // they get back (the marshalling rows of the Phase 5 threading table).
++        _dispatcher = winrt::Windows::System::DispatcherQueue::GetForCurrentThread();
++
++        // Seed the title the way cascadia does: the profile's starting title
++        // stands until the child sets one with OSC 0/2. Without this a ghostty
++        // tab is nameless for as long as the shell stays quiet.
++        if (_settings)
++        {
++            _title = _settings.StartingTitle();
++        }
++
++        Connection(connection);
++    }
++
++    GhosttyControlCore::~GhosttyControlCore()
++    {
++        Close();
++    }
++
++    // The engine is resolved here rather than in the constructor so a failure
++    // has somewhere to be reported: Initialize returning false is the signal
++    // TermControl already understands, and ControlInteractivity turns it into
++    // the cascadia fallback.
++    bool GhosttyControlCore::Initialize(const float actualWidth,
++                                        const float actualHeight,
++                                        const float compositionScale)
++    try
++    {
++        if (_initializedTerminal)
++        {
++            return true;
++        }
++
++        _engine = GhosttyEngine::TryGet();
++        if (!_engine)
++        {
++            RendererEnteredErrorState.raise(*this, nullptr);
++            return false;
++        }
++
++        _createSurface(actualWidth, actualHeight, compositionScale);
++        if (!_surface)
++        {
++            RendererEnteredErrorState.raise(*this, nullptr);
++            return false;
++        }
++
++        _initializedTerminal = true;
++        return true;
++    }
++    catch (...)
++    {
++        LOG_CAUGHT_EXCEPTION();
++        RendererEnteredErrorState.raise(*this, nullptr);
++        return false;
++    }
++
++    void GhosttyControlCore::_createSurface(const float width, const float height, const float scale)
++    {
++        _compositionScale = scale;
++
++        auto config = _engine->NewConfig();
++        THROW_HR_IF_NULL(E_FAIL, config);
++        const auto freeConfig = wil::scope_exit([&]() { ghostty_config_free(config); });
++        _applySettingsToConfig(config);
++
++        auto surfaceConfig = ghostty_surface_config_new();
++        surfaceConfig.platform_tag = GHOSTTY_PLATFORM_WINDOWS;
++
++        // Composition mode: libghostty presents into a DirectComposition
++        // surface handle that we hand to the SwapChainPanel, which is the same
++        // binding cascadia's renderer uses. No HWND is involved - the pane is
++        // XAML, not a child window.
++        surfaceConfig.platform.windows.hwnd = nullptr;
++        surfaceConfig.platform.windows.composition = true;
++        surfaceConfig.platform.windows.shared_texture.enabled = false;
++
++        // WT owns the pty (ADR 0006). libghostty spawns nothing; bytes come in
++        // through write_pty_output and go out through the engine's callbacks.
++        surfaceConfig.io_backend = GHOSTTY_IO_BACKEND_EXTERNAL;
++
++        surfaceConfig.scale_factor = scale;
++        surfaceConfig.userdata = this;
++
++        _surface = ghostty_surface_new(_engine->App(), &surfaceConfig);
++        THROW_HR_IF_NULL_MSG(E_FAIL, _surface, "ghostty_surface_new failed");
++
++        ghostty_surface_set_content_scale(_surface, scale, scale);
++        SizeChanged(width, height);
++    }
++
++    void GhosttyControlCore::_destroySurface() noexcept
++    {
++        if (_surface)
++        {
++            ghostty_surface_free(_surface);
++            _surface = nullptr;
++        }
++    }
++
++    // Settings -> ghostty_config_t. The MVP scope is deliberately five fields
++    // (font, size, scheme, scrollback, padding): the ones without which a pane
++    // is visibly wrong rather than merely unstyled. Everything else - opacity,
++    // acrylic, background image, cursor and selection colours, bell style - is
++    // Phase 6 parity work and is left at ghostty's defaults on purpose, so a
++    // half-applied setting never looks like a translator bug.
++    void GhosttyControlCore::_applySettingsToConfig(ghostty_config_t /*config*/) const
++    {
++        // TODO(phase-5): ghostty_config_set_* has no C entry point yet - the
++        // config is populated from strings/CLI today. Wiring the five fields
++        // needs a small additive C API on the ghostty side, which is a patch of
++        // its own rather than something to fake here. Until then a ghostty pane
++        // renders with ghostty's defaults, which is visibly a working terminal.
++    }
++
++    void GhosttyControlCore::EnablePainting()
++    {
++        // libghostty's renderer thread starts with the surface; there is no
++        // separate "begin painting" gate to open.
++    }
++
++    void GhosttyControlCore::Detach()
++    {
++        _connectionOutputRevoker.revoke();
++        _connectionStateRevoker.revoke();
++    }
++
++    void GhosttyControlCore::AttachToNewControl()
++    {
++        Attached.raise(*this, nullptr);
++    }
++
++    void GhosttyControlCore::Close()
++    {
++        if (_closing)
++        {
++            return;
++        }
++        _closing = true;
++
++        _connectionOutputRevoker.revoke();
++        _connectionStateRevoker.revoke();
++
++        if (_connection)
++        {
++            _connection.Close();
++        }
++
++        // Free the surface before dropping the connection reference: the
++        // surface's threads can still be calling back into us until it is gone.
++        _destroySurface();
++    }
++
++    void GhosttyControlCore::RequestClose() noexcept
++    {
++        _raiseOnUiThread([this]() { CloseTerminalRequested.raise(*this, nullptr); });
++    }
++
++#pragma region Connection
++
++    TerminalConnection::ITerminalConnection GhosttyControlCore::Connection()
++    {
++        return _connection;
++    }
++
++    void GhosttyControlCore::Connection(const TerminalConnection::ITerminalConnection& connection)
++    {
++        _connectionOutputRevoker.revoke();
++        _connectionStateRevoker.revoke();
++
++        _connection = connection;
++        if (!_connection)
++        {
++            return;
++        }
++
++        _connectionOutputRevoker = _connection.TerminalOutput(winrt::auto_revoke, [this](const winrt::array_view<const char16_t>& data) {
++            _connectionOutputHandler(data);
++        });
++        _connectionStateRevoker = _connection.StateChanged(winrt::auto_revoke, [this](auto&&, auto&&) {
++            _connectionStateChangedHandler();
++        });
++    }
++
++    // Raised on the connection's own output thread, never the UI thread
++    // (ConptyConnection creates it with CreateThread). That matters: this call
++    // blocks until libghostty has parsed the bytes, and blocking here is
++    // exactly how backpressure reaches the child - the pipe fills and the child
++    // stalls on write.
++    //
++    // The contract that makes it safe: hold no WT-side lock across the call and
++    // do not wait on the dispatcher. libghostty's parse and render threads must
++    // never be able to block on something this thread holds.
++    void GhosttyControlCore::_connectionOutputHandler(const winrt::array_view<const char16_t>& data)
++    {
++        if (!_surface || _closing)
++        {
++            return;
++        }
++
++        const std::wstring_view wide{ reinterpret_cast<const wchar_t*>(data.data()), data.size() };
++
++        _utf8Scratch.clear();
++        if (FAILED(til::u16u8(wide, _utf8Scratch, _u16State)))
++        {
++            return;
++        }
++        if (_utf8Scratch.empty())
++        {
++            // A lone high surrogate: buffered in _u16State until its partner
++            // arrives in a later event.
++            return;
++        }
++
++        ghostty_surface_write_pty_output(_surface,
++                                         reinterpret_cast<const uint8_t*>(_utf8Scratch.data()),
++                                         _utf8Scratch.size());
++    }
++
++    void GhosttyControlCore::_connectionStateChangedHandler()
++    {
++        _raiseOnUiThread([this]() { ConnectionStateChanged.raise(*this, nullptr); });
++    }
++
++    // Bytes the terminal wants to send to the child, arriving on libghostty's
++    // io thread. WriteInput is thread-safe on ConptyConnection, so this goes
++    // straight through rather than hopping to the UI thread.
++    void GhosttyControlCore::WriteToConnection(std::string_view utf8) noexcept
++    try
++    {
++        if (!_connection || _closing || _readOnly)
++        {
++            return;
++        }
++
++        const auto wide = til::u8u16(utf8);
++        _connection.WriteInput(winrt::array_view<const char16_t>{
++            reinterpret_cast<const char16_t*>(wide.data()),
++            reinterpret_cast<const char16_t*>(wide.data() + wide.size()) });
++    }
++    CATCH_LOG()
++
++    void GhosttyControlCore::ResizeConnection(uint16_t columns, uint16_t rows) noexcept
++    try
++    {
++        if (!_connection || _closing)
++        {
++            return;
++        }
++        _connection.Resize(rows, columns);
++    }
++    CATCH_LOG()
++
++    TerminalConnection::ConnectionState GhosttyControlCore::ConnectionState() const
++    {
++        return _connection ? _connection.State() : TerminalConnection::ConnectionState::Closed;
++    }
++
++    void GhosttyControlCore::HardResetWithoutErase()
++    {
++        // Cascadia uses this to reset VT state without clearing the buffer on
++        // a connection restart. libghostty has no equivalent C entry point yet.
++    }
++
++#pragma endregion
++
++#pragma region Actions from libghostty
++
++    bool GhosttyControlCore::HandleAction(const ghostty_action_s& action) noexcept
++    try
++    {
++        switch (action.tag)
++        {
++        case GHOSTTY_ACTION_SET_TITLE:
++        {
++            const auto title = til::u8u16(std::string_view{ action.action.set_title.title });
++            _raiseOnUiThread([this, title = winrt::hstring{ title }]() {
++                _title = title;
++                TitleChanged.raise(*this, winrt::make<implementation::TitleChangedEventArgs>(title));
++            });
++            return true;
++        }
++
++        case GHOSTTY_ACTION_PWD:
++        {
++            const auto pwd = til::u8u16(std::string_view{ action.action.pwd.pwd });
++            _raiseOnUiThread([this, pwd = winrt::hstring{ pwd }]() { _workingDirectory = pwd; });
++            return true;
++        }
++
++        case GHOSTTY_ACTION_CELL_SIZE:
++        {
++            // libghostty's own arithmetic is the authority here; deriving cell
++            // metrics on our side would let the two disagree and tell the child
++            // a size the terminal is not using.
++            const auto width = static_cast<float>(action.action.cell_size.width);
++            const auto height = static_cast<float>(action.action.cell_size.height);
++            _raiseOnUiThread([this, width, height]() {
++                _cellSize = { width, height };
++                FontSizeChanged.raise(*this, winrt::make<implementation::FontSizeChangedArgs>(static_cast<int>(width), static_cast<int>(height)));
++            });
++            return true;
++        }
++
++        case GHOSTTY_ACTION_SCROLLBAR:
++        {
++            const auto total = static_cast<int32_t>(action.action.scrollbar.total);
++            const auto offset = static_cast<int32_t>(action.action.scrollbar.offset);
++            const auto len = static_cast<int32_t>(action.action.scrollbar.len);
++            _raiseOnUiThread([this, total, offset, len]() {
++                _bufferHeight = total;
++                _scrollOffset = offset;
++                _viewHeight = len;
++                ScrollPositionChanged.raise(*this, winrt::make<implementation::ScrollPositionChangedArgs>(offset, len, total));
++            });
++            return true;
++        }
++
++        case GHOSTTY_ACTION_SWAP_CHAIN_CHANGED:
++        {
++            // Device loss produced a new handle; the panel's binding is stale.
++            // This is a UI-thread event in IControlCore, and getting it wrong
++            // shows as a frozen pane rather than an error.
++            _raiseOnUiThread([this]() { SwapChainChanged.raise(*this, nullptr); });
++            return true;
++        }
++
++        case GHOSTTY_ACTION_RING_BELL:
++        {
++            _raiseOnUiThread([this]() { WarningBell.raise(*this, nullptr); });
++            return true;
++        }
++
++        case GHOSTTY_ACTION_PROGRESS_REPORT:
++        {
++            const auto state = static_cast<size_t>(action.action.progress_report.state);
++            const auto progress = static_cast<size_t>(action.action.progress_report.progress);
++            _raiseOnUiThread([this, state, progress]() {
++                _taskbarState = state;
++                _taskbarProgress = progress;
++                TaskbarProgressChanged.raise(*this, nullptr);
++            });
++            return true;
++        }
++
++        case GHOSTTY_ACTION_COLOR_CHANGE:
++        {
++            const auto kind = action.action.color_change.kind;
++            const til::color color{ action.action.color_change.r, action.action.color_change.g, action.action.color_change.b };
++            _raiseOnUiThread([this, kind, color]() {
++                if (kind == GHOSTTY_ACTION_COLOR_KIND_BACKGROUND)
++                {
++                    BackgroundColorChanged.raise(*this, nullptr);
++                }
++                TabColorChanged.raise(*this, nullptr);
++            });
++            return true;
++        }
++
++        case GHOSTTY_ACTION_RENDERER_HEALTH:
++        {
++            if (action.action.renderer_health != GHOSTTY_RENDERER_HEALTH_HEALTHY)
++            {
++                _raiseOnUiThread([this]() { RendererEnteredErrorState.raise(*this, nullptr); });
++            }
++            return true;
++        }
++
++        // Tab and split creation belong to WT's own keybindings, which sit
++        // above the interface. Reporting these unhandled is correct, not a gap.
++        case GHOSTTY_ACTION_NEW_TAB:
++        case GHOSTTY_ACTION_NEW_SPLIT:
++        case GHOSTTY_ACTION_NEW_WINDOW:
++        default:
++            return false;
++        }
++    }
++    catch (...)
++    {
++        LOG_CAUGHT_EXCEPTION();
++        return false;
++    }
++
++    // Events that IControlCore documents as UI-thread must arrive there. If we
++    // are already on it, run inline so ordering with the caller is preserved.
++    void GhosttyControlCore::_raiseOnUiThread(std::function<void()> action)
++    {
++        if (!_dispatcher || _dispatcher.HasThreadAccess())
++        {
++            action();
++            return;
++        }
++
++        _dispatcher.TryEnqueue([action = std::move(action)]() { action(); });
++    }
++
++#pragma endregion
++
++#pragma region Size and font
++
++    void GhosttyControlCore::SizeChanged(const float width, const float height)
++    {
++        if (!_surface)
++        {
++            return;
++        }
++        const auto w = static_cast<uint32_t>(std::max(0.0f, width));
++        const auto h = static_cast<uint32_t>(std::max(0.0f, height));
++        if (w == 0 || h == 0)
++        {
++            return;
++        }
++        ghostty_surface_set_size(_surface, w, h);
++    }
++
++    void GhosttyControlCore::ScaleChanged(const float scale)
++    {
++        _compositionScale = scale;
++        if (_surface)
++        {
++            ghostty_surface_set_content_scale(_surface, scale, scale);
++        }
++    }
++
++    void GhosttyControlCore::SizeOrScaleChanged(const float width, const float height, const float scale)
++    {
++        ScaleChanged(scale);
++        SizeChanged(width, height);
++    }
++
++    uint64_t GhosttyControlCore::SwapChainHandle() const
++    {
++        if (!_surface)
++        {
++            return 0;
++        }
++        return reinterpret_cast<uint64_t>(ghostty_surface_get_swap_chain_handle(_surface));
++    }
++
++    winrt::Windows::Foundation::Size GhosttyControlCore::FontSize() const noexcept
++    {
++        return _cellSize;
++    }
++
++    winrt::Windows::Foundation::Size GhosttyControlCore::FontSizeInDips() const
++    {
++        return { _cellSize.Width / _compositionScale, _cellSize.Height / _compositionScale };
++    }
++
++    uint16_t GhosttyControlCore::FontWeight() const noexcept
++    {
++        return static_cast<uint16_t>(400);
++    }
++
++    void GhosttyControlCore::AdjustFontSize(float /*fontSizeDelta*/)
++    {
++        // Needs the config C API; see _applySettingsToConfig.
++    }
++
++    void GhosttyControlCore::ResetFontSize()
++    {
++    }
++
++#pragma endregion
++
++#pragma region Input
++
++    bool GhosttyControlCore::TrySendKeyEvent(const WORD vkey,
++                                             const WORD scanCode,
++                                             const ControlKeyStates modifiers,
++                                             const bool keyDown)
++    {
++        if (!_surface || _readOnly)
++        {
++            return false;
++        }
++
++        ghostty_input_key_s ev{};
++        ev.action = keyDown ? GHOSTTY_ACTION_PRESS : GHOSTTY_ACTION_RELEASE;
++        ev.keycode = vkey;
++        ev.text = nullptr;
++        ev.composing = false;
++        ev.unshifted_codepoint = 0;
++
++        auto mods = GHOSTTY_MODS_NONE;
++        if (modifiers.IsShiftPressed()) { mods = static_cast<ghostty_input_mods_e>(mods | GHOSTTY_MODS_SHIFT); }
++        if (modifiers.IsCtrlPressed()) { mods = static_cast<ghostty_input_mods_e>(mods | GHOSTTY_MODS_CTRL); }
++        if (modifiers.IsAltPressed()) { mods = static_cast<ghostty_input_mods_e>(mods | GHOSTTY_MODS_ALT); }
++        ev.mods = mods;
++        ev.consumed_mods = GHOSTTY_MODS_NONE;
++
++        UNREFERENCED_PARAMETER(scanCode);
++        return ghostty_surface_key(_surface, ev);
++    }
++
++    bool GhosttyControlCore::SendCharEvent(const wchar_t ch, const WORD /*scanCode*/, const ControlKeyStates /*modifiers*/)
++    {
++        if (!_surface || _readOnly)
++        {
++            return false;
++        }
++
++        const wchar_t buf[2]{ ch, L'\0' };
++        const auto utf8 = til::u16u8(std::wstring_view{ buf, 1 });
++        ghostty_surface_text(_surface, utf8.data(), utf8.size());
++        return true;
++    }
++
++    void GhosttyControlCore::SendInput(std::wstring_view wstr)
++    {
++        if (!_surface || _readOnly || wstr.empty())
++        {
++            return;
++        }
++        const auto utf8 = til::u16u8(wstr);
++        ghostty_surface_text(_surface, utf8.data(), utf8.size());
++    }
++
++    void GhosttyControlCore::PasteText(const winrt::hstring& hstr)
++    {
++        SendInput(hstr);
++    }
++
++    void GhosttyControlCore::GotFocus()
++    {
++        _focused = true;
++        if (_surface)
++        {
++            ghostty_surface_set_focus(_surface, true);
++        }
++    }
++
++    void GhosttyControlCore::LostFocus()
++    {
++        _focused = false;
++        if (_surface)
++        {
++            ghostty_surface_set_focus(_surface, false);
++        }
++    }
++
++    bool GhosttyControlCore::SendMouseEvent(const Core::Point /*viewportPosCore*/,
++                                            const uint32_t /*uiButton*/,
++                                            const ControlKeyStates /*states*/,
++                                            const int16_t /*wheelDelta*/,
++                                            const Control::MouseButtonState /*state*/)
++    {
++        // Mouse reporting is Phase 6 (selection and interaction parity). The
++        // pane is fully usable from the keyboard before then; returning false
++        // means "not handled", which is honest rather than silently swallowing.
++        return false;
++    }
++
++    void GhosttyControlCore::UserScrollViewport(const int32_t /*viewTop*/)
++    {
++    }
++
++#pragma endregion
++
++#pragma region ICoreState and stubs
++
++    hstring GhosttyControlCore::Title() { return _title; }
++    hstring GhosttyControlCore::WorkingDirectory() const { return _workingDirectory; }
++    const size_t GhosttyControlCore::TaskbarState() const noexcept { return _taskbarState; }
++    const size_t GhosttyControlCore::TaskbarProgress() const noexcept { return _taskbarProgress; }
++
++    IReference<winrt::Windows::UI::Color> GhosttyControlCore::TabColor() noexcept
++    {
++        return _tabColor ? IReference<winrt::Windows::UI::Color>{ static_cast<winrt::Windows::UI::Color>(*_tabColor) } : nullptr;
++    }
++
++    int GhosttyControlCore::ScrollOffset() { return _scrollOffset; }
++    int GhosttyControlCore::ViewHeight() const { return _viewHeight; }
++    int GhosttyControlCore::BufferHeight() const { return _bufferHeight; }
++
++    uint64_t GhosttyControlCore::OwningHwnd() { return _owningHwnd; }
++    void GhosttyControlCore::OwningHwnd(uint64_t owner) { _owningHwnd = owner; }
++
++    Control::IControlSettings GhosttyControlCore::Settings() { return _settings; }
++    Control::IControlAppearance GhosttyControlCore::FocusedAppearance() const { return _settings.try_as<Control::IControlAppearance>(); }
++    Control::IControlAppearance GhosttyControlCore::UnfocusedAppearance() const { return _unfocusedAppearance; }
++    bool GhosttyControlCore::HasUnfocusedAppearance() const { return _unfocusedAppearance != nullptr; }
++
++    void GhosttyControlCore::UpdateSettings(const Control::IControlSettings& settings, const IControlAppearance& newAppearance)
++    {
++        _settings = settings;
++        _unfocusedAppearance = newAppearance;
++        // Applying them needs the config C API; see _applySettingsToConfig.
++    }
++
++    void GhosttyControlCore::ApplyAppearance(const bool /*focused*/) {}
++    void GhosttyControlCore::SetHighContrastMode(const bool /*enabled*/) {}
++    void GhosttyControlCore::ApplyPreviewColorScheme(const Core::ICoreScheme&) {}
++    void GhosttyControlCore::ResetPreviewColorScheme() {}
++    void GhosttyControlCore::SetOverrideColorScheme(const Core::ICoreScheme&) {}
++
++    til::color GhosttyControlCore::ForegroundColor() const { return til::color{ 0xFF, 0xFF, 0xFF }; }
++    til::color GhosttyControlCore::BackgroundColor() const { return til::color{ 0x28, 0x2C, 0x34 }; }
++
++    float GhosttyControlCore::Opacity() const noexcept { return 1.0f; }
++    bool GhosttyControlCore::UseAcrylic() const noexcept { return false; }
++    void GhosttyControlCore::AdjustOpacity(const float /*opacity*/, const bool /*relative*/) {}
++    void GhosttyControlCore::ToggleShaderEffects() {}
++    void GhosttyControlCore::ResumeRendering() {}
++    void GhosttyControlCore::WindowVisibilityChanged(const bool /*showOrHide*/) {}
++
++    bool GhosttyControlCore::IsInReadOnlyMode() const { return _readOnly; }
++    void GhosttyControlCore::ToggleReadOnlyMode() { _readOnly = !_readOnly; }
++    void GhosttyControlCore::SetReadOnlyMode(const bool readOnlyState) { _readOnly = readOnlyState; }
++
++    // Selection, search, marks, clipboard read-back and the quick-fix/command
++    // history surface are Phase 6 (interaction parity). Each returns the
++    // "nothing here" answer its caller already handles for an empty terminal,
++    // so the shell degrades to a pane you can type in rather than misbehaving.
++    bool GhosttyControlCore::HasSelection() const { return false; }
++    bool GhosttyControlCore::HasMultiLineSelection() const { return false; }
++    winrt::hstring GhosttyControlCore::SelectedText(bool /*trimTrailingWhitespace*/) const { return {}; }
++    bool GhosttyControlCore::CopyOnSelect() const { return false; }
++    bool GhosttyControlCore::CopySelectionToClipboard(bool /*singleLine*/, bool /*withControlSequences*/, const CopyFormat /*formats*/) { return false; }
++    void GhosttyControlCore::SelectAll() {}
++    void GhosttyControlCore::ClearSelection() {}
++    bool GhosttyControlCore::ToggleBlockSelection() { return false; }
++    void GhosttyControlCore::ToggleMarkMode() {}
++    Control::SelectionInteractionMode GhosttyControlCore::SelectionMode() const { return Control::SelectionInteractionMode::None; }
++    bool GhosttyControlCore::SwitchSelectionEndpoint() { return false; }
++    bool GhosttyControlCore::ExpandSelectionToWord() { return false; }
++    bool GhosttyControlCore::TryMarkModeKeybinding(const WORD /*vkey*/, const ControlKeyStates /*modifiers*/) { return false; }
++    Control::SelectionData GhosttyControlCore::SelectionInfo() const { return {}; }
++    void GhosttyControlCore::SetSelectionAnchor(const Core::Point /*positionCore*/) {}
++    void GhosttyControlCore::SetEndSelectionPoint(const Core::Point /*positionCore*/) {}
++    void GhosttyControlCore::AnchorContextMenu(const Core::Point /*position*/) {}
++    void GhosttyControlCore::LeftClickOnTerminal(const Core::Point /*terminalPositionCore*/, const int32_t /*numberOfClicks*/, const bool /*altEnabled*/, const bool /*shiftEnabled*/, const bool /*isOnOriginalPosition*/, bool& selectionNeedsToBeCopied) { selectionNeedsToBeCopied = false; }
++
++    SearchResults GhosttyControlCore::Search(const SearchRequest& /*request*/) { return {}; }
++    Windows::Foundation::Collections::IVector<int32_t> GhosttyControlCore::SearchResultRows() const { return winrt::single_threaded_vector<int32_t>(); }
++    bool GhosttyControlCore::IsBufferRowInViewport(int32_t bufferRow) const { return bufferRow >= _scrollOffset && bufferRow < _scrollOffset + _viewHeight; }
++    void GhosttyControlCore::ClearSearch() {}
++
++    Windows::Foundation::Collections::IVector<Control::ScrollMark> GhosttyControlCore::ScrollMarks() const { return winrt::single_threaded_vector<Control::ScrollMark>(); }
++    void GhosttyControlCore::AddMark(const Control::ScrollMark& /*mark*/) {}
++    void GhosttyControlCore::ClearMark() {}
++    void GhosttyControlCore::ClearAllMarks() {}
++    void GhosttyControlCore::ScrollToMark(const Control::ScrollToMarkDirection& /*direction*/) {}
++    void GhosttyControlCore::SelectCommand(const bool /*goUp*/) {}
++    void GhosttyControlCore::SelectOutput(const bool /*goUp*/) {}
++    void GhosttyControlCore::ContextMenuSelectCommand() {}
++    void GhosttyControlCore::ContextMenuSelectOutput() {}
++    bool GhosttyControlCore::ShouldShowSelectCommand() { return false; }
++    bool GhosttyControlCore::ShouldShowSelectOutput() { return false; }
++
++    void GhosttyControlCore::SetHoveredCell(Core::Point /*terminalPosition*/) {}
++    void GhosttyControlCore::ClearHoveredCell() {}
++    winrt::hstring GhosttyControlCore::GetHyperlink(const Core::Point /*position*/) const { return {}; }
++    winrt::hstring GhosttyControlCore::HoveredUriText() const { return {}; }
++    IReference<Core::Point> GhosttyControlCore::HoveredCell() const { return nullptr; }
++
++    bool GhosttyControlCore::IsVtMouseModeEnabled() const { return false; }
++    bool GhosttyControlCore::ShouldSendAlternateScroll(const uint32_t /*uiButton*/, const int32_t /*delta*/) const { return false; }
++    Core::Point GhosttyControlCore::CursorPosition() const { return {}; }
++    bool GhosttyControlCore::ForceCursorVisible() const noexcept { return false; }
++    void GhosttyControlCore::ForceCursorVisible(bool /*force*/) {}
++
++    bool GhosttyControlCore::BracketedPasteEnabled() const noexcept { return false; }
++    void GhosttyControlCore::ClearBuffer(Control::ClearBufferType /*clearType*/) {}
++    hstring GhosttyControlCore::ReadEntireBuffer() const { return {}; }
++    Control::CommandHistoryContext GhosttyControlCore::CommandHistory() const { return nullptr; }
++    bool GhosttyControlCore::QuickFixesAvailable() const noexcept { return false; }
++    void GhosttyControlCore::UpdateQuickFixes(const Windows::Foundation::Collections::IVector<hstring>& /*quickFixes*/) {}
++    void GhosttyControlCore::ClearQuickFix() {}
++    void GhosttyControlCore::ColorSelection(const Control::SelectionColor& /*fg*/, const Control::SelectionColor& /*bg*/, Core::MatchMode /*matchMode*/) {}
++    void GhosttyControlCore::PersistTo(int64_t /*handle*/) const {}
++    void GhosttyControlCore::RestoreFromPath(const hstring& /*path*/) const {}
++    void GhosttyControlCore::PreviewInput(const hstring& /*input*/) {}
++    void GhosttyControlCore::OpenCWD() {}
++
++#pragma endregion
++}
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.h b/src/cascadia/TerminalControl/GhosttyControlCore.h
+new file mode 100644
+index 000000000..091d23313
+--- /dev/null
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.h
+@@ -0,0 +1,292 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++//
++// Module Name:
++// - GhosttyControlCore.h
++//
++// Abstract:
++// - IControlCore over libghostty (ADR 0001, ADR 0003). This is the second
++//   engine; ControlCore is the first. Everything above the interface -
++//   TermControl, tabs, panes, settings - is unaware of which one it holds.
++//
++// - Ownership runs the other way round from ControlCore. WT keeps the
++//   connection and therefore the pty (ADR 0006): output bytes arrive on the
++//   connection's thread and go into libghostty through
++//   ghostty_surface_write_pty_output, and the terminal's input comes back out
++//   through the engine's write callback into ITerminalConnection::WriteInput.
++//   libghostty spawns nothing.
++//
++// - Rendering is libghostty's, on its own thread, into a DirectComposition
++//   swap chain we hand to the same XAML SwapChainPanel path cascadia uses
++//   (proven in Phase 2). We never touch its pixels.
++
++#pragma once
++
++#include "GhosttyControlCore.g.h"
++#include "GhosttyEngine.h"
++#include "EventArgs.h"
++
++// For ::Microsoft::Terminal::Core::ControlKeyStates, which several IControlCore
++// members take. We want none of TerminalCore's engine, only that type - but it
++// is the header that declares it, and cascadia's core pulls it in the same way.
++#include "../../cascadia/TerminalCore/ControlKeyStates.hpp"
++
++#include <til/u8u16convert.h>
++
++namespace winrt::Microsoft::Terminal::Control::implementation
++{
++    struct GhosttyControlCore : GhosttyControlCoreT<GhosttyControlCore>
++    {
++    public:
++        GhosttyControlCore(Control::IControlSettings settings,
++                           Control::IControlAppearance unfocusedAppearance,
++                           TerminalConnection::ITerminalConnection connection);
++        ~GhosttyControlCore();
++
++        bool Initialize(const float actualWidth, const float actualHeight, const float compositionScale);
++        void EnablePainting();
++        void Detach();
++        void AttachToNewControl();
++        void Close();
++
++        void UpdateSettings(const Control::IControlSettings& settings, const IControlAppearance& newAppearance);
++        void ApplyAppearance(const bool focused);
++        void SetHighContrastMode(const bool enabled);
++        Control::IControlSettings Settings();
++        Control::IControlAppearance FocusedAppearance() const;
++        Control::IControlAppearance UnfocusedAppearance() const;
++        bool HasUnfocusedAppearance() const;
++
++        void ApplyPreviewColorScheme(const Core::ICoreScheme&);
++        void ResetPreviewColorScheme();
++        void SetOverrideColorScheme(const Core::ICoreScheme&);
++
++        uint64_t SwapChainHandle() const;
++
++        void SizeChanged(const float width, const float height);
++        void ScaleChanged(const float scale);
++        void SizeOrScaleChanged(const float width, const float height, const float scale);
++
++        void AdjustFontSize(float fontSizeDelta);
++        void ResetFontSize();
++        winrt::Windows::Foundation::Size FontSizeInDips() const;
++        winrt::Windows::Foundation::Size FontSize() const noexcept;
++        uint16_t FontWeight() const noexcept;
++
++        til::color ForegroundColor() const;
++        til::color BackgroundColor() const;
++
++        void SendInput(std::wstring_view wstr);
++        void PasteText(const winrt::hstring& hstr);
++        bool CopySelectionToClipboard(bool singleLine, bool withControlSequences, const CopyFormat formats);
++        void SelectAll();
++        void ClearSelection();
++        bool ToggleBlockSelection();
++        void ToggleMarkMode();
++        Control::SelectionInteractionMode SelectionMode() const;
++        bool SwitchSelectionEndpoint();
++        bool ExpandSelectionToWord();
++        bool TryMarkModeKeybinding(const WORD vkey, const ::Microsoft::Terminal::Core::ControlKeyStates modifiers);
++
++        void GotFocus();
++        void LostFocus();
++
++        void ToggleShaderEffects();
++        void AdjustOpacity(const float opacity, const bool relative);
++        void ResumeRendering();
++
++        void SetHoveredCell(Core::Point terminalPosition);
++        void ClearHoveredCell();
++        winrt::hstring GetHyperlink(const Core::Point position) const;
++        winrt::hstring HoveredUriText() const;
++        Windows::Foundation::IReference<Core::Point> HoveredCell() const;
++
++        void ColorSelection(const Control::SelectionColor& fg, const Control::SelectionColor& bg, Core::MatchMode matchMode);
++
++        void PersistTo(int64_t handle) const;
++        void RestoreFromPath(const hstring& path) const;
++        void ClearQuickFix();
++        void OpenCWD();
++
++#pragma region ICoreState
++        const size_t TaskbarState() const noexcept;
++        const size_t TaskbarProgress() const noexcept;
++
++        hstring Title();
++        Windows::Foundation::IReference<winrt::Windows::UI::Color> TabColor() noexcept;
++        hstring WorkingDirectory() const;
++
++        TerminalConnection::ConnectionState ConnectionState() const;
++
++        int ScrollOffset();
++        int ViewHeight() const;
++        int BufferHeight() const;
++
++        bool HasSelection() const;
++        bool HasMultiLineSelection() const;
++        winrt::hstring SelectedText(bool trimTrailingWhitespace) const;
++
++        bool BracketedPasteEnabled() const noexcept;
++
++        Windows::Foundation::Collections::IVector<Control::ScrollMark> ScrollMarks() const;
++        void AddMark(const Control::ScrollMark& mark);
++        void ClearMark();
++        void ClearAllMarks();
++        void ScrollToMark(const Control::ScrollToMarkDirection& direction);
++
++        void SelectCommand(const bool goUp);
++        void SelectOutput(const bool goUp);
++
++        void ContextMenuSelectCommand();
++        void ContextMenuSelectOutput();
++#pragma endregion
++
++#pragma region ITerminalInput
++        bool TrySendKeyEvent(const WORD vkey, const WORD scanCode, const ::Microsoft::Terminal::Core::ControlKeyStates modifiers, const bool keyDown);
++        bool SendCharEvent(const wchar_t ch, const WORD scanCode, const ::Microsoft::Terminal::Core::ControlKeyStates modifiers);
++        bool SendMouseEvent(const Core::Point viewportPosCore, const uint32_t uiButton, const ::Microsoft::Terminal::Core::ControlKeyStates states, const int16_t wheelDelta, const Control::MouseButtonState state);
++        void UserScrollViewport(const int32_t viewTop);
++        void ClearBuffer(Control::ClearBufferType clearType);
++#pragma endregion
++
++        bool IsVtMouseModeEnabled() const;
++        bool ShouldSendAlternateScroll(const uint32_t uiButton, const int32_t delta) const;
++        Core::Point CursorPosition() const;
++        bool ForceCursorVisible() const noexcept;
++        void ForceCursorVisible(bool force);
++
++        bool CopyOnSelect() const;
++        Control::SelectionData SelectionInfo() const;
++        void SetSelectionAnchor(const Core::Point positionCore);
++        void SetEndSelectionPoint(const Core::Point positionCore);
++        void AnchorContextMenu(const Core::Point viewportRelativeCharacterPositionCore);
++
++        SearchResults Search(const SearchRequest& request);
++        Windows::Foundation::Collections::IVector<int32_t> SearchResultRows() const;
++        bool IsBufferRowInViewport(int32_t bufferRow) const;
++        void ClearSearch();
++
++        void LeftClickOnTerminal(const Core::Point terminalPositionCore, const int32_t numberOfClicks, const bool altEnabled, const bool shiftEnabled, const bool isOnOriginalPosition, bool& selectionNeedsToBeCopied);
++
++        bool IsInReadOnlyMode() const;
++        void ToggleReadOnlyMode();
++        void SetReadOnlyMode(const bool readOnlyState);
++
++        hstring ReadEntireBuffer() const;
++        Control::CommandHistoryContext CommandHistory() const;
++        bool QuickFixesAvailable() const noexcept;
++        void UpdateQuickFixes(const Windows::Foundation::Collections::IVector<hstring>& quickFixes);
++
++        void WindowVisibilityChanged(const bool showOrHide);
++
++        uint64_t OwningHwnd();
++        void OwningHwnd(uint64_t owner);
++
++        TerminalConnection::ITerminalConnection Connection();
++        void Connection(const TerminalConnection::ITerminalConnection& connection);
++        void HardResetWithoutErase();
++
++        bool ShouldShowSelectCommand();
++        bool ShouldShowSelectOutput();
++
++        void PreviewInput(const hstring& input);
++
++        float Opacity() const noexcept;
++        bool UseAcrylic() const noexcept;
++
++        // ------------------------- Engine-side entry points -------------------------
++        // Called by GhosttyEngine's runtime callbacks, on libghostty's threads.
++        bool HandleAction(const ghostty_action_s& action) noexcept;
++        void WriteToConnection(std::string_view utf8) noexcept;
++        void ResizeConnection(uint16_t columns, uint16_t rows) noexcept;
++        void RequestClose() noexcept;
++
++        // -------------------------------- WinRT Events ---------------------------------
++        // clang-format off
++        til::typed_event<IInspectable, Control::FontSizeChangedArgs> FontSizeChanged;
++        til::typed_event<IInspectable, Control::TitleChangedEventArgs> TitleChanged;
++        til::typed_event<IInspectable, Control::WriteToClipboardEventArgs> WriteToClipboard;
++        til::typed_event<> WarningBell;
++        til::typed_event<> TabColorChanged;
++        til::typed_event<> BackgroundColorChanged;
++        til::typed_event<IInspectable, Control::ScrollPositionChangedArgs> ScrollPositionChanged;
++        til::typed_event<> TaskbarProgressChanged;
++        til::typed_event<> ConnectionStateChanged;
++        til::typed_event<> HoveredHyperlinkChanged;
++        til::typed_event<IInspectable, IInspectable> RendererEnteredErrorState;
++        til::typed_event<> SwapChainChanged;
++        til::typed_event<IInspectable, Control::RendererWarningArgs> RendererWarning;
++        til::typed_event<IInspectable, Control::NoticeEventArgs> RaiseNotice;
++        til::typed_event<IInspectable, Control::TransparencyChangedEventArgs> TransparencyChanged;
++        til::typed_event<> OutputIdle;
++        til::typed_event<IInspectable, Control::ShowWindowArgs> ShowWindowChanged;
++        til::typed_event<IInspectable, Control::UpdateSelectionMarkersEventArgs> UpdateSelectionMarkers;
++        til::typed_event<IInspectable, Control::OpenHyperlinkEventArgs> OpenHyperlink;
++        til::typed_event<IInspectable, Control::CompletionsChangedEventArgs> CompletionsChanged;
++        til::typed_event<IInspectable, Control::SearchMissingCommandEventArgs> SearchMissingCommand;
++        til::typed_event<IInspectable, Control::ShowNotificationEventArgs> ShowNotification;
++        til::typed_event<> RefreshQuickFixUI;
++        til::typed_event<IInspectable, Control::WindowSizeChangedEventArgs> WindowSizeChanged;
++        til::typed_event<> CloseTerminalRequested;
++        til::typed_event<> RestartTerminalRequested;
++        til::typed_event<> Attached;
++        // clang-format on
++
++    private:
++        void _createSurface(const float width, const float height, const float scale);
++        void _destroySurface() noexcept;
++        void _applySettingsToConfig(ghostty_config_t config) const;
++        void _connectionOutputHandler(const winrt::array_view<const char16_t>& data);
++        void _connectionStateChangedHandler();
++        void _raiseOnUiThread(std::function<void()> action);
++
++        Control::IControlSettings _settings{ nullptr };
++        Control::IControlAppearance _unfocusedAppearance{ nullptr };
++        TerminalConnection::ITerminalConnection _connection{ nullptr };
++        TerminalConnection::ITerminalConnection::TerminalOutput_revoker _connectionOutputRevoker;
++        TerminalConnection::ITerminalConnection::StateChanged_revoker _connectionStateRevoker;
++
++        GhosttyEngine* _engine{ nullptr };
++        ghostty_surface_t _surface{ nullptr };
++
++        // The UTF-16 -> UTF-8 boundary. ITerminalConnection deals in UTF-16 and
++        // ghostty parses bytes, and a surrogate pair may be split across two
++        // TerminalOutput events - so this holds the partial across calls. WT
++        // already ships the state machine; we just keep one per pane.
++        // (With ConptyConnection a split pair should never arrive, because its
++        // own til::u8state only ever emits whole codepoints. AzureConnection
++        // makes no such promise, and this costs nothing.)
++        ::til::u16state _u16State;
++        std::string _utf8Scratch;
++
++        winrt::hstring _title;
++        winrt::hstring _workingDirectory;
++        std::optional<til::color> _tabColor;
++        uint64_t _owningHwnd{ 0 };
++        size_t _taskbarState{ 0 };
++        size_t _taskbarProgress{ 0 };
++        bool _initializedTerminal{ false };
++        bool _closing{ false };
++        bool _readOnly{ false };
++        bool _focused{ false };
++
++        // Cell metrics as libghostty last reported them, in pixels. The
++        // CELL_SIZE action is the only authority for these: our own arithmetic
++        // and its must not diverge, or a resize tells the child a size the
++        // terminal is not using.
++        winrt::Windows::Foundation::Size _cellSize{ 0, 0 };
++        float _compositionScale{ 1.0f };
++
++        // Scroll state, from the SCROLLBAR action.
++        int32_t _scrollOffset{ 0 };
++        int32_t _viewHeight{ 0 };
++        int32_t _bufferHeight{ 0 };
++
++        winrt::Windows::System::DispatcherQueue _dispatcher{ nullptr };
++    };
++}
++
++namespace winrt::Microsoft::Terminal::Control::factory_implementation
++{
++    BASIC_FACTORY(GhosttyControlCore);
++}
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.idl b/src/cascadia/TerminalControl/GhosttyControlCore.idl
+new file mode 100644
+index 000000000..995dbd65f
+--- /dev/null
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.idl
+@@ -0,0 +1,26 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++
++import "IControlCore.idl";
++import "ICoreState.idl";
++import "IControlSettings.idl";
++
++namespace Microsoft.Terminal.Control
++{
++    // The ghostty engine: implementation #2 of IControlCore (ADR 0001).
++    //
++    // Everything the shell needs is on IControlCore, so this class body holds
++    // only the constructor - the same shape as ControlCore, and for the same
++    // MIDL reason (a runtimeclass that is constructed needs a default
++    // interface, which [default_interface] supplies).
++    //
++    // The engine is chosen per profile and bound at pane creation by the
++    // factory in ControlInteractivity (ADR 0007); nothing above that layer
++    // knows which implementation it is talking to.
++    [default_interface] runtimeclass GhosttyControlCore : IControlCore, ICoreState
++    {
++        GhosttyControlCore(IControlSettings settings,
++                           IControlAppearance unfocusedAppearance,
++                           Microsoft.Terminal.TerminalConnection.ITerminalConnection connection);
++    };
++}
+diff --git a/src/cascadia/TerminalControl/GhosttyEngine.cpp b/src/cascadia/TerminalControl/GhosttyEngine.cpp
+new file mode 100644
+index 000000000..9d44c419b
+--- /dev/null
++++ b/src/cascadia/TerminalControl/GhosttyEngine.cpp
+@@ -0,0 +1,233 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++
++#include "pch.h"
++#include "GhosttyEngine.h"
++#include "GhosttyControlCore.h"
++
++namespace winrt::Microsoft::Terminal::Control::implementation
++{
++    GhosttyEngine* GhosttyEngine::TryGet() noexcept
++    {
++        // Deliberately leaked: libghostty's app owns threads that outlive any
++        // sensible teardown point in a process that is exiting anyway, and
++        // running its destructor during static destruction would race them.
++        static GhosttyEngine* engine = []() -> GhosttyEngine* {
++            // Private ctor, so no make_unique.
++            std::unique_ptr<GhosttyEngine> candidate{ new GhosttyEngine{} };
++            if (!candidate->_initialize())
++            {
++                return nullptr;
++            }
++            return candidate.release();
++        }();
++
++        return engine;
++    }
++
++    // Starts the engine thread and waits for it to report whether libghostty
++    // came up. The bootstrap runs *there*, not here, because it needs far more
++    // stack than the calling (UI) thread has - see EngineThreadStackReserve.
++    bool GhosttyEngine::_initialize() noexcept
++    try
++    {
++        _wakeupEvent.create(wil::EventOptions::ManualReset);
++        _readyEvent.create(wil::EventOptions::ManualReset);
++
++        _tickThread.reset(CreateThread(
++            nullptr,
++            EngineThreadStackReserve,
++            [](LPVOID param) -> DWORD {
++                static_cast<GhosttyEngine*>(param)->_threadMain();
++                return 0;
++            },
++            this,
++            STACK_SIZE_PARAM_IS_A_RESERVATION,
++            nullptr));
++        RETURN_LAST_ERROR_IF_NULL_MSG(_tickThread.get(), "ghostty engine thread");
++
++        _readyEvent.wait();
++        return _bootstrapped;
++    }
++    CATCH_RETURN_FALSE()
++
++    void GhosttyEngine::_threadMain() noexcept
++    {
++        _bootstrapped = _bootstrap();
++        _readyEvent.SetEvent();
++
++        if (_bootstrapped)
++        {
++            _tickLoop();
++        }
++    }
++
++    bool GhosttyEngine::_bootstrap() noexcept
++    try
++    {
++        // ghostty_init_w takes the WTF-16 command line rather than argv - see
++        // the init-wtf16 patch. It parses ghostty's own CLI flags out of it,
++        // which for us is a no-op: WT's command line means nothing to ghostty
++        // and any unrecognised argument is ignored rather than fatal.
++        const auto commandLine = GetCommandLineW();
++        if (ghostty_init_w(wcslen(commandLine), reinterpret_cast<const uint16_t*>(commandLine)) != 0)
++        {
++            LOG_HR_MSG(E_FAIL, "ghostty_init_w failed");
++            return false;
++        }
++
++        ghostty_runtime_config_s runtime{};
++        runtime.userdata = this;
++        runtime.supports_selection_clipboard = false;
++        runtime.wakeup_cb = &GhosttyEngine::_wakeup;
++        runtime.action_cb = &GhosttyEngine::_action;
++        runtime.read_clipboard_cb = &GhosttyEngine::_readClipboard;
++        runtime.confirm_read_clipboard_cb = &GhosttyEngine::_confirmReadClipboard;
++        runtime.write_clipboard_cb = &GhosttyEngine::_writeClipboard;
++        runtime.close_surface_cb = &GhosttyEngine::_closeSurface;
++        runtime.write_pty_cb = &GhosttyEngine::_writePty;
++        runtime.resize_pty_cb = &GhosttyEngine::_resizePty;
++
++        const auto config = NewConfig();
++        if (!config)
++        {
++            return false;
++        }
++        // The app takes its own copy, so ours goes back immediately.
++        const auto freeConfig = wil::scope_exit([&]() { ghostty_config_free(config); });
++
++        _app = ghostty_app_new(&runtime, config);
++        if (!_app)
++        {
++            LOG_HR_MSG(E_FAIL, "ghostty_app_new failed");
++            return false;
++        }
++
++        return true;
++    }
++    CATCH_RETURN_FALSE()
++
++    GhosttyEngine::~GhosttyEngine()
++    {
++        _stopping.store(true, std::memory_order_release);
++        if (_wakeupEvent)
++        {
++            _wakeupEvent.SetEvent();
++        }
++        if (_tickThread)
++        {
++            WaitForSingleObject(_tickThread.get(), 2000);
++        }
++        if (_app)
++        {
++            ghostty_app_free(_app);
++        }
++    }
++
++    ghostty_config_t GhosttyEngine::NewConfig() const noexcept
++    {
++        const auto config = ghostty_config_new();
++        if (!config)
++        {
++            LOG_HR_MSG(E_FAIL, "ghostty_config_new failed");
++            return nullptr;
++        }
++
++        // Deliberately NOT ghostty_config_load_default_files: a pane's
++        // configuration comes from the WT profile, and silently mixing in
++        // ~/.config/ghostty would make two settings systems fight over the
++        // same pane. The translator in GhosttyControlCore is the only source.
++        ghostty_config_finalize(config);
++        return config;
++    }
++
++    void GhosttyEngine::_tickLoop() noexcept
++    {
++        while (!_stopping.load(std::memory_order_acquire))
++        {
++            WaitForSingleObject(_wakeupEvent.get(), INFINITE);
++            _wakeupEvent.ResetEvent();
++            if (_stopping.load(std::memory_order_acquire))
++            {
++                break;
++            }
++            ghostty_app_tick(_app);
++        }
++    }
++
++    void GhosttyEngine::_wakeup(void* userdata) noexcept
++    {
++        // Called from libghostty's own threads. Signalling an event is all we
++        // may safely do here; the tick happens on our thread.
++        if (const auto self = static_cast<GhosttyEngine*>(userdata))
++        {
++            self->_wakeupEvent.SetEvent();
++        }
++    }
++
++    GhosttyControlCore* GhosttyEngine::_coreFor(ghostty_target_s target) noexcept
++    {
++        if (target.tag != GHOSTTY_TARGET_SURFACE || !target.target.surface)
++        {
++            return nullptr;
++        }
++        return static_cast<GhosttyControlCore*>(ghostty_surface_userdata(target.target.surface));
++    }
++
++    bool GhosttyEngine::_action(ghostty_app_t /*app*/, ghostty_target_s target, ghostty_action_s action) noexcept
++    {
++        const auto core = _coreFor(target);
++        if (!core)
++        {
++            // App-targeted actions (quit, new window, global keybinds) belong to
++            // WT's own command layer, not to us. Reporting them unhandled is
++            // how libghostty learns the embedder did not act.
++            return false;
++        }
++
++        return core->HandleAction(action);
++    }
++
++    bool GhosttyEngine::_readClipboard(void* /*userdata*/, ghostty_clipboard_e /*loc*/, void* /*state*/) noexcept
++    {
++        // Paste is driven from WT's side (ControlInteractivity raises
++        // PasteFromClipboard and calls PasteText), so libghostty never needs to
++        // pull. Returning false means "no clipboard content available".
++        return false;
++    }
++
++    void GhosttyEngine::_confirmReadClipboard(void* /*userdata*/, const char* /*str*/, void* /*state*/, ghostty_clipboard_request_e /*req*/) noexcept
++    {
++    }
++
++    void GhosttyEngine::_writeClipboard(void* userdata, ghostty_clipboard_e /*loc*/, const ghostty_clipboard_content_s* /*content*/, size_t /*len*/, bool /*confirm*/) noexcept
++    {
++        // OSC 52. Phase 6 wires this to WriteToClipboard; until then a clipboard
++        // write from inside the terminal is dropped rather than half-applied.
++        UNREFERENCED_PARAMETER(userdata);
++    }
++
++    void GhosttyEngine::_closeSurface(void* userdata, bool /*processAlive*/) noexcept
++    {
++        if (const auto core = static_cast<GhosttyControlCore*>(userdata))
++        {
++            core->RequestClose();
++        }
++    }
++
++    void GhosttyEngine::_writePty(void* userdata, const uint8_t* data, size_t len) noexcept
++    {
++        if (const auto core = static_cast<GhosttyControlCore*>(userdata))
++        {
++            core->WriteToConnection({ reinterpret_cast<const char*>(data), len });
++        }
++    }
++
++    void GhosttyEngine::_resizePty(void* userdata, uint16_t columns, uint16_t rows) noexcept
++    {
++        if (const auto core = static_cast<GhosttyControlCore*>(userdata))
++        {
++            core->ResizeConnection(columns, rows);
++        }
++    }
++}
+diff --git a/src/cascadia/TerminalControl/GhosttyEngine.h b/src/cascadia/TerminalControl/GhosttyEngine.h
+new file mode 100644
+index 000000000..1feb978a3
+--- /dev/null
++++ b/src/cascadia/TerminalControl/GhosttyEngine.h
+@@ -0,0 +1,83 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++//
++// Module Name:
++// - GhosttyEngine.h
++//
++// Abstract:
++// - Process-wide libghostty bootstrap: one ghostty_init, one ghostty_app_t, and
++//   the runtime callbacks that route libghostty's actions back to whichever
++//   GhosttyControlCore owns the surface that raised them.
++//
++//   There is exactly one of these per process because ghostty_init sets up
++//   global state (logging, allocators, the config search path) and an app owns
++//   the mailbox that surfaces post to. Surfaces are per-pane; the app is not.
++
++#pragma once
++
++#include <ghostty.h>
++
++namespace winrt::Microsoft::Terminal::Control::implementation
++{
++    struct GhosttyControlCore;
++
++    class GhosttyEngine
++    {
++    public:
++        // Returns null if libghostty could not be brought up, rather than
++        // throwing: a missing or broken engine DLL must degrade to the cascadia
++        // engine, not take the window down. The reason is logged once.
++        static GhosttyEngine* TryGet() noexcept;
++
++        ghostty_app_t App() const noexcept { return _app; }
++
++        // A fresh config, pre-loaded with our defaults. The caller owns it and
++        // must ghostty_config_free it.
++        ghostty_config_t NewConfig() const noexcept;
++
++        ~GhosttyEngine();
++
++    private:
++        GhosttyEngine() = default;
++        bool _initialize() noexcept;
++
++        // libghostty wakes us from its own threads; ghostty_app_tick has to run
++        // on one consistent thread, so it gets a dedicated one rather than
++        // borrowing the UI thread (which would tie engine liveness to XAML
++        // being pumped, and stall ticks behind layout).
++        //
++        // That thread is also where the engine is *brought up*, and it is
++        // reserved 16 MB of stack to do it. ghostty_init overflows the 1 MB
++        // MSVC gives a main thread - measured, twice: the Phase 0 harness hit
++        // the same STATUS_STACK_OVERFLOW and links itself with /STACK:16MB.
++        // Zig-built code is written against Zig's 16 MiB default, so this is
++        // the outlier being accommodated, not a leak. Doing it here rather than
++        // raising WindowsTerminal.exe's own reserve keeps the requirement where
++        // it belongs - in the engine that has it.
++        static constexpr SIZE_T EngineThreadStackReserve = 16 * 1024 * 1024;
++
++        void _threadMain() noexcept;
++        bool _bootstrap() noexcept;
++        void _tickLoop() noexcept;
++
++        ghostty_app_t _app{ nullptr };
++        wil::unique_event _wakeupEvent;
++        wil::unique_event _readyEvent;
++        wil::unique_handle _tickThread;
++        std::atomic<bool> _stopping{ false };
++        bool _bootstrapped{ false };
++
++        // Resolves the surface that raised an action back to its core. Returns
++        // null for app-targeted actions and for surfaces we no longer own.
++        static GhosttyControlCore* _coreFor(ghostty_target_s target) noexcept;
++
++        static void _wakeup(void* userdata) noexcept;
++        static bool _action(ghostty_app_t app, ghostty_target_s target, ghostty_action_s action) noexcept;
++        static bool _readClipboard(void* userdata, ghostty_clipboard_e loc, void* state) noexcept;
++        static void _confirmReadClipboard(void* userdata, const char* str, void* state, ghostty_clipboard_request_e req) noexcept;
++        static void _writeClipboard(void* userdata, ghostty_clipboard_e loc, const ghostty_clipboard_content_s* content, size_t len, bool confirm) noexcept;
++        static void _closeSurface(void* userdata, bool processAlive) noexcept;
++        static void _writePty(void* userdata, const uint8_t* data, size_t len) noexcept;
++        static void _resizePty(void* userdata, uint16_t columns, uint16_t rows) noexcept;
++    };
++}
+diff --git a/src/cascadia/TerminalControl/IControlSettings.idl b/src/cascadia/TerminalControl/IControlSettings.idl
+index 09b4e7d1c..3988c0efe 100644
+--- a/src/cascadia/TerminalControl/IControlSettings.idl
++++ b/src/cascadia/TerminalControl/IControlSettings.idl
+@@ -1,4 +1,4 @@
+-﻿// Copyright (c) Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ 
+ import "IControlAppearance.idl";
+@@ -30,7 +30,8 @@ namespace Microsoft.Terminal.Control
+     // until the second engine is real.
+     enum TerminalEngine
+     {
+-        Cascadia = 0
++        Cascadia = 0,
++        Ghostty = 1
+     };
+ 
+     enum PathTranslationStyle
+diff --git a/src/cascadia/TerminalControl/TermControl.cpp b/src/cascadia/TerminalControl/TermControl.cpp
+index 843fc6069..222d24b8a 100644
+--- a/src/cascadia/TerminalControl/TermControl.cpp
++++ b/src/cascadia/TerminalControl/TermControl.cpp
+@@ -1,4 +1,4 @@
+-﻿// Copyright (c) Microsoft Corporation.
++// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ 
+ #include "pch.h"
+@@ -251,9 +251,40 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         return core->GetRenderer();
+     }
+ 
++    // TSF is cascadia-only. It reaches through to WT's own Renderer, which is
++    // precisely the coupling ADR 0001 scopes per-engine - so this asks whether
++    // the core really is the cascadia one instead of assuming it.
++    //
++    // The QI is for the ControlCore *class* interface, not IControlCore: every
++    // engine implements the latter, so testing for it would succeed for all of
++    // them and hand the wrong type to get_self. That is not hypothetical - this
++    // function used to cast unconditionally, and the first ghostty pane died in
++    // Renderer::GetRenderData off the resulting garbage pointer, with the null
++    // check below never firing because the cast produced a non-null one.
++    //
++    // Returning null degrades a ghostty pane to "no IME", which is where
++    // DESIGN.md already puts it until the preedit path is reimplemented per
++    // engine.
++    // Whether this control's engine can back TSF at all.
++    //
++    // TSF is cascadia-only: its Implementation dereferences the renderer the
++    // data provider hands out (Implementation.cpp:197) without a null check, so
++    // a provider that has no renderer to give cannot merely return null - the
++    // control must not register with TSF in the first place. A ghostty pane
++    // therefore has no IME, which is where DESIGN.md already puts it until the
++    // preedit path is reimplemented per engine.
++    bool TermControl::_tsfSupported() const noexcept
++    {
++        return _core.try_as<Control::ControlCore>() != nullptr;
++    }
++
+     ControlCore* TsfDataProvider::_getCore() const noexcept
+     {
+-        return get_self<ControlCore>(_termControl->_core);
++        if (const auto cascadia{ _termControl->_core.try_as<Control::ControlCore>() })
++        {
++            return get_self<ControlCore>(cascadia);
++        }
++        return nullptr;
+     }
+ 
+     static Windows::UI::ViewManagement::AccessibilitySettings& _GetAccessibilitySettings()
+@@ -2404,7 +2435,10 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             UpdateAppearance(_core.FocusedAppearance());
+         }
+ 
+-        GetTSFHandle().Focus(&_tsfDataProvider);
++        if (_tsfSupported())
++        {
++            GetTSFHandle().Focus(&_tsfDataProvider);
++        }
+     }
+ 
+     // Method Description:
+@@ -2437,7 +2471,10 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             UpdateAppearance(_core.UnfocusedAppearance());
+         }
+ 
+-        GetTSFHandle().Unfocus(&_tsfDataProvider);
++        if (_tsfSupported())
++        {
++            GetTSFHandle().Unfocus(&_tsfDataProvider);
++        }
+     }
+ 
+     // Method Description:
+@@ -2669,7 +2706,10 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             // This is absolutely crucial, as the TSF code tries to hold a strong reference to _tsfDataProvider,
+             // but right now _tsfDataProvider implements IUnknown as a no-op. This ensures that TSF stops referencing us.
+             // ~TermControl() calls Close() so this should be safe.
+-            GetTSFHandle().Unfocus(&_tsfDataProvider);
++            if (_tsfSupported())
++            {
++                GetTSFHandle().Unfocus(&_tsfDataProvider);
++            }
+ 
+             if (!_detached)
+             {
+diff --git a/src/cascadia/TerminalControl/TermControl.h b/src/cascadia/TerminalControl/TermControl.h
+index 50857e396..5b8595838 100644
+--- a/src/cascadia/TerminalControl/TermControl.h
++++ b/src/cascadia/TerminalControl/TermControl.h
+@@ -253,6 +253,8 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         Control::IControlCore _core{ nullptr };
+         Control::IKeyBindings _keyBindings{ nullptr };
+         TsfDataProvider _tsfDataProvider{ this };
++        // Whether this control's engine can back TSF. See the definition.
++        bool _tsfSupported() const noexcept;
+         winrt::com_ptr<SearchBoxControl> _searchBox;
+ 
+         enum class AltNumpadEncoding
+diff --git a/src/cascadia/TerminalControl/TerminalControlLib.vcxproj b/src/cascadia/TerminalControl/TerminalControlLib.vcxproj
+index d43265b8b..73aa29cce 100644
+--- a/src/cascadia/TerminalControl/TerminalControlLib.vcxproj
++++ b/src/cascadia/TerminalControl/TerminalControlLib.vcxproj
+@@ -27,9 +27,14 @@
+   <Import Project="..\..\..\common.openconsole.props" Condition="'$(OpenConsoleDir)'==''" />
+   <Import Project="$(OpenConsoleDir)src\common.nugetversions.props" />
+   <Import Project="$(OpenConsoleDir)src\cppwinrt.build.pre.props" />
++  <Import Project="libghostty.props" />
+   <!-- ========================= Headers ======================== -->
+   <ItemGroup>
+     <ClInclude Include="pch.h" />
++    <ClInclude Include="GhosttyEngine.h" />
++    <ClInclude Include="GhosttyControlCore.h">
++      <DependentUpon>GhosttyControlCore.idl</DependentUpon>
++    </ClInclude>
+     <ClInclude Include="ControlCore.h">
+       <DependentUpon>ControlCore.idl</DependentUpon>
+     </ClInclude>
+@@ -69,6 +74,10 @@
+     <ClCompile Include="pch.cpp">
+       <PrecompiledHeader>Create</PrecompiledHeader>
+     </ClCompile>
++    <ClCompile Include="GhosttyEngine.cpp" />
++    <ClCompile Include="GhosttyControlCore.cpp">
++      <DependentUpon>GhosttyControlCore.idl</DependentUpon>
++    </ClCompile>
+     <ClCompile Include="ControlCore.cpp">
+       <DependentUpon>ControlCore.idl</DependentUpon>
+     </ClCompile>
+@@ -109,6 +118,7 @@
+   <ItemGroup>
+     <Midl Include="IControlCore.idl" />
+     <Midl Include="ControlCore.idl" />
++    <Midl Include="GhosttyControlCore.idl" />
+     <Midl Include="ControlInteractivity.idl" />
+     <Midl Include="ScrollBarVisualStateManager.idl" />
+     <Midl Include="ICoreState.idl" />
+diff --git a/src/cascadia/TerminalControl/dll/TerminalControl.vcxproj b/src/cascadia/TerminalControl/dll/TerminalControl.vcxproj
+index 2af748bb2..996cb3557 100644
+--- a/src/cascadia/TerminalControl/dll/TerminalControl.vcxproj
++++ b/src/cascadia/TerminalControl/dll/TerminalControl.vcxproj
+@@ -32,6 +32,8 @@
+   <Import Project="..\..\..\..\common.openconsole.props" Condition="'$(OpenConsoleDir)'==''" />
+   <Import Project="$(OpenConsoleDir)src\common.nugetversions.props" />
+   <Import Project="$(OpenConsoleDir)src\cppwinrt.build.pre.props" />
++  <!-- The static lib references libghostty; this is the DLL that resolves it. -->
++  <Import Project="..\libghostty.props" />
+   <!-- ========================= XAML files ======================== -->
+   <ItemGroup>
+     <!-- DON'T PUT XAML FILES HERE! Put them in TerminalControlLib.vcxproj -->
+diff --git a/src/cascadia/TerminalControl/libghostty.props b/src/cascadia/TerminalControl/libghostty.props
+new file mode 100644
+index 000000000..e6d2c32c1
+--- /dev/null
++++ b/src/cascadia/TerminalControl/libghostty.props
+@@ -0,0 +1,47 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++  libghostty, the ghostty engine (ADR 0003).
++
++  The DLL and its header come from the sibling ghostty/ clone, built by
++  scripts/build-ghostty.ps1 - which also synthesizes ghostty.lib, since zig
++  emits no import library of its own for ghostty-internal.dll.
++
++  Override GhosttyOutDir to build against a libghostty from somewhere else.
++-->
++<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
++  <PropertyGroup>
++    <GhosttyOutDir Condition="'$(GhosttyOutDir)'==''">$(OpenConsoleDir)..\ghostty\zig-out\</GhosttyOutDir>
++    <GhosttyIncludeDir>$(GhosttyOutDir)include\</GhosttyIncludeDir>
++    <GhosttyLibDir>$(GhosttyOutDir)lib\</GhosttyLibDir>
++  </PropertyGroup>
++
++  <ItemDefinitionGroup>
++    <ClCompile>
++      <AdditionalIncludeDirectories>$(GhosttyIncludeDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
++    </ClCompile>
++    <Link>
++      <AdditionalLibraryDirectories>$(GhosttyLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
++      <AdditionalDependencies>ghostty.lib;%(AdditionalDependencies)</AdditionalDependencies>
++    </Link>
++  </ItemDefinitionGroup>
++
++  <!--
++    The DLL has to sit next to the executable at load time. It is content
++    rather than a project reference, so this copies it into the output and
++    into the package payload.
++  -->
++  <ItemGroup>
++    <None Include="$(GhosttyLibDir)ghostty-internal.dll" Condition="Exists('$(GhosttyLibDir)ghostty-internal.dll')">
++      <DeploymentContent>true</DeploymentContent>
++      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
++      <Link>ghostty-internal.dll</Link>
++    </None>
++  </ItemGroup>
++
++  <Target Name="GhosttyCheck" BeforeTargets="ClCompile">
++    <Error Condition="!Exists('$(GhosttyIncludeDir)ghostty.h')"
++           Text="libghostty not found at $(GhosttyOutDir). Run scripts\build-ghostty.ps1 first, or set GhosttyOutDir." />
++    <Error Condition="!Exists('$(GhosttyLibDir)ghostty.lib')"
++           Text="ghostty.lib not found at $(GhosttyLibDir). Run scripts\build-ghostty.ps1 - it synthesizes the import library." />
++  </Target>
++</Project>
+diff --git a/src/cascadia/TerminalSettingsModel/TerminalSettingsSerializationHelpers.h b/src/cascadia/TerminalSettingsModel/TerminalSettingsSerializationHelpers.h
+index 268a7e3a4..16074cf50 100644
+--- a/src/cascadia/TerminalSettingsModel/TerminalSettingsSerializationHelpers.h
++++ b/src/cascadia/TerminalSettingsModel/TerminalSettingsSerializationHelpers.h
+@@ -179,8 +179,9 @@ JSON_ENUM_MAPPER(::winrt::Microsoft::Terminal::Control::TextAntialiasingMode)
+ // SettingsLoadWarnings::UnknownEngine.
+ JSON_ENUM_MAPPER(::winrt::Microsoft::Terminal::Control::TerminalEngine)
+ {
+-    static constexpr std::array<pair_type, 1> mappings = {
+-        pair_type{ "cascadia", ValueType::Cascadia }
++    static constexpr std::array<pair_type, 2> mappings = {
++        pair_type{ "cascadia", ValueType::Cascadia },
++        pair_type{ "ghostty", ValueType::Ghostty }
+     };
+ 
+     ValueType FromJson(const Json::Value& json) const

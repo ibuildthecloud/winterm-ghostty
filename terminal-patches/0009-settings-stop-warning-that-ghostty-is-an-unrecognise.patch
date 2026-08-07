@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 4 Aug 2026 21:48:23 -0700
+Subject: [PATCH] settings: stop warning that "ghostty" is an unrecognised
+ engine
+
+Profile::LayerJson decided "unrecognised" by comparing the raw JSON
+string against a hardcoded "cascadia", so the list of known engines
+existed in two places: the JSON mapper, and that string. The day the
+ghostty engine shipped, every ghostty profile told the user its engine
+was not recognised while quietly working correctly.
+
+The check now asks the mapper (IsKnownName reads the same `mappings`
+FromJson does), so there is one list.
+
+The existing test kept passing throughout, because it used "ghostty" as
+its example of an *unknown* engine - it was asserting the bug. It now
+uses a genuinely bogus value, and asserts that "ghostty" parses.
+
+Added ProfileKnownEngineDoesNotWarn for the case that was missing
+entirely: a shipping engine must load silently. Mutation-verified -
+restoring the hardcoded comparison fails it.
+
+unitSettingsModel: 159/159.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ee27Fih3vSPYsqrUBpUoc
+---
+ .../TerminalSettingsModel/Profile.cpp         |  5 +-
+ .../TerminalSettingsSerializationHelpers.h    | 20 ++++++
+ .../UnitTests_SettingsModel/ProfileTests.cpp  | 66 ++++++++++++++++---
+ 3 files changed, 80 insertions(+), 11 deletions(-)
+
+diff --git a/src/cascadia/TerminalSettingsModel/Profile.cpp b/src/cascadia/TerminalSettingsModel/Profile.cpp
+index 6cd019ad8..ea4874092 100644
+--- a/src/cascadia/TerminalSettingsModel/Profile.cpp
++++ b/src/cascadia/TerminalSettingsModel/Profile.cpp
+@@ -218,7 +218,10 @@ void Profile::LayerJson(const Json::Value& json)
+         const auto& engineJson = json[JsonKey(EngineKey)];
+         if (engineJson.isString())
+         {
+-            _EngineValueUnrecognized = engineJson.asString() != "cascadia";
++            // Ask the mapper, rather than naming the engines a second time
++            // here - that duplication is exactly what made "ghostty" warn
++            // about being unrecognised after the engine shipped.
++            _EngineValueUnrecognized = !JsonUtils::ConversionTrait<Microsoft::Terminal::Control::TerminalEngine>::IsKnownName(engineJson.asString());
+         }
+     }
+ 
+diff --git a/src/cascadia/TerminalSettingsModel/TerminalSettingsSerializationHelpers.h b/src/cascadia/TerminalSettingsModel/TerminalSettingsSerializationHelpers.h
+index 16074cf50..05325b784 100644
+--- a/src/cascadia/TerminalSettingsModel/TerminalSettingsSerializationHelpers.h
++++ b/src/cascadia/TerminalSettingsModel/TerminalSettingsSerializationHelpers.h
+@@ -196,6 +196,26 @@ JSON_ENUM_MAPPER(::winrt::Microsoft::Terminal::Control::TerminalEngine)
+         }
+         return ValueType::Cascadia;
+     }
++
++    // Whether a name is one we actually know.
++    //
++    // Because FromJson falls back silently, the caller cannot tell a real
++    // engine from a typo by its return value - so Profile::LayerJson asks
++    // this to decide whether to raise SettingsLoadWarnings::UnknownEngine.
++    // It reads `mappings` rather than repeating the names, which is the whole
++    // point: a hardcoded second list is how "ghostty" ended up warning after
++    // it was already supported.
++    static bool IsKnownName(std::string_view name) noexcept
++    {
++        for (const auto& pair : mappings)
++        {
++            if (pair.first == name)
++            {
++                return true;
++            }
++        }
++        return false;
++    }
+ };
+ 
+ // Type Description:
+diff --git a/src/cascadia/UnitTests_SettingsModel/ProfileTests.cpp b/src/cascadia/UnitTests_SettingsModel/ProfileTests.cpp
+index 992eb31cc..2f865a845 100644
+--- a/src/cascadia/UnitTests_SettingsModel/ProfileTests.cpp
++++ b/src/cascadia/UnitTests_SettingsModel/ProfileTests.cpp
+@@ -33,6 +33,7 @@ namespace SettingsModelUnitTests
+         TEST_METHOD(ProfileDefaultsProhibitedSettings);
+ 
+         TEST_METHOD(ProfileEngineSetting);
++        TEST_METHOD(ProfileKnownEngineDoesNotWarn);
+ 
+         TEST_METHOD(SettingInheritanceFallback);
+         TEST_METHOD(ClearSettingRestoresInheritance);
+@@ -541,10 +542,15 @@ namespace SettingsModelUnitTests
+ 
+     void ProfileTests::ProfileEngineSetting()
+     {
+-        // The per-profile "engine" setting (ADR 0007). Only "cascadia" is valid
+-        // today, so this pins the three behaviours the phase contracts for:
+-        // it parses, it defaults, and an unknown value degrades to a warning
+-        // rather than failing the whole settings load.
++        // The per-profile "engine" setting (ADR 0007). Pins four behaviours:
++        // each shipping engine parses, absent means the default, and an
++        // unknown value degrades to a warning rather than failing the whole
++        // settings load - while a *known* engine does NOT warn.
++        //
++        // That last one is not hypothetical. The warning used to be raised by
++        // comparing the raw string against a hardcoded "cascadia", so the day
++        // the ghostty engine shipped, every ghostty profile told the user its
++        // engine was unrecognised while quietly working.
+         static constexpr std::string_view userSettings{ R"({
+             "profiles": {
+                 "list": [
+@@ -558,9 +564,14 @@ namespace SettingsModelUnitTests
+                         "guid": "{6239a42c-1111-49a3-80bd-e8fdd045185c}"
+                     },
+                     {
+-                        "name": "unknown",
++                        "name": "ghostty",
+                         "guid": "{6239a42c-2222-49a3-80bd-e8fdd045185c}",
+                         "engine": "ghostty"
++                    },
++                    {
++                        "name": "unknown",
++                        "guid": "{6239a42c-3333-49a3-80bd-e8fdd045185c}",
++                        "engine": "definitely-not-an-engine"
+                     }
+                 ]
+             }
+@@ -571,7 +582,7 @@ namespace SettingsModelUnitTests
+         // SettingsLoader rethrows as a hard settings-load failure.
+         const auto settings = winrt::make_self<implementation::CascadiaSettings>(userSettings);
+         const auto allProfiles = settings->AllProfiles();
+-        VERIFY_ARE_EQUAL(3u, allProfiles.Size());
++        VERIFY_ARE_EQUAL(4u, allProfiles.Size());
+ 
+         // "cascadia" parses.
+         VERIFY_ARE_EQUAL(winrt::Microsoft::Terminal::Control::TerminalEngine::Cascadia,
+@@ -581,12 +592,14 @@ namespace SettingsModelUnitTests
+         VERIFY_ARE_EQUAL(winrt::Microsoft::Terminal::Control::TerminalEngine::Cascadia,
+                          allProfiles.GetAt(1).Engine());
+ 
+-        // An unknown engine falls back rather than failing the load. "ghostty"
+-        // is the value users will reach for first, and it stays unrecognised
+-        // until that engine ships.
+-        VERIFY_ARE_EQUAL(winrt::Microsoft::Terminal::Control::TerminalEngine::Cascadia,
++        // "ghostty" parses now that the engine exists.
++        VERIFY_ARE_EQUAL(winrt::Microsoft::Terminal::Control::TerminalEngine::Ghostty,
+                          allProfiles.GetAt(2).Engine());
+ 
++        // An unknown engine falls back rather than failing the load.
++        VERIFY_ARE_EQUAL(winrt::Microsoft::Terminal::Control::TerminalEngine::Cascadia,
++                         allProfiles.GetAt(3).Engine());
++
+         // ...and the fallback is reported rather than silent.
+         auto sawUnknownEngine = false;
+         for (const auto& warning : settings->Warnings())
+@@ -599,6 +612,39 @@ namespace SettingsModelUnitTests
+         VERIFY_IS_TRUE(sawUnknownEngine, L"expected SettingsLoadWarnings::UnknownEngine");
+     }
+ 
++    void ProfileTests::ProfileKnownEngineDoesNotWarn()
++    {
++        // The other half of ProfileEngineSetting, and the half that was
++        // missing: a profile naming a *shipping* engine must load silently.
++        // Without this, nothing stops the warning's notion of "known" from
++        // drifting away from the parser's - which is precisely what happened.
++        static constexpr std::string_view userSettings{ R"({
++            "profiles": {
++                "list": [
++                    {
++                        "name": "cascadia",
++                        "guid": "{6239a42c-0000-49a3-80bd-e8fdd045185c}",
++                        "engine": "cascadia"
++                    },
++                    {
++                        "name": "ghostty",
++                        "guid": "{6239a42c-1111-49a3-80bd-e8fdd045185c}",
++                        "engine": "ghostty"
++                    }
++                ]
++            }
++        })" };
++
++        const auto settings = winrt::make_self<implementation::CascadiaSettings>(userSettings);
++
++        for (const auto& warning : settings->Warnings())
++        {
++            VERIFY_ARE_NOT_EQUAL(SettingsLoadWarnings::UnknownEngine,
++                                 warning,
++                                 L"a shipping engine must not be reported as unrecognised");
++        }
++    }
++
+     void ProfileTests::SettingInheritanceFallback()
+     {
+         // Verify that when no layer defines a setting, the default value is used.

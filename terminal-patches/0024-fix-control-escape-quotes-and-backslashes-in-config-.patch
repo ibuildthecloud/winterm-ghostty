@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Wed, 5 Aug 2026 22:13:16 -0700
+Subject: [PATCH] fix(control): escape quotes and backslashes in config values
+
+WT's default wordDelimiters contains both a backslash and a double quote, so
+the quoted entry ended its own string early and ghostty received a truncated
+delimiter set. Nothing logged a rejection because the entry still parsed -
+the only symptom was a double click on "Corporation." selecting the trailing
+period where cascadia did not.
+
+Pinned by a test. The deeper fix is to stop sending settings as text at all;
+see docs/phase-6-readiness.md.
+
+unitControl 50/50 -> 51/51.
+---
+ .../GhosttySettingsTranslator.cpp             | 20 ++++++++++++++++++-
+ .../GhosttySettingsTests.cpp                  | 16 +++++++++++++++
+ 2 files changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+index 6e518c114..e3a8b8769 100644
+--- a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
++++ b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+@@ -33,12 +33,30 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         // Values may contain spaces (font families especially), and the entry
+         // syntax is the config file's, so they are quoted the way a file would.
++        //
++        // The escaping is not decorative. WT's default wordDelimiters is
++        //     ./\()"'-:,.;<>~!@#$%^&*|+=[]{}~?
++        // which contains both a backslash and a double quote, so an unescaped
++        // value ends its own quoted string early and ghostty receives a
++        // truncated set - which is precisely how `.` went missing from a
++        // ghostty pane's word boundaries while the setting looked forwarded.
++        // ghostty's own documentation quotes values with \" inside them.
+         const auto setQuoted = [&entries](std::string_view key, std::wstring_view value) {
+             if (value.empty())
+             {
+                 return;
+             }
+-            entries.push_back(fmt::format("{} = \"{}\"", key, til::u16u8(value)));
++
++            std::string escaped;
++            for (const auto c : til::u16u8(value))
++            {
++                if (c == '\\' || c == '"')
++                {
++                    escaped.push_back('\\');
++                }
++                escaped.push_back(c);
++            }
++            entries.push_back(fmt::format("{} = \"{}\"", key, escaped));
+         };
+         const auto set = [&entries](std::string entry) {
+             entries.push_back(std::move(entry));
+diff --git a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+index 348c081f9..55567ec7c 100644
+--- a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
++++ b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+@@ -37,6 +37,7 @@ namespace ControlUnitTests
+         TEST_METHOD(PaddingIsZeroBecauseWindowsTerminalAlreadyPads);
+         TEST_METHOD(SchemeProducesForegroundBackgroundAndFullPalette);
+         TEST_METHOD(WordDelimitersReachTheEngine);
++        TEST_METHOD(QuotesAndBackslashesInAValueAreEscaped);
+         TEST_METHOD(NullSettingsProduceNothing);
+ 
+     private:
+@@ -154,6 +155,21 @@ namespace ControlUnitTests
+                        L"ghostty's word boundaries must come from WT's setting");
+     }
+ 
++    // WT's default wordDelimiters contains both a backslash and a double
++    // quote. Unescaped, the value ends its own quoted string early and ghostty
++    // gets a truncated set - which is exactly how `.` went missing from a
++    // ghostty pane's word boundaries while the setting looked forwarded.
++    void GhosttySettingsTests::QuotesAndBackslashesInAValueAreEscaped()
++    {
++        auto s = _settings();
++        s->WordDelimiters(L" .\\\"x");
++
++        const auto entries = Control::implementation::TranslateGhosttySettings(*s);
++
++        VERIFY_IS_TRUE(_has(entries, "selection-word-chars = \" .\\\\\\\"x\""),
++                       L"the backslash and the quote must both be escaped");
++    }
++
+     void GhosttySettingsTests::NullSettingsProduceNothing()
+     {
+         const Control::IControlSettings none{ nullptr };

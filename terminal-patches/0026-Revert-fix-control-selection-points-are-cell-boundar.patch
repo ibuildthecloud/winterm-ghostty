@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Wed, 5 Aug 2026 22:32:29 -0700
+Subject: [PATCH] Revert "fix(control): selection points are cell boundaries,
+ not cell centres"
+
+This reverts commit e97ae8c4cf1bbbec859e9d822da7e79b33305b27.
+---
+ .../TerminalControl/GhosttyControlCore.cpp        | 15 +--------------
+ 1 file changed, 1 insertion(+), 14 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 56bf56289..96ece4277 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -840,20 +840,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // and got 5..8 back, and asked for 5..9 and got 11..14.
+         const auto cellWidth = _cellSize.Width / _compositionScale;
+         const auto cellHeight = _cellSize.Height / _compositionScale;
+-
+-        // The cell edge, not its centre. What arrives here is a selection
+-        // *boundary*, not a character index: ControlInteractivity has already
+-        // applied cascadia's midpoint rule before calling, rounding the pointer
+-        // to the nearest cell edge ("rounding can push the position to the next
+-        // cell") and even nudging the anchor with termPos.x++ when a drag runs
+-        // leftwards.
+-        //
+-        // Centring re-read that boundary as a character, which is why selection
+-        // started one character late whenever the rounding had pushed the index
+-        // up, and why dragging extended as soon as the pointer touched the next
+-        // character instead of at its midpoint - the midpoint decision had
+-        // already been made and was being thrown away.
+-        const auto x = static_cast<double>(cell.X) * cellWidth;
++        const auto x = (static_cast<double>(cell.X) + 0.5) * cellWidth;
+         const auto y = (static_cast<double>(cell.Y) + 0.5) * cellHeight;
+         ghostty_surface_mouse_pos(_surface, x, y, GHOSTTY_MODS_NONE);
+     }

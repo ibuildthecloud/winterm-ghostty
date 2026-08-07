@@ -1,0 +1,512 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Wed, 5 Aug 2026 12:07:47 -0700
+Subject: [PATCH] test(control): pin the settings translation found by hand
+
+Six regression tests over the settings -> ghostty config translation. Each
+rule they pin came out of a bug found in manual testing rather than review:
+a font family with a space needs the config file's quoting, WT's "infinite"
+scrollback is a negative number that must not be forwarded, and ghostty's
+padding has to be zero because Windows Terminal already insets the pane -
+the double inset is what looked like a border round the first working pane.
+
+To make that testable the translation moves out of GhosttyControlCore into
+its own translation unit: it is a pure function over IControlSettings, so
+compiled into the test binary it needs no engine, no GPU and no pty. The
+rest of the core needs a live surface and stays out of reach of a unit test.
+
+ControlInteractivity.h no longer includes GhosttyControlCore.h - only the
+engine factory in the .cpp builds one, and the header was dragging ghostty.h
+into every consumer, the unit tests included.
+
+Mutation-verified: unquoting the font family, forwarding a negative history,
+padding of 1, and dropping the '#' from a colour each fail exactly one test
+and nothing else. unitControl 38/38, unitSettingsModel 159/159.
+---
+ .../TerminalControl/ControlInteractivity.cpp  |   3 +
+ .../TerminalControl/ControlInteractivity.h    |   1 -
+ .../TerminalControl/GhosttyControlCore.cpp    |  70 +--------
+ .../GhosttySettingsTranslator.cpp             |  96 ++++++++++++
+ .../GhosttySettingsTranslator.h               |  30 ++++
+ .../TerminalControlLib.vcxproj                |   4 +-
+ .../Control.UnitTests.vcxproj                 |  12 +-
+ .../GhosttySettingsTests.cpp                  | 146 ++++++++++++++++++
+ 8 files changed, 291 insertions(+), 71 deletions(-)
+ create mode 100644 src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+ create mode 100644 src/cascadia/TerminalControl/GhosttySettingsTranslator.h
+ create mode 100644 src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+
+diff --git a/src/cascadia/TerminalControl/ControlInteractivity.cpp b/src/cascadia/TerminalControl/ControlInteractivity.cpp
+index 88c51e30b..2b18f8f64 100644
+--- a/src/cascadia/TerminalControl/ControlInteractivity.cpp
++++ b/src/cascadia/TerminalControl/ControlInteractivity.cpp
+@@ -3,6 +3,9 @@
+ 
+ #include "pch.h"
+ #include "ControlInteractivity.h"
++// Here rather than in the header: this is the only place that builds one,
++// and the header would otherwise drag ghostty.h into every consumer.
++#include "GhosttyControlCore.h"
+ #include <DefaultSettings.h>
+ #include <unicode.hpp>
+ #include <Utils.h>
+diff --git a/src/cascadia/TerminalControl/ControlInteractivity.h b/src/cascadia/TerminalControl/ControlInteractivity.h
+index d9c759745..6fb4eceb3 100644
+--- a/src/cascadia/TerminalControl/ControlInteractivity.h
++++ b/src/cascadia/TerminalControl/ControlInteractivity.h
+@@ -21,7 +21,6 @@
+ #include "../buffer/out/search.h"
+ 
+ #include "ControlCore.h"
+-#include "GhosttyControlCore.h"
+ #include "../../renderer/uia/UiaRenderer.hpp"
+ 
+ namespace ControlUnitTests
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index beb100d56..8cf240a5f 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "pch.h"
+ #include "GhosttyControlCore.h"
++#include "GhosttySettingsTranslator.h"
+ 
+ #include "GhosttyControlCore.g.cpp"
+ 
+@@ -123,20 +124,10 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         }
+     }
+ 
+-    // Settings -> ghostty_config_t. The MVP scope is deliberately five fields
+-    // (font, size, scheme, scrollback, padding): the ones without which a pane
+-    // is visibly wrong rather than merely unstyled. Everything else - opacity,
+-    // acrylic, background image, cursor and selection colours, bell style - is
+-    // Phase 6 parity work and is left at ghostty's defaults on purpose, so a
+-    // half-applied setting never looks like a translator bug.
+     void GhosttyControlCore::_applySettingsToConfig(ghostty_config_t config) const
+     {
+-        if (!_settings)
++        for (const auto& entry : TranslateGhosttySettings(_settings))
+         {
+-            return;
+-        }
+-
+-        const auto set = [config](const std::string& entry) {
+             // A rejected entry is worth a log line but not a failed pane: the
+             // rest of the configuration is still worth applying.
+             if (!ghostty_config_set(config, entry.c_str()))
+@@ -148,63 +139,6 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             {
+                 _trace(L"set %hs", entry.c_str());
+             }
+-        };
+-
+-        // Values may contain spaces (font families especially), and the entry
+-        // syntax is the config file's, so they are quoted the way a file would.
+-        const auto setQuoted = [&set](std::string_view key, std::wstring_view value) {
+-            if (value.empty())
+-            {
+-                return;
+-            }
+-            set(fmt::format("{} = \"{}\"", key, til::u16u8(value)));
+-        };
+-
+-        // --- Font ---------------------------------------------------------
+-        setQuoted("font-family", _settings.FontFace());
+-        if (const auto size = _settings.FontSize(); size > 0)
+-        {
+-            set(fmt::format("font-size = {}", size));
+-        }
+-
+-        // --- Scrollback ---------------------------------------------------
+-        // WT counts lines; ghostty's byte limit is separate and left alone.
+-        // A negative HistorySize means "infinite" in WT, which is ghostty's
+-        // default for the line limit, so it is simply not set.
+-        if (const auto history = _settings.HistorySize(); history >= 0)
+-        {
+-            set(fmt::format("scrollback-limit-lines = {}", history));
+-        }
+-
+-        // --- Padding ------------------------------------------------------
+-        // WT already insets the SwapChainPanel by this same padding, so asking
+-        // ghostty to pad as well would double it. Ours is therefore zero, and
+-        // the pane's padding is whatever WT drew around us.
+-        set("window-padding-x = 0");
+-        set("window-padding-y = 0");
+-        set("window-padding-balance = false");
+-
+-        // --- Colour scheme ------------------------------------------------
+-        if (const auto scheme = _settings.try_as<Core::ICoreScheme>())
+-        {
+-            const auto hex = [](const Core::Color& c) {
+-                return fmt::format("#{:02x}{:02x}{:02x}", c.R, c.G, c.B);
+-            };
+-
+-            set(fmt::format("background = {}", hex(scheme.DefaultBackground())));
+-            set(fmt::format("foreground = {}", hex(scheme.DefaultForeground())));
+-            set(fmt::format("selection-background = {}", hex(scheme.SelectionBackground())));
+-            set(fmt::format("cursor-color = {}", hex(scheme.CursorColor())));
+-
+-            // The 16 ANSI entries. ghostty takes them as `palette = N=#rrggbb`,
+-            // one entry per line, which is why this is a loop rather than one
+-            // string - the same shape a config file would have.
+-            winrt::com_array<Core::Color> table;
+-            scheme.GetColorTable(table);
+-            for (uint32_t i = 0; i < table.size(); ++i)
+-            {
+-                set(fmt::format("palette = {}={}", i, hex(table[i])));
+-            }
+         }
+     }
+ 
+diff --git a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+new file mode 100644
+index 000000000..7383149bd
+--- /dev/null
++++ b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+@@ -0,0 +1,96 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++
++#include "pch.h"
++#include "GhosttySettingsTranslator.h"
++
++using namespace winrt::Microsoft::Terminal;
++
++namespace winrt::Microsoft::Terminal::Control::implementation
++{
++    // Settings -> the `key = value` entries ghostty's config parser takes.
++    //
++    // The MVP scope is deliberately five fields (font, size, scheme,
++    // scrollback, padding): the ones without which a pane is visibly wrong
++    // rather than merely unstyled. Everything else - opacity, acrylic,
++    // background image, bell style - is Phase 6 parity work and is left at
++    // ghostty's defaults on purpose, so a half-applied setting never looks
++    // like a translator bug.
++    //
++    // Pure on purpose, and in its own file so that file can be compiled into
++    // the unit tests: it touches no engine state, so it needs no libghostty,
++    // no GPU and no pty - unlike everything else in GhosttyControlCore, which
++    // needs a live surface. Every rule encoded here (quoting, the
++    // negative-history case, padding pinned to zero) was learned from a bug,
++    // so each one is worth pinning down in a test.
++    std::vector<std::string> TranslateGhosttySettings(const Control::IControlSettings& settings)
++    {
++        std::vector<std::string> entries;
++        if (!settings)
++        {
++            return entries;
++        }
++
++        // Values may contain spaces (font families especially), and the entry
++        // syntax is the config file's, so they are quoted the way a file would.
++        const auto setQuoted = [&entries](std::string_view key, std::wstring_view value) {
++            if (value.empty())
++            {
++                return;
++            }
++            entries.push_back(fmt::format("{} = \"{}\"", key, til::u16u8(value)));
++        };
++        const auto set = [&entries](std::string entry) {
++            entries.push_back(std::move(entry));
++        };
++
++        // --- Font ---------------------------------------------------------
++        setQuoted("font-family", settings.FontFace());
++        if (const auto size = settings.FontSize(); size > 0)
++        {
++            set(fmt::format("font-size = {}", size));
++        }
++
++        // --- Scrollback ---------------------------------------------------
++        // WT counts lines; ghostty's byte limit is separate and left alone.
++        // A negative HistorySize means "infinite" in WT, which is ghostty's
++        // default for the line limit, so it is simply not set.
++        if (const auto history = settings.HistorySize(); history >= 0)
++        {
++            set(fmt::format("scrollback-limit-lines = {}", history));
++        }
++
++        // --- Padding ------------------------------------------------------
++        // WT already insets the SwapChainPanel by this same padding, so asking
++        // ghostty to pad as well would double it. Ours is therefore zero, and
++        // the pane's padding is whatever WT drew around us.
++        set("window-padding-x = 0");
++        set("window-padding-y = 0");
++        set("window-padding-balance = false");
++
++        // --- Colour scheme ------------------------------------------------
++        if (const auto scheme = settings.try_as<Core::ICoreScheme>())
++        {
++            const auto hex = [](const Core::Color& c) {
++                return fmt::format("#{:02x}{:02x}{:02x}", c.R, c.G, c.B);
++            };
++
++            set(fmt::format("background = {}", hex(scheme.DefaultBackground())));
++            set(fmt::format("foreground = {}", hex(scheme.DefaultForeground())));
++            set(fmt::format("selection-background = {}", hex(scheme.SelectionBackground())));
++            set(fmt::format("cursor-color = {}", hex(scheme.CursorColor())));
++
++            // The 16 ANSI entries. ghostty takes them as `palette = N=#rrggbb`,
++            // one entry per line, which is why this is a loop rather than one
++            // string - the same shape a config file would have.
++            winrt::com_array<Core::Color> table;
++            scheme.GetColorTable(table);
++            for (uint32_t i = 0; i < table.size(); ++i)
++            {
++                set(fmt::format("palette = {}={}", i, hex(table[i])));
++            }
++        }
++
++        return entries;
++    }
++}
+diff --git a/src/cascadia/TerminalControl/GhosttySettingsTranslator.h b/src/cascadia/TerminalControl/GhosttySettingsTranslator.h
+new file mode 100644
+index 000000000..5dd3556e7
+--- /dev/null
++++ b/src/cascadia/TerminalControl/GhosttySettingsTranslator.h
+@@ -0,0 +1,30 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++//
++// Module Name:
++// - GhosttySettingsTranslator.h
++//
++// Abstract:
++// - Turns a WT profile into the `key = value` entries ghostty's config parser
++//   takes (ADR 0003, PLAN Phase 5).
++//
++// - Deliberately free of any libghostty dependency: it produces strings and
++//   nothing else. That is what lets it be unit tested with a mock settings
++//   object, with no engine, GPU or pty involved. Everything else in
++//   GhosttyControlCore needs a live surface and cannot be reached from a unit
++//   test, so the part that *can* be tested is kept separable on purpose.
++
++#pragma once
++
++#include <string>
++#include <vector>
++
++// The projection, not the implementation type: this file is compiled into the
++// unit tests as well, where no implementation exists.
++#include <winrt/Microsoft.Terminal.Core.h>
++#include <winrt/Microsoft.Terminal.Control.h>
++
++namespace winrt::Microsoft::Terminal::Control::implementation
++{
++    std::vector<std::string> TranslateGhosttySettings(const Control::IControlSettings& settings);
++}
+diff --git a/src/cascadia/TerminalControl/TerminalControlLib.vcxproj b/src/cascadia/TerminalControl/TerminalControlLib.vcxproj
+index 73aa29cce..c761be934 100644
+--- a/src/cascadia/TerminalControl/TerminalControlLib.vcxproj
++++ b/src/cascadia/TerminalControl/TerminalControlLib.vcxproj
+@@ -1,4 +1,4 @@
+-<?xml version="1.0" encoding="utf-8"?>
++﻿<?xml version="1.0" encoding="utf-8"?>
+ <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+   <PropertyGroup Label="Globals">
+     <ProjectGuid>{CA5CAD1A-44BD-4AC7-AC72-6CA5B3AB89ED}</ProjectGuid>
+@@ -32,6 +32,7 @@
+   <ItemGroup>
+     <ClInclude Include="pch.h" />
+     <ClInclude Include="GhosttyEngine.h" />
++    <ClInclude Include="GhosttySettingsTranslator.h" />
+     <ClInclude Include="GhosttyControlCore.h">
+       <DependentUpon>GhosttyControlCore.idl</DependentUpon>
+     </ClInclude>
+@@ -75,6 +76,7 @@
+       <PrecompiledHeader>Create</PrecompiledHeader>
+     </ClCompile>
+     <ClCompile Include="GhosttyEngine.cpp" />
++    <ClCompile Include="GhosttySettingsTranslator.cpp" />
+     <ClCompile Include="GhosttyControlCore.cpp">
+       <DependentUpon>GhosttyControlCore.idl</DependentUpon>
+     </ClCompile>
+diff --git a/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj b/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
+index 5406e1d7b..24d0354ec 100644
+--- a/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
++++ b/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
+@@ -1,4 +1,4 @@
+-<?xml version="1.0" encoding="utf-8"?>
++﻿<?xml version="1.0" encoding="utf-8"?>
+ <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+   <PropertyGroup>
+     <ProjectGuid>{C323DAEE-B307-4C7B-ACE5-7293CBEFCB5B}</ProjectGuid>
+@@ -18,6 +18,12 @@
+   <Import Project="$(SolutionDir)\common.openconsole.props" Condition="'$(OpenConsoleDir)'==''" />
+   <Import Project="$(OpenConsoleDir)src\common.nugetversions.props" />
+   <Import Project="$(OpenConsoleDir)\src\cppwinrt.build.pre.props" />
++  <!--
++    The tests link Microsoft.Terminal.ControlLib, which contains the ghostty
++    engine, so they need its import library and its DLL alongside them even
++    though the translator under test calls nothing from it.
++  -->
++  <Import Project="$(OpenConsoleDir)src\cascadia\TerminalControl\libghostty.props" />
+ 
+   <!-- ========================= Headers ======================== -->
+   <ItemGroup>
+@@ -29,6 +35,10 @@
+   <!-- ========================= Cpp Files ======================== -->
+   <ItemGroup>
+     <ClCompile Include="ControlCoreTests.cpp" />
++    <ClCompile Include="GhosttySettingsTests.cpp" />
++    <!-- Compiled straight into the tests: it is a pure function with no
++         libghostty dependency, so the test binary needs no engine DLL. -->
++    <ClCompile Include="..\TerminalControl\GhosttySettingsTranslator.cpp" />
+     <ClCompile Include="ControlInteractivityTests.cpp" />
+     <ClCompile Include="pch.cpp">
+       <PrecompiledHeader>Create</PrecompiledHeader>
+diff --git a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+new file mode 100644
+index 000000000..fb0b1206a
+--- /dev/null
++++ b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+@@ -0,0 +1,146 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++//
++// Regression tests for the settings -> ghostty config translation.
++//
++// Every rule pinned here came out of a bug found by hand, not by review:
++// values with spaces need the config file's quoting, WT's "infinite"
++// scrollback is a negative number that must not be forwarded, and ghostty's
++// padding has to be zero because Windows Terminal already insets the pane.
++//
++// The translation is deliberately a pure function so it can be tested here at
++// all. The rest of GhosttyControlCore needs a live engine, a GPU and a pty; a
++// unit test cannot reach it, which is exactly why this part was carved out.
++
++#include "pch.h"
++#include "../TerminalControl/GhosttySettingsTranslator.h"
++#include "MockControlSettings.h"
++
++using namespace WEX::Logging;
++using namespace WEX::TestExecution;
++using namespace WEX::Common;
++
++using namespace winrt;
++using namespace winrt::Microsoft::Terminal;
++
++namespace ControlUnitTests
++{
++    class GhosttySettingsTests
++    {
++        BEGIN_TEST_CLASS(GhosttySettingsTests)
++            TEST_CLASS_PROPERTY(L"TestTimeout", L"0:0:10")
++        END_TEST_CLASS()
++
++        TEST_METHOD(FontFamilyIsQuoted);
++        TEST_METHOD(InfiniteScrollbackIsNotForwarded);
++        TEST_METHOD(FiniteScrollbackIsForwarded);
++        TEST_METHOD(PaddingIsZeroBecauseWindowsTerminalAlreadyPads);
++        TEST_METHOD(SchemeProducesForegroundBackgroundAndFullPalette);
++        TEST_METHOD(NullSettingsProduceNothing);
++
++    private:
++        static bool _has(const std::vector<std::string>& entries, std::string_view entry)
++        {
++            return std::find(entries.begin(), entries.end(), entry) != entries.end();
++        }
++
++        static bool _hasPrefix(const std::vector<std::string>& entries, std::string_view prefix)
++        {
++            return std::any_of(entries.begin(), entries.end(), [&](const std::string& e) {
++                return e.rfind(prefix, 0) == 0;
++            });
++        }
++
++        static winrt::com_ptr<MockControlSettings> _settings()
++        {
++            auto s = winrt::make_self<MockControlSettings>();
++            s->FontFace(L"Cascadia Mono");
++            s->FontSize(12.0f);
++            s->HistorySize(9001);
++            return s;
++        }
++    };
++
++    // A font family with a space in it is the case a naive implementation gets
++    // wrong: unquoted, ghostty's parser sees "Cascadia" and drops "Mono".
++    void GhosttySettingsTests::FontFamilyIsQuoted()
++    {
++        const auto entries = Control::implementation::TranslateGhosttySettings(
++            *_settings());
++
++        VERIFY_IS_TRUE(_has(entries, "font-family = \"Cascadia Mono\""),
++                       L"font family must carry the config file's quoting");
++        VERIFY_IS_TRUE(_has(entries, "font-size = 12"));
++    }
++
++    // WT spells "infinite scrollback" as a negative historySize. ghostty's line
++    // limit is already unlimited by default, so the entry must be omitted
++    // rather than forwarded - "scrollback-limit-lines = -1" is not a thing.
++    void GhosttySettingsTests::InfiniteScrollbackIsNotForwarded()
++    {
++        auto s = _settings();
++        s->HistorySize(-1);
++
++        const auto entries = Control::implementation::TranslateGhosttySettings(*s);
++
++        VERIFY_IS_FALSE(_hasPrefix(entries, "scrollback-limit-lines"),
++                        L"a negative historySize means infinite; do not forward it");
++    }
++
++    void GhosttySettingsTests::FiniteScrollbackIsForwarded()
++    {
++        const auto entries = Control::implementation::TranslateGhosttySettings(
++            *_settings());
++
++        VERIFY_IS_TRUE(_has(entries, "scrollback-limit-lines = 9001"));
++    }
++
++    // Windows Terminal already insets the SwapChainPanel by the profile's
++    // padding. If ghostty pads as well the pane is inset twice, which is what
++    // made the first working pane look like it had a border round it.
++    void GhosttySettingsTests::PaddingIsZeroBecauseWindowsTerminalAlreadyPads()
++    {
++        const auto entries = Control::implementation::TranslateGhosttySettings(
++            *_settings());
++
++        VERIFY_IS_TRUE(_has(entries, "window-padding-x = 0"));
++        VERIFY_IS_TRUE(_has(entries, "window-padding-y = 0"));
++        VERIFY_IS_TRUE(_has(entries, "window-padding-balance = false"));
++    }
++
++    // The colours matter for more than looks: while the pane was drawn in
++    // ghostty's defaults and WT's padding in the profile's background, the
++    // mismatch showed up as a visible frame around the terminal.
++    void GhosttySettingsTests::SchemeProducesForegroundBackgroundAndFullPalette()
++    {
++        auto s = _settings();
++        s->DefaultBackground(til::color{ 0x0c, 0x0c, 0x0c });
++        s->DefaultForeground(til::color{ 0xcc, 0xcc, 0xcc });
++
++        std::array<winrt::Microsoft::Terminal::Core::Color, 16> table{};
++        for (uint32_t i = 0; i < table.size(); ++i)
++        {
++            table[i] = til::color{ gsl::narrow_cast<uint8_t>(i), 0x20, 0x30 };
++        }
++        s->SetColorTable(table);
++
++        const auto entries = Control::implementation::TranslateGhosttySettings(*s);
++
++        VERIFY_IS_TRUE(_has(entries, "background = #0c0c0c"));
++        VERIFY_IS_TRUE(_has(entries, "foreground = #cccccc"));
++
++        // All sixteen, each as its own entry - the shape a config file has.
++        for (uint32_t i = 0; i < 16; ++i)
++        {
++            const auto expected = fmt::format("palette = {}=#{:02x}2030", i, i);
++            VERIFY_IS_TRUE(_has(entries, expected),
++                           fmt::format(L"missing palette entry {}", i).c_str());
++        }
++    }
++
++    void GhosttySettingsTests::NullSettingsProduceNothing()
++    {
++        const Control::IControlSettings none{ nullptr };
++        VERIFY_ARE_EQUAL(0u, Control::implementation::TranslateGhosttySettings(none).size());
++    }
++}

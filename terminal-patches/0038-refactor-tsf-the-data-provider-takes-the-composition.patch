@@ -1,0 +1,544 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Thu, 6 Aug 2026 17:02:14 -0700
+Subject: [PATCH] refactor(tsf): the data provider takes the composition, not a
+ renderer
+
+IDataProvider::GetRenderer() made TSF depend on one particular terminal engine.
+Implementation reached through it and wrote the in-progress composition into
+that renderer's data itself, dereferencing it unchecked - so a provider with no
+such renderer could not merely return null, and a ghostty pane had to be kept
+away from TSF entirely. That is why it had no IME at all.
+
+SetComposition/ClearComposition replace it. Where the preedit goes is now the
+provider's business: cascadia writes it into its renderer exactly as before
+(the body moved, unchanged, including the lock and the repaint), and a ghostty
+pane hands it to ghostty_surface_preedit, which draws its own.
+
+Three implementors, not one. TermControl's is the interesting one; HwndTerminal
+and conhost's WindowProc have their own, and conhost's is not built by the
+`terminal` project - only the package build caught it. Both got the same body
+they were already getting by proxy.
+
+Two more things a ghostty pane needed, both of which were asking cascadia's core
+for something that is on IControlCore: GetCursorPosition, so the candidate
+window opens at the cursor rather than the corner of the screen, and
+HandleOutput, which would otherwise have composed text and then swallowed it.
+
+This also removes the seventh and last get_self escape ADR 0001 enumerated - TSF
+no longer needs WT's Renderer at all. _tsfSupported() stays, returning true: an
+engine with no preedit path of its own would still have to say so, and saying it
+in one place is what kept the ghostty pane from crashing on TSF while it could
+not.
+
+**Unverified.** Nothing here proves an IME works - that needs an installed CJK
+IME and a human, and none is installed on this machine. What is verified is that
+cascadia's path is byte-for-byte the same work in a different place, and that
+all four suites pass: terminalCore 54/54, unitSettingsModel 159/159,
+unitControl 62/62, terminalApp 51/51.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BgDGqEqRBB8L5Ueoq1uuxy
+---
+ .../TerminalControl/GhosttyControlCore.cpp    |  53 ++++++-
+ .../TerminalControl/GhosttyControlCore.h      |   5 +
+ src/cascadia/TerminalControl/HwndTerminal.cpp |  34 ++++-
+ src/cascadia/TerminalControl/HwndTerminal.hpp |   3 +-
+ src/cascadia/TerminalControl/TermControl.cpp  | 138 ++++++++++++++----
+ src/cascadia/TerminalControl/TermControl.h    |   4 +-
+ src/interactivity/win32/windowproc.cpp        |  35 ++++-
+ src/tsf/Handle.h                              |  16 +-
+ src/tsf/Implementation.cpp                    |  40 +----
+ 9 files changed, 255 insertions(+), 73 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index ce9deb7b5..166b4b50d 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -1376,7 +1376,58 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+     bool GhosttyControlCore::IsVtMouseModeEnabled() const { return false; }
+     bool GhosttyControlCore::ShouldSendAlternateScroll(const uint32_t /*uiButton*/, const int32_t /*delta*/) const { return false; }
+-    Core::Point GhosttyControlCore::CursorPosition() const { return {}; }
++    // Where the cursor is, in cells, for the IME candidate window.
++    //
++    // libghostty answers in pixels rather than cells - ghostty_surface_ime_point
++    // gives the point an IME should anchor to, already in DIPs and already
++    // accounting for the width of any preedit and the surface's padding - so
++    // this converts. Windows Terminal wants cells because it multiplies by the
++    // font size itself.
++    //
++    // The y arithmetic is why this needs a comment rather than a division:
++    // imePoint returns the *bottom* of the cursor cell (Surface.zig: "We want
++    // the bottom"), so dividing by the cell height lands one row below the
++    // cursor, and TermControl adds a row's height of its own to get the bottom
++    // of the rect. Subtracting the row here means the candidate window sits
++    // under the cursor rather than under the line below it.
++    Core::Point GhosttyControlCore::CursorPosition() const
++    {
++        if (!_surface || _cellSize.Width <= 0 || _cellSize.Height <= 0)
++        {
++            return {};
++        }
++
++        double x{};
++        double y{};
++        double width{};
++        double height{};
++        ghostty_surface_ime_point(_surface, &x, &y, &width, &height);
++
++        // imePoint is in DIPs; _cellSize is physical.
++        const auto cellWidth = _cellSize.Width / _compositionScale;
++        const auto cellHeight = _cellSize.Height / _compositionScale;
++
++        return {
++            std::max(0, static_cast<int32_t>(x / cellWidth)),
++            std::max(0, static_cast<int32_t>(y / cellHeight) - 1),
++        };
++    }
++
++    // The provisional text an IME shows at the cursor before it is committed.
++    // ghostty draws its own, so this is the whole of it - the attributes and
++    // cursor offset TSF also produces describe how *WT's* renderer should style
++    // it and have no counterpart here.
++    void GhosttyControlCore::SetPreedit(const hstring& text) const
++    {
++        if (!_surface)
++        {
++            return;
++        }
++
++        const auto utf8 = til::u16u8(text);
++        ghostty_surface_preedit(_surface, utf8.data(), utf8.size());
++        _renderNow();
++    }
+     bool GhosttyControlCore::ForceCursorVisible() const noexcept { return false; }
+     void GhosttyControlCore::ForceCursorVisible(bool /*force*/) {}
+ 
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.h b/src/cascadia/TerminalControl/GhosttyControlCore.h
+index 73427a6dc..93c9863cc 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.h
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.h
+@@ -152,6 +152,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         bool IsVtMouseModeEnabled() const;
+         bool ShouldSendAlternateScroll(const uint32_t uiButton, const int32_t delta) const;
+         Core::Point CursorPosition() const;
++
++        // The in-progress IME composition. Not on IControlCore: TermControl's
++        // TSF provider reaches for it directly, the same way it reaches into
++        // cascadia's renderer for the same purpose.
++        void SetPreedit(const hstring& text) const;
+         bool ForceCursorVisible() const noexcept;
+         void ForceCursorVisible(bool force);
+ 
+diff --git a/src/cascadia/TerminalControl/HwndTerminal.cpp b/src/cascadia/TerminalControl/HwndTerminal.cpp
+index 2c792e81c..f32a0d371 100644
+--- a/src/cascadia/TerminalControl/HwndTerminal.cpp
++++ b/src/cascadia/TerminalControl/HwndTerminal.cpp
+@@ -87,9 +87,39 @@ void HwndTerminal::TsfDataProvider::HandleOutput(std::wstring_view text)
+     _terminal->_WriteTextToConnection(text);
+ }
+ 
+-Microsoft::Console::Render::Renderer* HwndTerminal::TsfDataProvider::GetRenderer()
++// The same body TSF's Implementation used to run against the renderer this
++// provider handed out, now that it is handed the composition instead.
++void HwndTerminal::TsfDataProvider::SetComposition(const Microsoft::Console::Render::Composition& composition)
+ {
+-    return _terminal->_renderer.get();
++    const auto renderer = _terminal->_renderer.get();
++    const auto renderData = renderer->GetRenderData();
++
++    renderData->LockConsole();
++    const auto unlock = wil::scope_exit([&]() {
++        renderData->UnlockConsole();
++    });
++
++    renderData->tsfPreview = composition;
++    renderer->NotifyPaintFrame();
++}
++
++void HwndTerminal::TsfDataProvider::ClearComposition()
++{
++    const auto renderer = _terminal->_renderer.get();
++    const auto renderData = renderer->GetRenderData();
++
++    renderData->LockConsole();
++    const auto unlock = wil::scope_exit([&]() {
++        renderData->UnlockConsole();
++    });
++
++    auto& comp = renderData->tsfPreview;
++    if (!comp.text.empty())
++    {
++        comp.text.clear();
++        comp.attributes.clear();
++        renderer->NotifyPaintFrame();
++    }
+ }
+ 
+ // This magic flag is "documented" at https://msdn.microsoft.com/en-us/library/windows/desktop/ms646301(v=vs.85).aspx
+diff --git a/src/cascadia/TerminalControl/HwndTerminal.hpp b/src/cascadia/TerminalControl/HwndTerminal.hpp
+index 68ffc73ec..268766e3e 100644
+--- a/src/cascadia/TerminalControl/HwndTerminal.hpp
++++ b/src/cascadia/TerminalControl/HwndTerminal.hpp
+@@ -95,7 +95,8 @@ private:
+         RECT GetViewport() override;
+         RECT GetCursorPosition() override;
+         void HandleOutput(std::wstring_view text) override;
+-        Microsoft::Console::Render::Renderer* GetRenderer() override;
++        void SetComposition(const Microsoft::Console::Render::Composition& composition) override;
++        void ClearComposition() override;
+         HwndTerminal* _terminal;
+     };
+     wil::unique_hwnd _hwnd;
+diff --git a/src/cascadia/TerminalControl/TermControl.cpp b/src/cascadia/TerminalControl/TermControl.cpp
+index b02075914..827998147 100644
+--- a/src/cascadia/TerminalControl/TermControl.cpp
++++ b/src/cascadia/TerminalControl/TermControl.cpp
+@@ -6,8 +6,15 @@
+ 
+ #include <inputpaneinterop.h>
+ 
+-#include "TermControlAutomationPeer.h"
+-#include "../../renderer/atlas/AtlasEngine.h"
++#include "TermControlAutomationPeer.h"
++// The TSF provider hands a composition to whichever engine is behind the pane,
++// and each draws it its own way - so this file knows both, the same way it
++// already knows ControlCore for the UIA cluster.
++#include "GhosttyControlCore.h"
++#include "../../renderer/atlas/AtlasEngine.h"
++// Renderer and Composition both need complete types here: TSF hands us a
++// composition and cascadia writes it into its own renderer.
++#include "../../renderer/base/renderer.hpp"
+ #include "../../tsf/Handle.h"
+ 
+ #include "TermControl.g.cpp"
+@@ -199,9 +206,13 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         return clientRect;
+     }
+ 
++    // Where the candidate window goes. Everything this needs - the cursor cell
++    // and the font size - is on IControlCore, so it asks the interface rather
++    // than cascadia's core and a ghostty pane answers it too. An IME that puts
++    // its candidate list in the corner of the screen is barely better than none.
+     RECT TsfDataProvider::GetCursorPosition()
+     {
+-        const auto core = _getCore();
++        const auto core = _termControl->_core;
+         if (!core)
+         {
+             return {};
+@@ -214,8 +225,8 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         const auto scaleFactor = static_cast<float>(DisplayInformation::GetForCurrentView().RawPixelsPerViewPixel());
+         const auto localOrigin = _termControl->TransformToVisual(nullptr).TransformPoint({});
+         const auto padding = _termControl->GetPadding();
+-        const auto cursorPosition = core->CursorPosition();
+-        const auto fontSize = core->FontSize();
++        const auto cursorPosition = core.CursorPosition();
++        const auto fontSize = core.FontSize();
+ 
+         // fontSize is not in DIPs, so we need to first multiply by scaleFactor and then do the rest.
+         const auto left = clientRect.left + (localOrigin.X + static_cast<float>(padding.Left)) * scaleFactor + cursorPosition.X * fontSize.Width;
+@@ -231,53 +242,118 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         };
+     }
+ 
++    // The committed text, once the IME is done with it. SendInput is on
++    // IControlCore, so this reaches whichever engine is behind the pane - it
++    // used to ask for cascadia's core, which would have meant a ghostty pane
++    // composing text and then swallowing it.
+     void TsfDataProvider::HandleOutput(std::wstring_view text)
+     {
+-        const auto core = _getCore();
++        const auto core = _termControl->_core;
+         if (!core)
+         {
+             return;
+         }
+-        core->SendInput(text);
++        core.SendInput(text);
++    }
++
++    // Where an in-progress composition goes, per engine.
++    //
++    // TSF used to write it into WT's renderer itself, reaching through a
++    // GetRenderer() on this provider. That is exactly the coupling ADR 0001
++    // scopes per-engine, so the composition now arrives here instead and each
++    // engine puts it somewhere it can draw it.
++    void TsfDataProvider::SetComposition(const ::Microsoft::Console::Render::Composition& composition)
++    {
++        if (_getCore())
++        {
++            _setCascadiaComposition(&composition);
++            return;
++        }
++
++        // Any other engine draws its own preedit. The attributes and cursor
++        // position are dropped: they describe how WT's renderer should style
++        // the provisional text, and an engine drawing its own has its own idea
++        // about that.
++        if (const auto ghostty{ _termControl->_core.try_as<Control::GhosttyControlCore>() })
++        {
++            get_self<implementation::GhosttyControlCore>(ghostty)->SetPreedit(winrt::hstring{ composition.text });
++        }
++    }
++
++    void TsfDataProvider::ClearComposition()
++    {
++        if (_getCore())
++        {
++            _setCascadiaComposition(nullptr);
++            return;
++        }
++
++        if (const auto ghostty{ _termControl->_core.try_as<Control::GhosttyControlCore>() })
++        {
++            get_self<implementation::GhosttyControlCore>(ghostty)->SetPreedit({});
++        }
+     }
+ 
+-    ::Microsoft::Console::Render::Renderer* TsfDataProvider::GetRenderer()
++    // Cascadia's half, moved out of TSF's Implementation unchanged - including
++    // the lock and the repaint, which are why this cannot just be a property on
++    // the core.
++    void TsfDataProvider::_setCascadiaComposition(const ::Microsoft::Console::Render::Composition* composition) const
+     {
+         const auto core = _getCore();
+         if (!core)
+         {
+-            return nullptr;
++            return;
++        }
++
++        const auto renderer = core->GetRenderer();
++        const auto renderData = renderer->GetRenderData();
++
++        renderData->LockConsole();
++        const auto unlock = wil::scope_exit([&]() {
++            renderData->UnlockConsole();
++        });
++
++        auto& comp = renderData->tsfPreview;
++        if (composition)
++        {
++            comp.text = composition->text;
++            comp.attributes = composition->attributes;
++            comp.cursorPos = composition->cursorPos;
++            renderer->NotifyPaintFrame();
++        }
++        else if (!comp.text.empty())
++        {
++            comp.text.clear();
++            comp.attributes.clear();
++            renderer->NotifyPaintFrame();
+         }
+-        return core->GetRenderer();
+     }
+ 
+-    // TSF is cascadia-only. It reaches through to WT's own Renderer, which is
+-    // precisely the coupling ADR 0001 scopes per-engine - so this asks whether
+-    // the core really is the cascadia one instead of assuming it.
+-    //
+-    // The QI is for the ControlCore *class* interface, not IControlCore: every
+-    // engine implements the latter, so testing for it would succeed for all of
+-    // them and hand the wrong type to get_self. That is not hypothetical - this
+-    // function used to cast unconditionally, and the first ghostty pane died in
+-    // Renderer::GetRenderData off the resulting garbage pointer, with the null
+-    // check below never firing because the cast produced a non-null one.
+-    //
+-    // Returning null degrades a ghostty pane to "no IME", which is where
+-    // DESIGN.md already puts it until the preedit path is reimplemented per
+-    // engine.
+     // Whether this control's engine can back TSF at all.
+     //
+-    // TSF is cascadia-only: its Implementation dereferences the renderer the
+-    // data provider hands out (Implementation.cpp:197) without a null check, so
+-    // a provider that has no renderer to give cannot merely return null - the
+-    // control must not register with TSF in the first place. A ghostty pane
+-    // therefore has no IME, which is where DESIGN.md already puts it until the
+-    // preedit path is reimplemented per engine.
++    // Both can, now. TSF used to reach through the data provider for WT's own
++    // Renderer and write the composition into it, so a provider with no such
++    // renderer could not merely return null - the caller dereferenced it
++    // unchecked - and a ghostty pane had to be kept away from TSF entirely,
++    // which meant no IME at all. The provider takes the composition instead
++    // (IDataProvider::SetComposition) and each engine draws it its own way.
++    //
++    // Kept rather than deleted: an engine with no preedit path of its own would
++    // still have to say so, and saying it in one place is what kept a ghostty
++    // pane from crashing on TSF for as long as it could not.
+     bool TermControl::_tsfSupported() const noexcept
+     {
+-        return _core.try_as<Control::ControlCore>() != nullptr;
++        return true;
+     }
+ 
++    // The QI is for the ControlCore *class* interface, not IControlCore: every
++    // engine implements the latter, so testing for it would succeed for all of
++    // them and hand the wrong type to get_self. That is not hypothetical - this
++    // used to cast unconditionally, and the first ghostty pane died in
++    // Renderer::GetRenderData off the resulting garbage pointer, with the null
++    // check never firing because the cast produced a non-null one.
++    //
++    // Null now means "a different engine", not "no IME".
+     ControlCore* TsfDataProvider::_getCore() const noexcept
+     {
+         if (const auto cascadia{ _termControl->_core.try_as<Control::ControlCore>() })
+diff --git a/src/cascadia/TerminalControl/TermControl.h b/src/cascadia/TerminalControl/TermControl.h
+index d944c3480..3da6f814b 100644
+--- a/src/cascadia/TerminalControl/TermControl.h
++++ b/src/cascadia/TerminalControl/TermControl.h
+@@ -34,10 +34,12 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         RECT GetViewport() override;
+         RECT GetCursorPosition() override;
+         void HandleOutput(std::wstring_view text) override;
+-        ::Microsoft::Console::Render::Renderer* GetRenderer() override;
++        void SetComposition(const ::Microsoft::Console::Render::Composition& composition) override;
++        void ClearComposition() override;
+ 
+     private:
+         ControlCore* _getCore() const noexcept;
++        void _setCascadiaComposition(const ::Microsoft::Console::Render::Composition* composition) const;
+ 
+         TermControl* _termControl = nullptr;
+         HWND _hwnd = nullptr;
+diff --git a/src/interactivity/win32/windowproc.cpp b/src/interactivity/win32/windowproc.cpp
+index a4f46c29e..0c50c004c 100644
+--- a/src/interactivity/win32/windowproc.cpp
++++ b/src/interactivity/win32/windowproc.cpp
+@@ -103,10 +103,41 @@ struct TsfDataProvider : Microsoft::Console::TSF::IDataProvider
+         gci.GetActiveInputBuffer()->WriteString(text);
+     }
+ 
+-    Microsoft::Console::Render::Renderer* GetRenderer() override
++    // The body TSF's Implementation used to run against the renderer this
++    // provider handed out, now that it is handed the composition instead.
++    void SetComposition(const Microsoft::Console::Render::Composition& composition) override
+     {
+         auto& g = Microsoft::Console::Interactivity::ServiceLocator::LocateGlobals();
+-        return g.pRender;
++        const auto renderer = g.pRender;
++        const auto renderData = renderer->GetRenderData();
++
++        renderData->LockConsole();
++        const auto unlock = wil::scope_exit([&]() {
++            renderData->UnlockConsole();
++        });
++
++        renderData->tsfPreview = composition;
++        renderer->NotifyPaintFrame();
++    }
++
++    void ClearComposition() override
++    {
++        auto& g = Microsoft::Console::Interactivity::ServiceLocator::LocateGlobals();
++        const auto renderer = g.pRender;
++        const auto renderData = renderer->GetRenderData();
++
++        renderData->LockConsole();
++        const auto unlock = wil::scope_exit([&]() {
++            renderData->UnlockConsole();
++        });
++
++        auto& comp = renderData->tsfPreview;
++        if (!comp.text.empty())
++        {
++            comp.text.clear();
++            comp.attributes.clear();
++            renderer->NotifyPaintFrame();
++        }
+     }
+ };
+ 
+diff --git a/src/tsf/Handle.h b/src/tsf/Handle.h
+index 86afe1043..0b15796cb 100644
+--- a/src/tsf/Handle.h
++++ b/src/tsf/Handle.h
+@@ -5,7 +5,7 @@
+ 
+ namespace Microsoft::Console::Render
+ {
+-    class Renderer;
++    struct Composition;
+ }
+ 
+ namespace Microsoft::Console::TSF
+@@ -24,7 +24,19 @@ namespace Microsoft::Console::TSF
+         virtual RECT GetViewport() = 0;
+         virtual RECT GetCursorPosition() = 0;
+         virtual void HandleOutput(std::wstring_view text) = 0;
+-        virtual Render::Renderer* GetRenderer() = 0;
++
++        // Show the in-progress composition - the underlined provisional text an
++        // IME puts at the cursor before it is committed - or take it away again.
++        //
++        // This used to be `GetRenderer()`, and the composition was written into
++        // that renderer's data from inside Implementation. That made TSF depend
++        // on one particular terminal engine: a provider backed by anything else
++        // had no renderer to hand over, could not return null because the
++        // caller dereferenced it unchecked, and so could not be registered with
++        // TSF at all. Passing the composition instead leaves *how* to draw it
++        // where it belongs, with the provider.
++        virtual void SetComposition(const Render::Composition& composition) = 0;
++        virtual void ClearComposition() = 0;
+     };
+ 
+     // A pimpl idiom wrapper for `Implementation` so that we don't pull in all the TSF headers everywhere.
+diff --git a/src/tsf/Implementation.cpp b/src/tsf/Implementation.cpp
+index 00c5613cb..7d4e9274b 100644
+--- a/src/tsf/Implementation.cpp
++++ b/src/tsf/Implementation.cpp
+@@ -193,23 +193,7 @@ void Implementation::Unfocus(IDataProvider* provider)
+         return;
+     }
+ 
+-    {
+-        const auto renderer = _provider->GetRenderer();
+-        const auto renderData = renderer->GetRenderData();
+-
+-        renderData->LockConsole();
+-        const auto unlock = wil::scope_exit([&]() {
+-            renderData->UnlockConsole();
+-        });
+-
+-        if (!renderData->tsfPreview.text.empty())
+-        {
+-            auto& comp = renderData->tsfPreview;
+-            comp.text.clear();
+-            comp.attributes.clear();
+-            renderer->NotifyPaintFrame();
+-        }
+-    }
++    _provider->ClearComposition();
+ 
+     _provider.reset();
+ 
+@@ -719,22 +703,12 @@ void Implementation::_doCompositionUpdate(TfEditCookie ec)
+ 
+     if (_provider)
+     {
+-        {
+-            const auto renderer = _provider->GetRenderer();
+-            const auto renderData = renderer->GetRenderData();
+-
+-            renderData->LockConsole();
+-            const auto unlock = wil::scope_exit([&]() {
+-                renderData->UnlockConsole();
+-            });
+-
+-            auto& comp = renderData->tsfPreview;
+-            comp.text = std::move(activeComposition);
+-            comp.attributes = std::move(activeCompositionRanges);
+-            // The code block above that calculates the `cursorPos` will clamp it to a positive number.
+-            comp.cursorPos = static_cast<size_t>(cursorPos);
+-            renderer->NotifyPaintFrame();
+-        }
++        Render::Composition composition;
++        composition.text = std::move(activeComposition);
++        composition.attributes = std::move(activeCompositionRanges);
++        // The code block above that calculates the `cursorPos` will clamp it to a positive number.
++        composition.cursorPos = static_cast<size_t>(cursorPos);
++        _provider->SetComposition(composition);
+ 
+         if (!finalizedString.empty())
+         {

@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Thu, 6 Aug 2026 01:21:55 -0700
+Subject: [PATCH] feat(control): a triple click highlights the whole line
+
+Cascadia highlights the full width of the line and trims on copy. ghostty's
+default stops where the line's content stops, so side by side in one window the
+ghostty pane's triple click visibly falls short - and the highlight is drawn
+from ghostty's own selection extent, so nothing on this side could fix it.
+
+selection-trim-line = false asks for the wider extent. What gets copied is
+trimmed either way, which is the half that had to be checked separately rather
+than assumed: scripts/smoke-harness.ps1 triple clicks a 26-character line in a
+71-column terminal and requires the selection to grow to 70 cells while the
+text stays 26 characters.
+
+WT suites: terminalCore 54/54, unitSettingsModel 159/159, unitControl 55/55,
+terminalApp 51/51.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BgDGqEqRBB8L5Ueoq1uuxy
+---
+ .../TerminalControl/GhosttySettingsTranslator.cpp  |  8 ++++++++
+ .../UnitTests_Control/GhosttySettingsTests.cpp     | 14 ++++++++++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+index b7e9001bd..ce1b9199f 100644
+--- a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
++++ b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+@@ -98,6 +98,14 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             }
+         }
+ 
++        // A triple click highlights the whole width of the line here, the way
++        // cascadia's does. ghostty's own default stops where the line's content
++        // stops, which reads as a highlight that falls short next to a cascadia
++        // pane in the same window. What gets copied is trimmed either way, so
++        // this widens the highlight without putting trailing spaces on the
++        // clipboard - measured, because that was the regression to fear.
++        set("selection-trim-line", "false");
++
+         // --- Padding ------------------------------------------------------
+         // WT already insets the SwapChainPanel by this same padding, so asking
+         // ghostty to pad as well would double it. Ours is therefore zero, and
+diff --git a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+index 3d57ca2d4..d148aafa9 100644
+--- a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
++++ b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+@@ -39,6 +39,7 @@ namespace ControlUnitTests
+         TEST_METHOD(PaddingIsZeroBecauseWindowsTerminalAlreadyPads);
+         TEST_METHOD(SchemeProducesForegroundBackgroundAndFullPalette);
+         TEST_METHOD(WordDelimitersReachTheEngine);
++        TEST_METHOD(TripleClickHighlightsTheWholeLine);
+         TEST_METHOD(BackslashesAreDoubledForTheWordCharsFieldOnly);
+         TEST_METHOD(NullSettingsProduceNothing);
+ 
+@@ -169,6 +170,19 @@ namespace ControlUnitTests
+                        L"ghostty's word boundaries must come from WT's setting");
+     }
+ 
++    // ghostty's triple click stops where the line's content stops; cascadia's
++    // runs to the edge of the pane. Side by side in one window the difference
++    // is obvious, and it is drawn from ghostty's selection extent, so it can
++    // only be fixed by asking for the wider one.
++    void GhosttySettingsTests::TripleClickHighlightsTheWholeLine()
++    {
++        const auto entries = Control::implementation::TranslateGhosttySettings(
++            *_settings());
++
++        VERIFY_IS_TRUE(_has(entries, "selection-trim-line", "false"),
++                       L"a triple click must highlight the full width of the line");
++    }
++
+     // The one escaping rule left, and it belongs to the field rather than to
+     // the entry. ghostty parses selection-word-chars as a Zig string literal,
+     // so a lone backslash starts an escape sequence there - and WT's default

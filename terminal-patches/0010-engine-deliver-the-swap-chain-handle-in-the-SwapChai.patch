@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 4 Aug 2026 21:58:50 -0700
+Subject: [PATCH] engine: deliver the swap chain handle in the SwapChainChanged
+ args
+
+The ghostty pane came up completely blank. libghostty was rendering
+correctly the whole time - nothing was ever bound to the panel.
+
+TermControl::RenderEngineSwapChainChanged takes the handle from the
+event args, boxed as a uint64, and never re-reads SwapChainHandle():
+
+    HANDLE h = reinterpret_cast<HANDLE>(winrt::unbox_value<uint64_t>(args));
+
+We raised the event with null args, so the unbox threw instead of
+binding. And that handler is the only place a normal (non-reattach)
+startup ever calls _AttachDxgiSwapChainToXaml, so the panel never got a
+swap chain at all - hence blank rather than merely late.
+
+Now boxes the handle the way ControlCore does, re-reading it on the UI
+thread so the newest one wins, and raises once more at the end of
+Initialize in case the renderer built the swap chain during
+ghostty_surface_new. That second raise is a no-op while the handle is 0.
+
+Verified by capture: a WT tab titled "ghostty test" showing cmd.exe's
+banner and prompt, rendered by libghostty through the D3D11 backend into
+a DirectComposition swap chain on the XAML SwapChainPanel.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ee27Fih3vSPYsqrUBpUoc
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 34 ++++++++++++++++---
+ .../TerminalControl/GhosttyControlCore.h      |  1 +
+ 2 files changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 04a2cdfae..1933db2e9 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -69,6 +69,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         }
+ 
+         _initializedTerminal = true;
++
++        // If the renderer already built a swap chain while we were in
++        // ghostty_surface_new, its action fired before anything could act on
++        // it. Raising once here costs nothing when the handle is still 0.
++        _raiseSwapChainChanged();
+         return true;
+     }
+     catch (...)
+@@ -341,10 +346,15 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         case GHOSTTY_ACTION_SWAP_CHAIN_CHANGED:
+         {
+-            // Device loss produced a new handle; the panel's binding is stale.
+-            // This is a UI-thread event in IControlCore, and getting it wrong
+-            // shows as a frozen pane rather than an error.
+-            _raiseOnUiThread([this]() { SwapChainChanged.raise(*this, nullptr); });
++            // The handle travels in the event args, boxed as a uint64 -
++            // TermControl::RenderEngineSwapChainChanged unboxes it and binds
++            // that, and never re-reads SwapChainHandle(). Raising this with
++            // null args is not a no-op, it throws in the unbox.
++            //
++            // This is also the *only* path that ever binds the panel on a
++            // normal (non-reattach) startup, which is why getting it wrong
++            // shows up as a permanently blank pane rather than a late one.
++            _raiseSwapChainChanged();
+             return true;
+         }
+ 
+@@ -404,6 +414,22 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         return false;
+     }
+ 
++    // Re-read the handle and hand it to the control, boxed the way
++    // TermControl expects. Read on the UI thread rather than captured at the
++    // raise site: the renderer may have replaced it again in between, and the
++    // last one wins either way.
++    void GhosttyControlCore::_raiseSwapChainChanged()
++    {
++        _raiseOnUiThread([this]() {
++            const auto handle = SwapChainHandle();
++            if (handle == 0)
++            {
++                return;
++            }
++            SwapChainChanged.raise(*this, winrt::box_value<uint64_t>(handle));
++        });
++    }
++
+     // Events that IControlCore documents as UI-thread must arrive there. If we
+     // are already on it, run inline so ordering with the caller is preserved.
+     void GhosttyControlCore::_raiseOnUiThread(std::function<void()> action)
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.h b/src/cascadia/TerminalControl/GhosttyControlCore.h
+index 091d23313..955343863 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.h
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.h
+@@ -238,6 +238,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         void _applySettingsToConfig(ghostty_config_t config) const;
+         void _connectionOutputHandler(const winrt::array_view<const char16_t>& data);
+         void _connectionStateChangedHandler();
++        void _raiseSwapChainChanged();
+         void _raiseOnUiThread(std::function<void()> action);
+ 
+         Control::IControlSettings _settings{ nullptr };

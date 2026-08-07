@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Wed, 5 Aug 2026 07:12:52 -0700
+Subject: [PATCH] engine: scroll the ghostty pane from the scrollbar
+
+UserScrollViewport was a stub, so dragging the scrollbar on a ghostty
+pane did nothing - one of Phase 5's exit criteria, silently unmet.
+
+WT hands over an absolute buffer row for the top of the viewport, and
+ghostty's scroll_to_row takes an absolute row with 0 being the first row
+of the screen (scrollback included), so the two line up with no
+arithmetic in between. Driven through the binding-action API because that
+is the only route to an absolute position; the mouse-scroll entry point
+moves by deltas and would drift against the thumb over a long drag.
+
+Verified in the same session, from traces rather than by eye:
+- tab title: `cmd /k title X` reaches WT's window title, i.e. child OSC
+  -> write_pty_output -> ghostty parse -> SET_TITLE -> TitleChanged.
+- resize: growing the window moved the grid 53x29 -> 53x34 and pushed it
+  to the ConPTY.
+- side-by-side: a ghostty pane split with a cascadia pane gives one
+  window, two ConPTYs, two shells, no crash.
+
+Not verified: the scrollbar drag itself, which needs a hand on a mouse.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ee27Fih3vSPYsqrUBpUoc
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 20 ++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index e3d887d06..d37aa06d7 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -713,8 +713,26 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         return false;
+     }
+ 
+-    void GhosttyControlCore::UserScrollViewport(const int32_t /*viewTop*/)
++    // The scrollbar's thumb, dragged. WT gives an absolute buffer row for the
++    // top of the viewport, which is exactly what ghostty's scroll_to_row takes
++    // (0 being the first row of the screen, scrollback included), so the two
++    // coordinate systems line up without arithmetic.
++    //
++    // Driven through the binding-action API because that is the only route to
++    // an absolute scroll position; the mouse-scroll entry point only moves by
++    // deltas and would drift against the thumb.
++    void GhosttyControlCore::UserScrollViewport(const int32_t viewTop)
+     {
++        if (!_surface)
++        {
++            return;
++        }
++
++        const auto action = fmt::format("scroll_to_row:{}", std::max(0, viewTop));
++        if (!ghostty_surface_binding_action(_surface, action.data(), action.size()))
++        {
++            _trace(L"scroll_to_row rejected (%hs)", action.c_str());
++        }
+     }
+ 
+ #pragma endregion

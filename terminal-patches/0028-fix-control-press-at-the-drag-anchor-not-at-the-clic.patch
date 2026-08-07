@@ -1,0 +1,217 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Wed, 5 Aug 2026 23:47:45 -0700
+Subject: [PATCH] fix(control): press at the drag anchor, not at the click
+
+Windows Terminal hands the core selection *boundaries*, not the cells under
+the pointer, and the two ends arrive at different times. The far end comes from
+SetEndSelectionPoint, already rounded to the nearest cell edge. The anchor
+comes from SetSelectionAnchor on the first movement past the drag threshold -
+the touchdown point floored, and one cell further right when the drag runs
+leftwards, which is what keeps the character you started on selected.
+
+The press was going out before either of those, at LeftClickOnTerminal, which
+carries a *guess* at the anchor: the click position rounded to the nearest
+edge. ghostty latches its anchor when the button goes down and will not
+re-latch, so the guess stuck - and it is wrong whenever the click lands in the
+right half of a character, which is the "selection starts one character late"
+report.
+
+So a single click no longer presses at all. All it owes ghostty is that the old
+selection goes away, and clear_selection does that without latching anything.
+The press moves to SetSelectionAnchor, where the direction is known, preceded
+by clear_selection because a press within a cell width of the last one is a
+double click to ghostty and would select by word.
+
+Multi-clicks press once per click instead of relying on ghostty's own timing to
+agree with Windows'. Because click one always clears the sequence, the replay
+starts from zero and two presses mean word, three mean line - deterministically,
+where before an ordinary drag could select by word if the timing fell wrong.
+
+Positions now land a quarter of the way into the boundary cell rather than at
+its centre. Both are below ghostty's 60%-of-a-cell threshold - the far end of a
+drag was never the bug - but 0.1 of a cell is not a margin worth relying on
+with a content scale and whole-pixel truncation underneath. ClearSelection uses
+the new action too, replacing the press-and-release imitation.
+
+Measured on both sides before changing anything: docs/selection-geometry.md.
+Covered end to end by scripts/smoke-harness.ps1, which drags in pixels through
+WT's own rounding into the real engine and demands the characters cascadia
+would have selected - including the three-presses-inside-one-character case
+that has to come back identical.
+
+WT suites: terminalCore 54/54, unitSettingsModel 159/159, unitControl 54/54,
+terminalApp 51/51.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BgDGqEqRBB8L5Ueoq1uuxy
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 107 ++++++++++++------
+ 1 file changed, 74 insertions(+), 33 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 96ece4277..decd3bea6 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -820,9 +820,25 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+ #pragma region Selection
+ 
+-    // WT hands out selection endpoints in cells; ghostty takes mouse positions
+-    // in pixels, relative to the surface. The viewport is the shared frame of
+-    // reference - both sides mean "row 0 is the top of what is on screen".
++    // What WT hands out is not a cell under the pointer - it is a selection
++    // *boundary*, already rounded. ControlInteractivity does that rounding
++    // before the core is called: the drag anchor floors the touchdown point and
++    // adds one when the drag runs leftwards, and the far end rounds to the
++    // nearest cell edge. Measured against the real cascadia core in
++    // UnitTests_Control::SelectionDragGeometryTests; see docs/selection-geometry.md.
++    //
++    // ghostty is a boundary model too, but it derives the boundary from where
++    // in the cell the pointer is: at or past 60% of the cell width, the
++    // boundary is the cell's right edge, otherwise its left edge
++    // (SelectionGesture.zig, threshold `@round(cell_width * 0.6)`; confirmed on
++    // the real engine with GHOSTTY_HARNESS_SELECT_SWEEP).
++    //
++    // So to mean boundary B, send a pixel inside cell B below that threshold.
++    // A quarter of the way across leaves margin on both sides: the cell's own
++    // left edge below, the 60% threshold above, with room for the content scale
++    // and for ghostty truncating to whole pixels. The cell *centre*, which this
++    // used to send, also lands below 60% - the far end of a drag was never the
++    // bug - but 0.1 of a cell is not a margin worth relying on.
+     void GhosttyControlCore::_mouseTo(const Core::Point cell) const
+     {
+         if (!_surface)
+@@ -838,9 +854,14 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // Measured, not reasoned: driving this sequence in harness/hwnd-host
+         // with GHOSTTY_HARNESS_SELECT on a 200% monitor asked for cells 2..4
+         // and got 5..8 back, and asked for 5..9 and got 11..14.
++        //
++        // No padding term: the settings translator pins window-padding-x/y to
++        // zero because WT insets the SwapChainPanel itself. ghostty's own
++        // arithmetic does subtract padding_left before taking the fraction, so
++        // if that ever stops being zero this has to grow the term with it.
+         const auto cellWidth = _cellSize.Width / _compositionScale;
+         const auto cellHeight = _cellSize.Height / _compositionScale;
+-        const auto x = (static_cast<double>(cell.X) + 0.5) * cellWidth;
++        const auto x = (static_cast<double>(cell.X) + 0.25) * cellWidth;
+         const auto y = (static_cast<double>(cell.Y) + 0.5) * cellHeight;
+         ghostty_surface_mouse_pos(_surface, x, y, GHOSTTY_MODS_NONE);
+     }
+@@ -863,15 +884,21 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         _mouseDown = false;
+     }
+ 
+-    // Windows Terminal calls this *as well as* LeftClickOnTerminal for a single
+-    // physical click: the click presses, and then the first drag movement
+-    // anchors. Pressing again here made two presses land at nearly the same
+-    // place and time, which is a double click to ghostty - so an ordinary drag
+-    // selected by word, and only selected by character when the timing happened
+-    // to fall outside ghostty's double-click window.
++    // This is where a drag's anchor actually comes from, and it is the only
++    // place that knows it: ControlInteractivity calls it on the first pointer
++    // movement past the drag threshold, with the *touchdown* point floored, and
++    // one cell further right when the drag runs leftwards. That +1 is why the
++    // character you started on stays selected whichever way you drag.
+     //
+-    // So a press already in flight is left alone and this only moves. The press
+-    // belongs to whichever of the two calls arrives first.
++    // The press has to happen here rather than at the click. ghostty latches
++    // its anchor when the button goes down and will not re-latch, so pressing
++    // at click time - before the direction is known - latched WT's *rounded*
++    // click position instead, one character late whenever the click landed in
++    // the right half of a character. That was the reported bug.
++    //
++    // clear_selection first, because a press within one cell width of the last
++    // one is a double click to ghostty and would select by word. The action
++    // ends the click sequence, so this press counts as one.
+     void GhosttyControlCore::SetSelectionAnchor(const Core::Point positionCore)
+     {
+         if (!_surface)
+@@ -879,12 +906,8 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             return;
+         }
+ 
+-        if (_mouseDown)
+-        {
+-            _mouseTo(positionCore);
+-            return;
+-        }
+-
++        _releaseMouseIfHeld();
++        _bindingAction("clear_selection");
+         _mouseTo(positionCore);
+         ghostty_surface_mouse_button(_surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+         _mouseDown = true;
+@@ -897,23 +920,48 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         _renderNow();
+     }
+ 
+-    // The click that begins a selection. ghostty counts its own clicks from the
+-    // press events - a double click selects a word, a triple selects a line -
+-    // so numberOfClicks is deliberately not forwarded: passing WT's count as
+-    // well would double the count and turn a double click into a line select.
++    // The click that begins a selection.
++    //
++    // A single click sends no press at all. The position WT gives here is
++    // rounded to the nearest cell edge, which is a guess at where the selection
++    // should start; the drag anchor that follows knows, because by then the
++    // direction is known. Pressing on that guess is what latched the anchor a
++    // character late. All a single click owes ghostty is that the old selection
++    // goes away, and clear_selection does that without latching anything.
++    //
++    // Multi-clicks do press, once per click, so ghostty's own count reaches the
++    // behaviour Windows already decided on: two presses select a word, three a
++    // line. Replaying rather than forwarding a count keeps the two sides'
++    // click-timing rules out of it - and because click one cleared the sequence,
++    // the replay always starts from zero.
+     void GhosttyControlCore::LeftClickOnTerminal(const Core::Point terminalPositionCore,
+-                                                 const int32_t /*numberOfClicks*/,
++                                                 const int32_t numberOfClicks,
+                                                  const bool /*altEnabled*/,
+                                                  const bool /*shiftEnabled*/,
+                                                  const bool /*isOnOriginalPosition*/,
+                                                  bool& selectionNeedsToBeCopied)
+     {
++        if (!_surface)
++        {
++            return;
++        }
++
+         // A new physical click ends whatever drag ghostty still thinks is in
+-        // progress. Without this the press below is swallowed as a move and the
++        // progress. Without this a press below is swallowed as a move and the
+         // click extends the previous selection instead of starting one.
+         _releaseMouseIfHeld();
++        _bindingAction("clear_selection");
++
++        if (numberOfClicks > 1)
++        {
++            _mouseTo(terminalPositionCore);
++            for (auto i = 0; i < numberOfClicks; ++i)
++            {
++                ghostty_surface_mouse_button(_surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
++            }
++            _mouseDown = true;
++        }
+ 
+-        SetSelectionAnchor(terminalPositionCore);
+         _renderNow();
+         selectionNeedsToBeCopied = CopyOnSelect();
+     }
+@@ -958,14 +1006,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             return;
+         }
+         _releaseMouseIfHeld();
+-
+-        // ghostty has no clear-selection binding. A press and release without
+-        // movement is what collapses a selection in its own mouse handling, so
+-        // that is what this does. Worth replacing with a real binding upstream:
+-        // this is behaviour-by-imitation and would break if ghostty's click
+-        // handling ever changed.
+-        ghostty_surface_mouse_button(_surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+-        ghostty_surface_mouse_button(_surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
++        _bindingAction("clear_selection");
+         _renderNow();
+     }
+ 

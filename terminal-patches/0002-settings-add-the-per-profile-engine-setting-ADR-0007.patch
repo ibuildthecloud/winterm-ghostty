@@ -1,0 +1,455 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Mon, 3 Aug 2026 00:06:19 -0700
+Subject: [PATCH] settings: add the per-profile "engine" setting (ADR 0007)
+
+Flows through the existing pipe: settings JSON -> TerminalSettingsModel
+-> IControlSettings -> the factory at pane creation in
+ControlInteractivity. Only "cascadia" is valid today; it stays the
+default indefinitely and ghostty will be opt-in per profile.
+
+Unlike every other enum setting, an unrecognised value here must not
+fail the settings load. The usual EnumMapper throws DeserializationError
+and SettingsLoader rethrows it as a hard failure - an error dialog, with
+none of the user's settings applied. "ghostty" is the value users will
+reach for first and stays unrecognised until that engine ships, so a
+typo-grade mistake would break the whole settings file.
+
+So TerminalEngine gets a tolerant conversion trait that falls back to
+cascadia, and Profile::LayerJson spots the fallback from the raw JSON so
+CascadiaSettings can raise the new SettingsLoadWarnings::UnknownEngine.
+This makes "engine" deliberately more permissive than its siblings; the
+inconsistency is intentional and recorded for the retro.
+
+ProfileTests::ProfileEngineSetting pins all three behaviours. Both
+halves were mutation-tested: dropping _validateEnginesExist() fails the
+warning assertion, and reverting the tolerant trait reproduces the hard
+load failure ("* Line 16, Column 35 (engine)").
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ee27Fih3vSPYsqrUBpUoc
+---
+ .../Resources/en-US/Resources.resw            |  4 ++
+ src/cascadia/TerminalApp/TerminalWindow.cpp   |  1 +
+ .../TerminalControl/ControlInteractivity.cpp  | 15 ++++-
+ .../TerminalControl/IControlSettings.idl      | 18 +++++-
+ .../TerminalSettings.cpp                      |  5 +-
+ .../CascadiaSettings.cpp                      | 20 +++++-
+ .../TerminalSettingsModel/CascadiaSettings.h  |  1 +
+ .../TerminalSettingsModel/MTSMSettings.h      |  5 +-
+ .../TerminalSettingsModel/Profile.cpp         | 14 +++++
+ src/cascadia/TerminalSettingsModel/Profile.h  |  8 +++
+ .../TerminalSettingsModel/Profile.idl         |  5 +-
+ .../TerminalSettingsSerializationHelpers.h    | 33 ++++++++++
+ .../TerminalWarnings.idl                      |  1 +
+ .../UnitTests_SettingsModel/ProfileTests.cpp  | 62 +++++++++++++++++++
+ src/cascadia/inc/ControlProperties.h          |  5 +-
+ 15 files changed, 185 insertions(+), 12 deletions(-)
+
+diff --git a/src/cascadia/TerminalApp/Resources/en-US/Resources.resw b/src/cascadia/TerminalApp/Resources/en-US/Resources.resw
+index a178ae252..a26a76f56 100644
+--- a/src/cascadia/TerminalApp/Resources/en-US/Resources.resw
++++ b/src/cascadia/TerminalApp/Resources/en-US/Resources.resw
+@@ -267,6 +267,10 @@
+     <value>• Found a keybinding that was missing a required parameter value. This keybinding will be ignored.</value>
+     <comment>{Locked="•"} This glyph is a bullet, used in a bulleted list.</comment>
+   </data>
++  <data name="UnknownEngine" xml:space="preserve">
++    <value>• The specified "engine" was not recognized. Temporarily falling back to "cascadia".</value>
++    <comment>{Locked="•"} This glyph is a bullet, used in a bulleted list.</comment>
++  </data>
+   <data name="UnknownTheme" xml:space="preserve">
+     <value>• The specified "theme" was not found in the list of themes. Temporarily falling back to the default value.</value>
+     <comment>{Locked="•"} This glyph is a bullet, used in a bulleted list.</comment>
+diff --git a/src/cascadia/TerminalApp/TerminalWindow.cpp b/src/cascadia/TerminalApp/TerminalWindow.cpp
+index d775f8765..57463af88 100644
+--- a/src/cascadia/TerminalApp/TerminalWindow.cpp
++++ b/src/cascadia/TerminalApp/TerminalWindow.cpp
+@@ -56,6 +56,7 @@ static const std::array settingsLoadWarningsLabels{
+     USES_RESOURCE(L"DuplicateRemainingProfilesEntry"),
+     USES_RESOURCE(L"InvalidUseOfContent"),
+     USES_RESOURCE(L"InvalidRegex"),
++    USES_RESOURCE(L"UnknownEngine"),
+ };
+ 
+ static_assert(settingsLoadWarningsLabels.size() == static_cast<size_t>(SettingsLoadWarnings::WARNINGS_SIZE));
+diff --git a/src/cascadia/TerminalControl/ControlInteractivity.cpp b/src/cascadia/TerminalControl/ControlInteractivity.cpp
+index a1f93f299..759aa2dc0 100644
+--- a/src/cascadia/TerminalControl/ControlInteractivity.cpp
++++ b/src/cascadia/TerminalControl/ControlInteractivity.cpp
+@@ -46,7 +46,20 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     {
+         _id = _nextId.fetch_add(1, std::memory_order_relaxed);
+ 
+-        _core = winrt::make_self<ControlCore>(settings, unfocusedAppearance, connection);
++        // The engine factory (ADR 0007). An engine binds here, at pane
++        // creation, because engines are parallel towers sharing no mutable
++        // state - a live session cannot be transplanted between them.
++        //
++        // Only cascadia exists today. An unrecognised "engine" value never
++        // reaches this switch: it has already fallen back to the default and
++        // raised SettingsLoadWarnings::UnknownEngine.
++        switch (settings.Engine())
++        {
++        case Control::TerminalEngine::Cascadia:
++        default:
++            _core = winrt::make_self<ControlCore>(settings, unfocusedAppearance, connection);
++            break;
++        }
+ 
+         _core->Attached([weakThis = get_weak()](auto&&, auto&&) {
+             if (auto self{ weakThis.get() })
+diff --git a/src/cascadia/TerminalControl/IControlSettings.idl b/src/cascadia/TerminalControl/IControlSettings.idl
+index 4682668e9..09b4e7d1c 100644
+--- a/src/cascadia/TerminalControl/IControlSettings.idl
++++ b/src/cascadia/TerminalControl/IControlSettings.idl
+@@ -1,4 +1,4 @@
+-// Copyright (c) Microsoft Corporation.
++﻿// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ 
+ import "IControlAppearance.idl";
+@@ -20,6 +20,19 @@ namespace Microsoft.Terminal.Control
+         Aliased
+     };
+ 
++    // Which IControlCore implementation backs a pane (ADR 0007). Bound at pane
++    // creation - engines are parallel towers sharing no state, so a live
++    // session cannot be transplanted between them.
++    //
++    // Only Cascadia exists today. "ghostty" is deliberately absent rather than
++    // present-but-rejected: an unknown enum value already routes through the
++    // settings loader's warn-and-fall-back path, which is the behaviour we want
++    // until the second engine is real.
++    enum TerminalEngine
++    {
++        Cascadia = 0
++    };
++
+     enum PathTranslationStyle
+     {
+         None = 0,
+@@ -61,7 +74,8 @@ namespace Microsoft.Terminal.Control
+         String Commandline { get; };
+         String StartingDirectory { get; };
+ 
+-        TextAntialiasingMode AntialiasingMode { get; };
++        TextAntialiasingMode AntialiasingMode { get; };
++        TerminalEngine Engine { get; };
+ 
+         // Experimental Settings
+         Microsoft.Terminal.Control.GraphicsAPI GraphicsAPI { get; };
+diff --git a/src/cascadia/TerminalSettingsAppAdapterLib/TerminalSettings.cpp b/src/cascadia/TerminalSettingsAppAdapterLib/TerminalSettings.cpp
+index 2b2fad932..b5eaec408 100644
+--- a/src/cascadia/TerminalSettingsAppAdapterLib/TerminalSettings.cpp
++++ b/src/cascadia/TerminalSettingsAppAdapterLib/TerminalSettings.cpp
+@@ -1,4 +1,4 @@
+-// Copyright (c) Microsoft Corporation.
++﻿// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ 
+ #include "pch.h"
+@@ -318,7 +318,8 @@ namespace winrt::Microsoft::Terminal::Settings
+ 
+         _ScrollState = profile.ScrollState();
+ 
+-        _AntialiasingMode = profile.AntialiasingMode();
++        _AntialiasingMode = profile.AntialiasingMode();
++        _Engine = profile.Engine();
+ 
+         if (profile.TabColor())
+         {
+diff --git a/src/cascadia/TerminalSettingsModel/CascadiaSettings.cpp b/src/cascadia/TerminalSettingsModel/CascadiaSettings.cpp
+index 9897629f3..5e024fb3f 100644
+--- a/src/cascadia/TerminalSettingsModel/CascadiaSettings.cpp
++++ b/src/cascadia/TerminalSettingsModel/CascadiaSettings.cpp
+@@ -1,4 +1,4 @@
+-// Copyright (c) Microsoft Corporation.
++﻿// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ 
+ #include "pch.h"
+@@ -444,6 +444,7 @@ void CascadiaSettings::_validateSettings()
+     _validateThemeExists();
+     _validateProfileEnvironmentVariables();
+     _validateRegexes();
++    _validateEnginesExist();
+ }
+ 
+ // Method Description:
+@@ -707,6 +708,23 @@ static bool _validateNTMEntries(const IVector<Model::NewTabMenuEntry>& entries)
+     return true;
+ }
+ 
++// Method Description:
++// - Warns if any profile named an "engine" that is not recognised (ADR 0007).
++//   Unlike other enum settings, an unknown engine does not fail the settings
++//   load - it falls back to the default - so without this the substitution
++//   would be silent.
++void CascadiaSettings::_validateEnginesExist()
++{
++    for (const auto& profile : _allProfiles)
++    {
++        if (winrt::get_self<Profile>(profile)->_EngineValueUnrecognized)
++        {
++            _warnings.Append(SettingsLoadWarnings::UnknownEngine);
++            return;
++        }
++    }
++}
++
+ void CascadiaSettings::_validateRegexes()
+ {
+     if (!_validateNTMEntries(_globals->NewTabMenu()))
+diff --git a/src/cascadia/TerminalSettingsModel/CascadiaSettings.h b/src/cascadia/TerminalSettingsModel/CascadiaSettings.h
+index cebf8174d..03e983335 100644
+--- a/src/cascadia/TerminalSettingsModel/CascadiaSettings.h
++++ b/src/cascadia/TerminalSettingsModel/CascadiaSettings.h
+@@ -222,6 +222,7 @@ namespace winrt::Microsoft::Terminal::Settings::Model::implementation
+         bool _hasInvalidColorScheme(const Model::Command& command) const;
+         void _validateThemeExists();
+         void _validateRegexes();
++        void _validateEnginesExist();
+ 
+         void _researchOnLoad();
+ 
+diff --git a/src/cascadia/TerminalSettingsModel/MTSMSettings.h b/src/cascadia/TerminalSettingsModel/MTSMSettings.h
+index 96cd878b8..f2000cfdf 100644
+--- a/src/cascadia/TerminalSettingsModel/MTSMSettings.h
++++ b/src/cascadia/TerminalSettingsModel/MTSMSettings.h
+@@ -1,4 +1,4 @@
+-/*++
++﻿/*++
+ Copyright (c) Microsoft Corporation
+ Licensed under the MIT license.
+ 
+@@ -87,7 +87,8 @@ Author(s):
+     X(hstring, AnswerbackMessage, "answerbackMessage")                                                                                                         \
+     X(hstring, Commandline, "commandline", L"%SystemRoot%\\System32\\cmd.exe")                                                                                 \
+     X(Microsoft::Terminal::Control::ScrollbarState, ScrollState, "scrollbarState", Microsoft::Terminal::Control::ScrollbarState::Visible)                      \
+-    X(Microsoft::Terminal::Control::TextAntialiasingMode, AntialiasingMode, "antialiasingMode", Microsoft::Terminal::Control::TextAntialiasingMode::Grayscale) \
++    X(Microsoft::Terminal::Control::TextAntialiasingMode, AntialiasingMode, "antialiasingMode", Microsoft::Terminal::Control::TextAntialiasingMode::Grayscale) \
++    X(Microsoft::Terminal::Control::TerminalEngine, Engine, "engine", Microsoft::Terminal::Control::TerminalEngine::Cascadia) \
+     X(hstring, StartingDirectory, "startingDirectory")                                                                                                         \
+     X(IMediaResource, Icon, "icon", implementation::MediaResource::FromString(L"\uE756"))                                                                      \
+     X(bool, SuppressApplicationTitle, "suppressApplicationTitle", false)                                                                                       \
+diff --git a/src/cascadia/TerminalSettingsModel/Profile.cpp b/src/cascadia/TerminalSettingsModel/Profile.cpp
+index 50aa36ec3..6cd019ad8 100644
+--- a/src/cascadia/TerminalSettingsModel/Profile.cpp
++++ b/src/cascadia/TerminalSettingsModel/Profile.cpp
+@@ -208,6 +208,20 @@ void Profile::LayerJson(const Json::Value& json)
+     MTSM_PROFILE_SETTINGS(PROFILE_SETTINGS_LAYER_JSON)
+ #undef PROFILE_SETTINGS_LAYER_JSON
+ 
++    // "engine" converts permissively rather than failing the whole settings
++    // load (see ConversionTrait<TerminalEngine>), so the fallback is silent by
++    // the time the macro above has run. Spot it here from the raw JSON, so
++    // CascadiaSettings can raise SettingsLoadWarnings::UnknownEngine.
++    static constexpr std::string_view EngineKey{ "engine" };
++    if (json.isMember(JsonKey(EngineKey)))
++    {
++        const auto& engineJson = json[JsonKey(EngineKey)];
++        if (engineJson.isString())
++        {
++            _EngineValueUnrecognized = engineJson.asString() != "cascadia";
++        }
++    }
++
+     if (json.isMember(JsonKey(UnfocusedAppearanceKey)))
+     {
+         auto unfocusedAppearance{ winrt::make_self<implementation::AppearanceConfig>(weak_ref<Model::Profile>(*this)) };
+diff --git a/src/cascadia/TerminalSettingsModel/Profile.h b/src/cascadia/TerminalSettingsModel/Profile.h
+index 96c6ab8f9..ee8f012c7 100644
+--- a/src/cascadia/TerminalSettingsModel/Profile.h
++++ b/src/cascadia/TerminalSettingsModel/Profile.h
+@@ -141,6 +141,14 @@ namespace winrt::Microsoft::Terminal::Settings::Model::implementation
+         MTSM_PROFILE_SETTINGS(PROFILE_SETTINGS_INITIALIZE)
+ #undef PROFILE_SETTINGS_INITIALIZE
+ 
++    public:
++        // True when the profile named an "engine" that is not recognised, and
++        // the conversion fell back to the default instead of failing the whole
++        // settings load. Implementation-only: CascadiaSettings turns this into
++        // SettingsLoadWarnings::UnknownEngine. Deliberately not projected -
++        // nothing above the settings model needs it.
++        bool _EngineValueUnrecognized{ false };
++
+     private:
+         Model::IAppearanceConfig _DefaultAppearance{ winrt::make<AppearanceConfig>(weak_ref<Model::Profile>(*this)) };
+         Model::FontConfig _FontInfo{ winrt::make<FontConfig>(weak_ref<Model::Profile>(*this)) };
+diff --git a/src/cascadia/TerminalSettingsModel/Profile.idl b/src/cascadia/TerminalSettingsModel/Profile.idl
+index 3702003ac..42ddfaf16 100644
+--- a/src/cascadia/TerminalSettingsModel/Profile.idl
++++ b/src/cascadia/TerminalSettingsModel/Profile.idl
+@@ -1,4 +1,4 @@
+-// Copyright (c) Microsoft Corporation.
++﻿// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ 
+ import "IAppearanceConfig.idl";
+@@ -67,7 +67,8 @@ namespace Microsoft.Terminal.Settings.Model
+         IAppearanceConfig DefaultAppearance { get; };
+         INHERITABLE_PROFILE_SETTING(IAppearanceConfig, UnfocusedAppearance);
+ 
+-        INHERITABLE_PROFILE_SETTING(Microsoft.Terminal.Control.TextAntialiasingMode, AntialiasingMode);
++        INHERITABLE_PROFILE_SETTING(Microsoft.Terminal.Control.TextAntialiasingMode, AntialiasingMode);
++        INHERITABLE_PROFILE_SETTING(Microsoft.Terminal.Control.TerminalEngine, Engine);
+ 
+         INHERITABLE_PROFILE_SETTING(Int32, HistorySize);
+         INHERITABLE_PROFILE_SETTING(Boolean, SnapOnInput);
+diff --git a/src/cascadia/TerminalSettingsModel/TerminalSettingsSerializationHelpers.h b/src/cascadia/TerminalSettingsModel/TerminalSettingsSerializationHelpers.h
+index 878b09f89..268a7e3a4 100644
+--- a/src/cascadia/TerminalSettingsModel/TerminalSettingsSerializationHelpers.h
++++ b/src/cascadia/TerminalSettingsModel/TerminalSettingsSerializationHelpers.h
+@@ -164,6 +164,39 @@ JSON_ENUM_MAPPER(::winrt::Microsoft::Terminal::Control::TextAntialiasingMode)
+     };
+ };
+ 
++// Type Description:
++// - Which IControlCore implementation backs a pane (ADR 0007).
++//
++// This one deliberately does NOT inherit EnumMapper's strictness. Every other
++// enum setting throws DeserializationError on an unrecognised value, and
++// SettingsLoader rethrows that as a hard settings-load failure - the user gets
++// an error dialog and none of their settings apply.
++//
++// That is the wrong outcome here. "ghostty" is the value users will reach for
++// first, and it stays unrecognised until that engine ships, so a typo-grade
++// mistake would break the whole settings file. Instead an unknown value falls
++// back to the default; Profile::LayerJson notices the fallback and raises
++// SettingsLoadWarnings::UnknownEngine.
++JSON_ENUM_MAPPER(::winrt::Microsoft::Terminal::Control::TerminalEngine)
++{
++    static constexpr std::array<pair_type, 1> mappings = {
++        pair_type{ "cascadia", ValueType::Cascadia }
++    };
++
++    ValueType FromJson(const Json::Value& json) const
++    {
++        const auto name{ Detail::GetStringView(json) };
++        for (const auto& pair : mappings)
++        {
++            if (pair.first == name)
++            {
++                return pair.second;
++            }
++        }
++        return ValueType::Cascadia;
++    }
++};
++
+ // Type Description:
+ // - Helper for converting a user-specified closeOnExit value to its corresponding enum
+ JSON_ENUM_MAPPER(::winrt::Microsoft::Terminal::Settings::Model::CloseOnExitMode)
+diff --git a/src/cascadia/TerminalSettingsModel/TerminalWarnings.idl b/src/cascadia/TerminalSettingsModel/TerminalWarnings.idl
+index 74f373796..af9862f21 100644
+--- a/src/cascadia/TerminalSettingsModel/TerminalWarnings.idl
++++ b/src/cascadia/TerminalSettingsModel/TerminalWarnings.idl
+@@ -25,6 +25,7 @@ namespace Microsoft.Terminal.Settings.Model
+         DuplicateRemainingProfilesEntry,
+         InvalidUseOfContent,
+         InvalidRegex,
++        UnknownEngine,
+         WARNINGS_SIZE // IMPORTANT: This MUST be the last value in this enum. It's an unused placeholder.
+     };
+ 
+diff --git a/src/cascadia/UnitTests_SettingsModel/ProfileTests.cpp b/src/cascadia/UnitTests_SettingsModel/ProfileTests.cpp
+index 9264a4a44..992eb31cc 100644
+--- a/src/cascadia/UnitTests_SettingsModel/ProfileTests.cpp
++++ b/src/cascadia/UnitTests_SettingsModel/ProfileTests.cpp
+@@ -32,6 +32,8 @@ namespace SettingsModelUnitTests
+         TEST_METHOD(TestCorrectOldDefaultShellPaths);
+         TEST_METHOD(ProfileDefaultsProhibitedSettings);
+ 
++        TEST_METHOD(ProfileEngineSetting);
++
+         TEST_METHOD(SettingInheritanceFallback);
+         TEST_METHOD(ClearSettingRestoresInheritance);
+         TEST_METHOD(HasSettingAtSpecificLayer);
+@@ -537,6 +539,66 @@ namespace SettingsModelUnitTests
+         VERIFY_ARE_NOT_EQUAL(L"foo.exe", allProfiles.GetAt(2).Commandline());
+     }
+ 
++    void ProfileTests::ProfileEngineSetting()
++    {
++        // The per-profile "engine" setting (ADR 0007). Only "cascadia" is valid
++        // today, so this pins the three behaviours the phase contracts for:
++        // it parses, it defaults, and an unknown value degrades to a warning
++        // rather than failing the whole settings load.
++        static constexpr std::string_view userSettings{ R"({
++            "profiles": {
++                "list": [
++                    {
++                        "name": "explicit",
++                        "guid": "{6239a42c-0000-49a3-80bd-e8fdd045185c}",
++                        "engine": "cascadia"
++                    },
++                    {
++                        "name": "unset",
++                        "guid": "{6239a42c-1111-49a3-80bd-e8fdd045185c}"
++                    },
++                    {
++                        "name": "unknown",
++                        "guid": "{6239a42c-2222-49a3-80bd-e8fdd045185c}",
++                        "engine": "ghostty"
++                    }
++                ]
++            }
++        })" };
++
++        // Note this does not throw. Every other enum setting would: an
++        // unrecognised value normally becomes a DeserializationError that
++        // SettingsLoader rethrows as a hard settings-load failure.
++        const auto settings = winrt::make_self<implementation::CascadiaSettings>(userSettings);
++        const auto allProfiles = settings->AllProfiles();
++        VERIFY_ARE_EQUAL(3u, allProfiles.Size());
++
++        // "cascadia" parses.
++        VERIFY_ARE_EQUAL(winrt::Microsoft::Terminal::Control::TerminalEngine::Cascadia,
++                         allProfiles.GetAt(0).Engine());
++
++        // Absent means cascadia - it stays the default indefinitely (ADR 0007).
++        VERIFY_ARE_EQUAL(winrt::Microsoft::Terminal::Control::TerminalEngine::Cascadia,
++                         allProfiles.GetAt(1).Engine());
++
++        // An unknown engine falls back rather than failing the load. "ghostty"
++        // is the value users will reach for first, and it stays unrecognised
++        // until that engine ships.
++        VERIFY_ARE_EQUAL(winrt::Microsoft::Terminal::Control::TerminalEngine::Cascadia,
++                         allProfiles.GetAt(2).Engine());
++
++        // ...and the fallback is reported rather than silent.
++        auto sawUnknownEngine = false;
++        for (const auto& warning : settings->Warnings())
++        {
++            if (warning == SettingsLoadWarnings::UnknownEngine)
++            {
++                sawUnknownEngine = true;
++            }
++        }
++        VERIFY_IS_TRUE(sawUnknownEngine, L"expected SettingsLoadWarnings::UnknownEngine");
++    }
++
+     void ProfileTests::SettingInheritanceFallback()
+     {
+         // Verify that when no layer defines a setting, the default value is used.
+diff --git a/src/cascadia/inc/ControlProperties.h b/src/cascadia/inc/ControlProperties.h
+index e54cb14a2..061699aa4 100644
+--- a/src/cascadia/inc/ControlProperties.h
++++ b/src/cascadia/inc/ControlProperties.h
+@@ -1,4 +1,4 @@
+-// Copyright (c) Microsoft Corporation.
++﻿// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ 
+ #pragma once
+@@ -77,7 +77,8 @@
+     X(winrt::hstring, Commandline)                                                                                                                       \
+     X(winrt::hstring, StartingDirectory)                                                                                                                 \
+     X(winrt::Microsoft::Terminal::Control::ScrollbarState, ScrollState, winrt::Microsoft::Terminal::Control::ScrollbarState::Visible)                    \
+-    X(winrt::Microsoft::Terminal::Control::TextAntialiasingMode, AntialiasingMode, winrt::Microsoft::Terminal::Control::TextAntialiasingMode::Grayscale) \
++    X(winrt::Microsoft::Terminal::Control::TextAntialiasingMode, AntialiasingMode, winrt::Microsoft::Terminal::Control::TextAntialiasingMode::Grayscale) \
++    X(winrt::Microsoft::Terminal::Control::TerminalEngine, Engine, winrt::Microsoft::Terminal::Control::TerminalEngine::Cascadia) \
+     X(winrt::Microsoft::Terminal::Control::GraphicsAPI, GraphicsAPI)                                                                                     \
+     X(bool, DisablePartialInvalidation, false)                                                                                                           \
+     X(bool, SoftwareRendering, false)                                                                                                                    \

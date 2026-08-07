@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Wed, 5 Aug 2026 11:05:19 -0700
+Subject: [PATCH] engine: force a draw after feeding pty output
+
+A ghostty pane stopped repainting partway through any long output. The
+terminal was fine - scrolling revealed the whole listing, correctly
+parsed - but the screen stayed stale until something unrelated woke it.
+Output did not repaint; neither did resizing; scrolling did.
+
+libghostty schedules repaints through its `wakeup` async, which
+coalesces by design - the comment on the neighbouring `draw_now` async
+says so: "This does not coalesce like the wakeup does." A notify that
+lands after the renderer has already sampled the terminal state is folded
+into a wake that has finished its work, so the last batch never reaches
+the screen.
+
+Measured in one run: queueRender notified 80 times, processOutput ran 80
+times, the renderer thread woke fewer than 20 times, and drawFrame
+stopped being called entirely while bytes kept arriving. Ruled out along
+the way, each with evidence rather than argument: lost bytes (58 KB
+parsed during the freeze), a skipped back-buffer copy (never happened),
+deadlock (every thread idle, children at a prompt), and
+must_draw_from_app_thread (not declared for this apprt).
+
+ghostty_surface_draw is drawFrame(sync = true), which skips the
+needs_redraw gate and is documented as safe from another thread. It is
+exactly what hwnd-host does on WM_PAINT - which is why the harness never
+showed this in three phases of work, and why a XAML pane, having no
+paint pump, showed it immediately. Composition mode was correlated, not
+causal.
+
+Verified: `dir C:\Windows\System32` now renders all 4796 entries and ends
+at the prompt with no scrolling or resizing.
+
+This is arguably compensating for an upstream shortcoming - output ought
+to drive its own repaint without the embedder forcing frames, and any
+embedder not pumping paint messages would hit this. Worth raising
+upstream; the retro should decide whether we carry a patch that makes the
+tail of the wakeup non-coalescing instead.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ee27Fih3vSPYsqrUBpUoc
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 20 +++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index d37aa06d7..befe27c1e 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -310,6 +310,26 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         ghostty_surface_write_pty_output(_surface,
+                                          reinterpret_cast<const uint8_t*>(_utf8Scratch.data()),
+                                          _utf8Scratch.size());
++
++        // Then force the frame out.
++        //
++        // Parsing schedules a render through libghostty's `wakeup` async,
++        // which *coalesces by design* (its own comment contrasts it with the
++        // non-coalescing `draw_now`). A notify that lands after the renderer
++        // has already sampled the terminal state is folded into a wake that
++        // has done its work, so the final batch never reaches the screen: the
++        // pane freezes mid-output and stays frozen until something unrelated
++        // wakes it, which is exactly what scrolling did.
++        //
++        // Measured: 80 notifies produced fewer than 20 wakes, and drawFrame
++        // stopped being called entirely while the parser kept running.
++        //
++        // ghostty_surface_draw is drawFrame(sync = true), which skips the
++        // needs_redraw gate and is documented as safe to call from another
++        // thread. It is what hwnd-host does on WM_PAINT - which is why the
++        // harness never showed this and a XAML pane, having no paint pump,
++        // always did.
++        ghostty_surface_draw(_surface);
+     }
+ 
+     void GhosttyControlCore::_connectionStateChangedHandler()

@@ -1,0 +1,334 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Wed, 5 Aug 2026 23:18:26 -0700
+Subject: [PATCH] test(control): pin what a pixel drag selects on cascadia
+
+The rule a user feels is the composition of two quantisations -
+std::round at the press site, std::floor plus a direction fudge at the drag
+anchor - so it cannot be read off either one. This drives PointerPressed and
+PointerMoved in pixels against a real ControlCore and reads the selection back,
+sweeping both endpoints across whole cells.
+
+What it found, and now pins:
+
+  dragging right: [ floor(press.x / w) , round(drag.x / w) )
+  dragging left:  [ round(drag.x / w)  , floor(press.x / w) + 1 )
+
+The cell the drag started on is always selected whole, and where inside it the
+press landed makes no difference - the first drag movement re-anchors and
+throws the press site's rounding away. That is stated as its own test, because
+that rounding looks load-bearing and is not; taking it at face value is what
+sent ghostty's anchor a character late.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BgDGqEqRBB8L5Ueoq1uuxy
+---
+ src/cascadia/TerminalControl/ControlCore.h    |   4 +
+ .../TerminalControl/ControlInteractivity.h    |   3 +
+ .../Control.UnitTests.vcxproj                 |   1 +
+ .../SelectionDragGeometryTests.cpp            | 241 ++++++++++++++++++
+ 4 files changed, 249 insertions(+)
+ create mode 100644 src/cascadia/UnitTests_Control/SelectionDragGeometryTests.cpp
+
+diff --git a/src/cascadia/TerminalControl/ControlCore.h b/src/cascadia/TerminalControl/ControlCore.h
+index 376964bbc..dfba3227d 100644
+--- a/src/cascadia/TerminalControl/ControlCore.h
++++ b/src/cascadia/TerminalControl/ControlCore.h
+@@ -39,6 +39,7 @@ namespace ControlUnitTests
+     class ControlCoreTests;
+     class ControlInteractivityTests;
+     class GhosttyEngineSelectionTests;
++    class SelectionDragGeometryTests;
+ };
+ 
+ #define RUNTIME_SETTING(type, name, setting)                 \
+@@ -468,6 +469,9 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         friend class ControlUnitTests::ControlInteractivityTests;
+         // Needs _inUnitTests, so a core it builds can be torn down in a test host.
+         friend class ControlUnitTests::GhosttyEngineSelectionTests;
++        // Reads the selection back in cell coordinates, to measure what a
++        // pixel drag actually selected.
++        friend class ControlUnitTests::SelectionDragGeometryTests;
+         bool _inUnitTests{ false };
+     };
+ }
+diff --git a/src/cascadia/TerminalControl/ControlInteractivity.h b/src/cascadia/TerminalControl/ControlInteractivity.h
+index b8a6b5656..ef98c3609 100644
+--- a/src/cascadia/TerminalControl/ControlInteractivity.h
++++ b/src/cascadia/TerminalControl/ControlInteractivity.h
+@@ -28,6 +28,7 @@ namespace ControlUnitTests
+     class ControlCoreTests;
+     class ControlInteractivityTests;
+     class GhosttyEngineSelectionTests;
++    class SelectionDragGeometryTests;
+ };
+ 
+ namespace winrt::Microsoft::Terminal::Control::implementation
+@@ -179,6 +180,8 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         friend class ControlUnitTests::ControlInteractivityTests;
+         // Needs _cascadiaCore() to tell which engine the factory picked.
+         friend class ControlUnitTests::GhosttyEngineSelectionTests;
++        // Drives PointerPressed/Moved in pixels against cascadia's own core.
++        friend class ControlUnitTests::SelectionDragGeometryTests;
+     };
+ }
+ 
+diff --git a/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj b/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
+index bc3ce5a93..39edb89b1 100644
+--- a/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
++++ b/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
+@@ -44,6 +44,7 @@
+     <ClCompile Include="..\TerminalControl\GhosttySettingsTranslator.cpp" />
+     <ClCompile Include="..\TerminalControl\GhosttyKeyTranslator.cpp" />
+     <ClCompile Include="ControlInteractivityTests.cpp" />
++    <ClCompile Include="SelectionDragGeometryTests.cpp" />
+     <ClCompile Include="pch.cpp">
+       <PrecompiledHeader>Create</PrecompiledHeader>
+     </ClCompile>
+diff --git a/src/cascadia/UnitTests_Control/SelectionDragGeometryTests.cpp b/src/cascadia/UnitTests_Control/SelectionDragGeometryTests.cpp
+new file mode 100644
+index 000000000..79a70d8c3
+--- /dev/null
++++ b/src/cascadia/UnitTests_Control/SelectionDragGeometryTests.cpp
+@@ -0,0 +1,241 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++//
++// What a mouse drag at a given *pixel* selects, measured against the real
++// cascadia core.
++//
++// A second engine has to reproduce this, and it cannot be reproduced from a
++// description. ControlInteractivity quantises the pointer to a cell before the
++// core ever sees it - std::round at the click site, std::floor plus a
++// direction fudge at the drag anchor - so the rule a user actually feels is
++// the composition of those two, not either one. This suite pins the
++// composition in pixels, so the ghostty mapping has something exact to match.
++//
++// Measured on 2026-08-05 at a 9x19 cell, sweeping the press and drag positions
++// across whole cells in 20%-of-a-cell steps. Both directions came out as a
++// half-open span of cells [start, end):
++//
++//   dragging right: [ floor(press.x / w) , round(drag.x / w) )
++//   dragging left:  [ round(drag.x / w)  , floor(press.x / w) + 1 )
++//
++// Two things fall out of that, and they are what the ghostty side has to
++// honour:
++//
++//   1. The cell the drag *started* on is always selected whole, whichever
++//      direction the drag goes, and where inside it the press landed makes no
++//      difference at all. ControlInteractivity re-anchors on the first drag
++//      movement (SetSelectionAnchor with floor, +1 when dragging left) and
++//      that overrides the rounded position the press site sent.
++//   2. The far end of the selection moves at the *midpoint* of a cell.
++//
++// So both endpoints WT hands the core are already selection boundaries. They
++// are not the cells under the pointer, and re-reading them as cells is what
++// put ghostty's selection one character off.
++
++#include "pch.h"
++#include "../TerminalControl/ControlInteractivity.h"
++#include "../TerminalControl/ControlCore.h"
++
++#include "MockControlSettings.h"
++#include "MockConnection.h"
++
++using namespace WEX::Logging;
++using namespace WEX::TestExecution;
++using namespace WEX::Common;
++
++using namespace winrt;
++using namespace winrt::Microsoft::Terminal;
++using namespace ::Microsoft::Terminal::Core;
++
++namespace ControlUnitTests
++{
++    class SelectionDragGeometryTests
++    {
++        BEGIN_TEST_CLASS(SelectionDragGeometryTests)
++            TEST_CLASS_PROPERTY(L"TestTimeout", L"0:1:00")
++        END_TEST_CLASS()
++
++        TEST_METHOD(DragRightSpansPressCellToDragMidpoint);
++        TEST_METHOD(DragLeftSpansDragMidpointThroughPressCell);
++        TEST_METHOD(PressPositionWithinTheCellDoesNotMoveTheAnchor);
++
++        TEST_CLASS_SETUP(ClassSetup)
++        {
++            winrt::init_apartment(winrt::apartment_type::single_threaded);
++            return true;
++        }
++        TEST_CLASS_CLEANUP(ClassCleanup)
++        {
++            winrt::uninit_apartment();
++            return true;
++        }
++
++    private:
++        // The half-open cell span [start, end) a drag produced. GetSelectionEnd
++        // is exclusive - see ControlInteractivityTests::TestDragSelectOutsideBounds,
++        // whose expectation adds one for exactly that reason. { -1, -1 } means
++        // the drag produced no selection at all.
++        struct Span
++        {
++            til::CoordType start;
++            til::CoordType end;
++
++            bool operator==(const Span& o) const noexcept { return start == o.start && end == o.end; }
++        };
++
++        struct Harness
++        {
++            winrt::com_ptr<MockControlSettings> settings;
++            winrt::com_ptr<MockConnection> conn;
++            winrt::com_ptr<Control::implementation::ControlCore> core;
++            winrt::com_ptr<Control::implementation::ControlInteractivity> interactivity;
++            float cellWidth{};
++            uint64_t clock{};
++
++            // Pixel of a position given as a cell plus a fraction across it.
++            int32_t px(double cell, double frac) const
++            {
++                return gsl::narrow_cast<int32_t>(cell * cellWidth + frac * cellWidth);
++            }
++
++            // One drag, press to release, in pixels. Returns what the core says
++            // is selected afterwards.
++            Span drag(int32_t fromX, int32_t toX, int32_t y = 0)
++            {
++                const auto modifiers = ControlKeyStates();
++                const auto down{ Control::MouseButtonState::IsLeftButtonDown };
++                const Control::MouseButtonState up{};
++
++                // Far enough apart that _numberOfClicks always says "1": a
++                // repeated press at the same pixel would otherwise become a
++                // double click and select by word.
++                clock += 10'000'000;
++
++                interactivity->PointerPressed(0, down, WM_LBUTTONDOWN, clock, modifiers, Core::Point{ fromX, y });
++                interactivity->PointerMoved(0, down, WM_LBUTTONDOWN, modifiers, Core::Point{ toX, y });
++                interactivity->PointerReleased(0, up, WM_LBUTTONUP, modifiers, Core::Point{ toX, y });
++
++                if (!core->HasSelection())
++                {
++                    return { -1, -1 };
++                }
++                const auto anchor = core->_terminal->GetSelectionAnchor();
++                const auto end = core->_terminal->GetSelectionEnd();
++                core->ClearSelection();
++                return { anchor.x, end.x };
++            }
++        };
++
++        Harness _harness()
++        {
++            Harness h{};
++            h.settings = winrt::make_self<MockControlSettings>();
++            h.conn = winrt::make_self<MockConnection>();
++            h.interactivity = winrt::make_self<Control::implementation::ControlInteractivity>(
++                *h.settings, *h.settings, *h.conn);
++            h.core.copy_from(h.interactivity->_cascadiaCore());
++            VERIFY_IS_NOT_NULL(h.core);
++            h.core->_inUnitTests = true;
++
++            h.core->Initialize(270, 380, 1.0);
++#ifndef NDEBUG
++            h.core->_terminal->_suppressLockChecks = true;
++#endif
++            VERIFY_IS_TRUE(h.core->_initializedTerminal);
++            h.interactivity->Initialize();
++            h.interactivity->GotFocus();
++
++            h.cellWidth = h.core->FontSize().Width;
++            VERIFY_IS_TRUE(h.cellWidth > 1.0f);
++            return h;
++        }
++
++        // The rule this suite exists to state, as arithmetic rather than prose.
++        // Taken from the pixels rather than the nominal fractions: a pixel is a
++        // whole number, so asking for 55% of a 9px cell actually lands at 44%.
++        static Span _expected(int32_t pressPx, int32_t dragPx, float cellWidth)
++        {
++            const auto w = gsl::narrow_cast<double>(cellWidth);
++            const auto pressCell = gsl::narrow_cast<til::CoordType>(std::floor(pressPx / w));
++            const auto boundary = gsl::narrow_cast<til::CoordType>(std::lround(dragPx / w));
++            return dragPx < pressPx ? Span{ boundary, pressCell + 1 } :
++                                      Span{ pressCell, boundary };
++        }
++    };
++
++    // Dragging right: the cell pressed on is the start, and the end boundary
++    // steps to the next cell as the pointer crosses each cell's midpoint.
++    void SelectionDragGeometryTests::DragRightSpansPressCellToDragMidpoint()
++    {
++        auto h = _harness();
++        const double fracs[] = { 0.05, 0.25, 0.45, 0.55, 0.75, 0.95 };
++
++        for (const auto pressFrac : fracs)
++        {
++            for (double dragCell = 6; dragCell <= 8; dragCell += 1)
++            {
++                for (const auto dragFrac : fracs)
++                {
++                    const auto pressPx = h.px(4, pressFrac);
++                    const auto dragPx = h.px(dragCell, dragFrac);
++                    const auto actual = h.drag(pressPx, dragPx);
++                    const auto expected = _expected(pressPx, dragPx, h.cellWidth);
++                    VERIFY_ARE_EQUAL(expected.start, actual.start,
++                                     NoThrowString().Format(L"start: press 4+%.2f drag %.0f+%.2f",
++                                                            pressFrac, dragCell, dragFrac));
++                    VERIFY_ARE_EQUAL(expected.end, actual.end,
++                                     NoThrowString().Format(L"end: press 4+%.2f drag %.0f+%.2f",
++                                                            pressFrac, dragCell, dragFrac));
++                }
++            }
++        }
++    }
++
++    // Dragging left is the mirror image, and the asymmetry is the point: the
++    // pressed cell is still selected whole, so its *right* edge is the fixed
++    // boundary. That is the anchor ControlInteractivity nudges with termPos.x++.
++    void SelectionDragGeometryTests::DragLeftSpansDragMidpointThroughPressCell()
++    {
++        auto h = _harness();
++        const double fracs[] = { 0.05, 0.25, 0.45, 0.55, 0.75, 0.95 };
++
++        for (const auto pressFrac : fracs)
++        {
++            for (double dragCell = 0; dragCell <= 2; dragCell += 1)
++            {
++                for (const auto dragFrac : fracs)
++                {
++                    const auto pressPx = h.px(8, pressFrac);
++                    const auto dragPx = h.px(dragCell, dragFrac);
++                    const auto actual = h.drag(pressPx, dragPx);
++                    const auto expected = _expected(pressPx, dragPx, h.cellWidth);
++                    VERIFY_ARE_EQUAL(expected.start, actual.start,
++                                     NoThrowString().Format(L"start: press 8+%.2f drag %.0f+%.2f",
++                                                            pressFrac, dragCell, dragFrac));
++                    VERIFY_ARE_EQUAL(expected.end, actual.end,
++                                     NoThrowString().Format(L"end: press 8+%.2f drag %.0f+%.2f",
++                                                            pressFrac, dragCell, dragFrac));
++                }
++            }
++        }
++    }
++
++    // Stated on its own because it is the one that misled: the press site
++    // rounds to the nearest cell, so it looks like where you click inside a
++    // character decides whether that character is selected. It does not - the
++    // first drag movement re-anchors and throws that rounding away.
++    void SelectionDragGeometryTests::PressPositionWithinTheCellDoesNotMoveTheAnchor()
++    {
++        auto h = _harness();
++
++        const auto leftOfCell = h.drag(h.px(4, 0.05), h.px(8, 0.05));
++        const auto rightOfCell = h.drag(h.px(4, 0.95), h.px(8, 0.05));
++        VERIFY_ARE_EQUAL(leftOfCell.start, rightOfCell.start);
++        VERIFY_ARE_EQUAL(4, leftOfCell.start);
++
++        const auto leftOfCellBack = h.drag(h.px(8, 0.05), h.px(4, 0.05));
++        const auto rightOfCellBack = h.drag(h.px(8, 0.95), h.px(4, 0.05));
++        VERIFY_ARE_EQUAL(leftOfCellBack.end, rightOfCellBack.end);
++        VERIFY_ARE_EQUAL(9, leftOfCellBack.end);
++    }
++}

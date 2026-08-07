@@ -1,0 +1,410 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Thu, 6 Aug 2026 13:01:38 -0700
+Subject: [PATCH] fix(control): a settings reload no longer crashes the window
+
+Found by hand, saving a setting with a ghostty pane open, and it took the whole
+process with it: an access violation calling BackgroundImage() on a null
+IControlAppearance.
+
+TermControl reads the appearance the core hands it without checking -
+_UpdateSettingsFromUIThread does `_focused ? FocusedAppearance() :
+UnfocusedAppearance()` and dereferences the result - so cascadia's core never
+returns null there. It falls back to the settings object and keeps a separate
+bool for whether a distinct unfocused appearance was configured. This core
+stored the argument as it came, which is null for the great majority of profiles
+- so "any profile without an unfocusedAppearance, any settings change, pane not
+focused" was a crash. Pre-existing since Phase 5, and nothing had exercised a
+settings *reload* on a ghostty pane before today.
+
+Also from the same hand session: search now lands on the match cascadia lands
+on. Both engines pick the match nearest the bottom, and ghostty's own first
+choice is that one (selectNext with nothing selected takes
+active_results[len - 1]), so the control asks for ghostty's rather than
+modelling cascadia's idea of "nearest".
+
+Verified against the repro, not just the test: a ghostty pane launched by GUID,
+then three settings reloads driven through settings.json - the same path the
+Settings UI takes - all survived, where the first crashed before.
+
+The regression test is the honest shape of it: a core built with *no* unfocused
+appearance, asserting the fallback holds and survives the reload that reads it
+back. It failed first for the wrong reason - the suite's fixture passes the
+settings object as the appearance, so the crashing case needed modelling
+explicitly.
+
+WT suites: terminalCore 54/54, unitSettingsModel 159/159, unitControl 61/61,
+terminalApp 51/51. smoke-harness 9/9.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BgDGqEqRBB8L5Ueoq1uuxy
+---
+ src/cascadia/TerminalControl/EventArgs.h      | 20 +++-
+ .../TerminalControl/GhosttyControlCore.cpp    | 92 +++++++++++++++++--
+ .../TerminalControl/GhosttyControlCore.h      |  7 +-
+ src/cascadia/TerminalControl/TermControl.cpp  |  9 +-
+ .../UnitTests_Control/GhosttySearchTests.cpp  | 72 ++++++++++++---
+ 5 files changed, 175 insertions(+), 25 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/EventArgs.h b/src/cascadia/TerminalControl/EventArgs.h
+index 6dec6d734..ec783bf70 100644
+--- a/src/cascadia/TerminalControl/EventArgs.h
++++ b/src/cascadia/TerminalControl/EventArgs.h
+@@ -23,8 +23,24 @@
+ #include "ShowNotificationEventArgs.g.h"
+ #include "WindowSizeChangedEventArgs.g.h"
+ 
+-namespace winrt::Microsoft::Terminal::Control::implementation
+-{
++namespace winrt::Microsoft::Terminal::Control::implementation
++{
++    // A SearchResults::TotalMatches meaning "nothing new to say - leave the
++    // status where it is".
++    //
++    // A negative total already means "searching", and SearchBoxControl renders
++    // it as that word. For an engine that answers a search on its own thread
++    // there is a moment on every keystroke where nothing is known yet, and
++    // saying "Searching..." for that moment reads as the status box glitching
++    // rather than as progress - it is gone before it can be read. Saying zero
++    // instead would claim there are no matches for a search that has not run.
++    //
++    // So this is the third answer: do not touch the status. During typing that
++    // leaves the previous count up until the real one arrives; on the very
++    // first search of a session it leaves the box blank, which is what it
++    // already was.
++    static constexpr int32_t SearchStatusUnchanged{ (std::numeric_limits<int32_t>::min)() };
++
+ 
+     struct FontSizeChangedArgs : public FontSizeChangedArgsT<FontSizeChangedArgs>
+     {
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 93932f33e..ce9deb7b5 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -18,9 +18,10 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     GhosttyControlCore::GhosttyControlCore(Control::IControlSettings settings,
+                                            Control::IControlAppearance unfocusedAppearance,
+                                            TerminalConnection::ITerminalConnection connection) :
+-        _settings{ settings },
+-        _unfocusedAppearance{ unfocusedAppearance }
++        _settings{ settings }
+     {
++        _setUnfocusedAppearance(unfocusedAppearance);
++
+         // Captured on the thread that creates the pane, which is the UI thread.
+         // Actions arrive on libghostty's threads and the WinRT events they turn
+         // into are ones TermControl expects on the UI thread, so this is how
+@@ -429,6 +430,24 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             const auto total = static_cast<int32_t>(action.action.search_total.total);
+             _raiseOnUiThread([this, total]() {
+                 _searchTotal = total;
++
++                // A fresh search has matches but no current one, and WT renders
++                // that as "?/9". Cascadia lands on a match as you type - the
++                // one nearest the bottom of the buffer, so a search from the
++                // prompt starts at 9 of 9 - and ghostty's own first pick is the
++                // same match: selectNext with nothing selected takes
++                // active_results[len - 1] (search/screen.zig). So this asks for
++                // ghostty's, and the two agree without either side having to
++                // model the other's idea of "nearest".
++                //
++                // One-shot, because the total is re-reported whenever output
++                // changes what matches - re-selecting on every one of those
++                // would drag the highlight back under the user mid-navigation.
++                if (_selectFirstMatch && total > 0)
++                {
++                    _selectFirstMatch = false;
++                    _navigateSearch(false);
++                }
+                 SearchResultsChanged.raise(*this, nullptr);
+             });
+             return true;
+@@ -1111,17 +1130,34 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+     Control::IControlSettings GhosttyControlCore::Settings() { return _settings; }
+     Control::IControlAppearance GhosttyControlCore::FocusedAppearance() const { return _settings.try_as<Control::IControlAppearance>(); }
++
++    // Neither of these may return null, and that is a contract rather than a
++    // courtesy: TermControl reads the appearance it is handed without checking
++    // (_UpdateSettingsFromUIThread does `_focused ? FocusedAppearance() :
++    // UnfocusedAppearance()` and dereferences the result), so a profile with no
++    // unfocused appearance - which is most of them - crashed the whole window
++    // on any settings reload while the pane was not focused. Cascadia falls
++    // back to the settings object for exactly this reason and keeps a separate
++    // bool for whether a distinct one was configured.
+     Control::IControlAppearance GhosttyControlCore::UnfocusedAppearance() const { return _unfocusedAppearance; }
+-    bool GhosttyControlCore::HasUnfocusedAppearance() const { return _unfocusedAppearance != nullptr; }
++    bool GhosttyControlCore::HasUnfocusedAppearance() const { return _hasUnfocusedAppearance; }
+ 
+     void GhosttyControlCore::UpdateSettings(const Control::IControlSettings& settings, const IControlAppearance& newAppearance)
+     {
+         _settings = settings;
+-        _unfocusedAppearance = newAppearance;
++        _setUnfocusedAppearance(newAppearance);
+ 
+         _pushSettings();
+     }
+ 
++    void GhosttyControlCore::_setUnfocusedAppearance(const IControlAppearance& newAppearance)
++    {
++        _hasUnfocusedAppearance = static_cast<bool>(newAppearance);
++        _unfocusedAppearance = _hasUnfocusedAppearance ?
++                                   newAppearance :
++                                   _settings.try_as<Control::IControlAppearance>();
++    }
++
+     // Translate the profile into a ghostty_config_t and apply it to the
+     // surface. A surface is born with the *app's* config, so without the
+     // update call this is a silent no-op - the pane comes up correct in every
+@@ -1218,26 +1254,66 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         if (isNewNeedle)
+         {
+             _searchNeedle = needle;
+-            _searchTotal = -1;
+             _searchSelected = -1;
++            // Selecting a match is ours to ask for: ghostty highlights every
++            // match but selects none until it is navigated, and WT's status box
++            // renders "no current match" as a literal "?" next to the total.
++            _selectFirstMatch = true;
++            _searchTotal = -1;
++
+             // ghostty replaces any active search, so this is both "start" and
+             // "change the terms".
+             _bindingAction(fmt::format("search:{}", til::u16u8(needle)));
+         }
+         else if (request.ExecuteSearch)
+         {
+-            _bindingAction(request.GoForward ? "navigate_search:next" : "navigate_search:previous");
++            _navigateSearch(request.GoForward);
+         }
+ 
+         return {
+-            .TotalMatches = _searchTotal,
+-            .CurrentMatch = _searchSelected,
++            // Nothing is known about this needle yet, and there is no honest
++            // number for that. -1 would render as "Searching...", which at
++            // ghostty's speed is gone before it can be read and looks like the
++            // status box glitching; 0 would claim there are no matches for a
++            // search that has not run. SearchStatusUnchanged is the third
++            // answer: leave the status alone until there is something true to
++            // put in it. SearchInvalidated still goes out, so the scrollbar
++            // rebuilds on time.
++            .TotalMatches = _searchTotal < 0 ? SearchStatusUnchanged : _searchTotal,
++            .CurrentMatch = _currentMatchFromTop(),
+             .SearchInvalidated = isNewNeedle,
+             // ghostty has no regex to be invalid, and the toggle is disabled.
+             .SearchRegexInvalid = false,
+         };
+     }
+ 
++    // The two engines count matches from opposite ends of the buffer.
++    //
++    // ghostty's first selection is the *newest* match and carries index 0
++    // (search/screen.zig: selectNext with no prior match takes
++    // active_results[len - 1] and assigns idx 0), and the index grows going
++    // backwards in time. Windows Terminal's status box means "the Nth match
++    // counting from the top". Reported unconverted, "1/9" highlighted what
++    // cascadia calls 9.
++    int32_t GhosttyControlCore::_currentMatchFromTop() const noexcept
++    {
++        if (_searchSelected < 0 || _searchTotal <= 0 || _searchSelected >= _searchTotal)
++        {
++            return -1;
++        }
++        return _searchTotal - 1 - _searchSelected;
++    }
++
++    // Same inversion, applied to the direction. ghostty's "next" walks *up* the
++    // buffer - it increments an index that counts backwards in time - where
++    // WT's "find next" walks down it. Forwarded unconverted, Enter and
++    // shift+Enter moved the highlight the wrong way in a ghostty pane while the
++    // numbers next to them counted the right way.
++    void GhosttyControlCore::_navigateSearch(bool goForward) const
++    {
++        _bindingAction(goForward ? "navigate_search:previous" : "navigate_search:next");
++    }
++
+     // Scrollbar pips need a row per match, and ghostty reports counts rather
+     // than positions - SEARCH_TOTAL is a number, and the match geometry never
+     // leaves the renderer. Empty, therefore, rather than wrong: a partial list
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.h b/src/cascadia/TerminalControl/GhosttyControlCore.h
+index 394c7fc1f..73427a6dc 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.h
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.h
+@@ -271,7 +271,9 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         void _raiseOnUiThread(std::function<void()> action);
+ 
+         Control::IControlSettings _settings{ nullptr };
+-        Control::IControlAppearance _unfocusedAppearance{ nullptr };
++        Control::IControlAppearance _unfocusedAppearance{ nullptr };
++        bool _hasUnfocusedAppearance{ false };
++        void _setUnfocusedAppearance(const IControlAppearance& newAppearance);
+         TerminalConnection::ITerminalConnection _connection{ nullptr };
+         TerminalConnection::ITerminalConnection::TerminalOutput_revoker _connectionOutputRevoker;
+         TerminalConnection::ITerminalConnection::StateChanged_revoker _connectionStateRevoker;
+@@ -330,6 +332,9 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         std::wstring _searchNeedle;
+         int32_t _searchTotal{ -1 };
+         int32_t _searchSelected{ -1 };
++        bool _selectFirstMatch{ false };
++        int32_t _currentMatchFromTop() const noexcept;
++        void _navigateSearch(bool goForward) const;
+ 
+         winrt::Windows::System::DispatcherQueue _dispatcher{ nullptr };
+     };
+diff --git a/src/cascadia/TerminalControl/TermControl.cpp b/src/cascadia/TerminalControl/TermControl.cpp
+index 84124e4fd..b02075914 100644
+--- a/src/cascadia/TerminalControl/TermControl.cpp
++++ b/src/cascadia/TerminalControl/TermControl.cpp
+@@ -3851,12 +3851,14 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             return;
+         }
+ 
+-        // Only show status when we have a search term
++        // Only show status when we have a search term, and only when the engine
++        // has something to say about it - see SearchStatusUnchanged.
++        const auto pending = results.TotalMatches == implementation::SearchStatusUnchanged;
+         if (_searchBox->Text().empty())
+         {
+             _searchBox->ClearStatus();
+         }
+-        else
++        else if (!pending)
+         {
+             _searchBox->SetStatus(results.TotalMatches, results.CurrentMatch, results.SearchRegexInvalid);
+         }
+@@ -3876,7 +3878,8 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             }
+         }
+ 
+-        if (auto automationPeer{ FrameworkElementAutomationPeer::FromElement(*this) })
++        if (auto automationPeer{ FrameworkElementAutomationPeer::FromElement(*this) };
++            automationPeer && !pending)
+         {
+             const auto status = _searchBox->GetAccessibleStatus(results.TotalMatches, results.CurrentMatch, results.SearchRegexInvalid);
+             if (!status.empty())
+diff --git a/src/cascadia/UnitTests_Control/GhosttySearchTests.cpp b/src/cascadia/UnitTests_Control/GhosttySearchTests.cpp
+index e07bce73d..3cbb759a3 100644
+--- a/src/cascadia/UnitTests_Control/GhosttySearchTests.cpp
++++ b/src/cascadia/UnitTests_Control/GhosttySearchTests.cpp
+@@ -9,10 +9,11 @@
+ // starts the work and returns what it knows at the time - which, for a needle
+ // it has not seen before, is nothing.
+ //
+-// What it returns while it waits is the part worth pinning. A negative total is
+-// not a placeholder: SearchBoxControl renders it as "Searching...", so the
+-// honest answer and the right-looking one are the same answer. Returning 0
+-// would say "no matches" about a search that has not run.
++// What it returns while it waits is the part worth pinning, and it is not a
++// number: 0 would say "no matches" about a search that has not run, and a
++// negative total renders as "Searching...", which at ghostty's speed is gone
++// before it can be read and looks like the status box glitching. It reports
++// SearchStatusUnchanged instead - leave the status alone.
+ //
+ // This drives the real core through IControlCore, so it needs no
+ // implementation access - and on a machine where libghostty cannot start, the
+@@ -44,7 +45,8 @@ namespace ControlUnitTests
+         TEST_METHOD(GhosttySupportsNeitherRegexNorCase);
+         TEST_METHOD(ANewNeedleIsInvalidatedAndNotYetCounted);
+         TEST_METHOD(NavigatingTheSameNeedleDoesNotInvalidate);
+-        TEST_METHOD(AnEmptySearchClears);
++        TEST_METHOD(AnEmptySearchClears);
++        TEST_METHOD(UnfocusedAppearanceIsNeverNull);
+ 
+     private:
+         struct Core
+@@ -54,15 +56,22 @@ namespace ControlUnitTests
+             bool isGhostty{ false };
+         };
+ 
+-        static Core _core(Control::TerminalEngine engine)
++        // withUnfocusedAppearance models a profile that configures a distinct
++        // one. Most profiles do not, which is the case that crashed - so it is
++        // a parameter rather than an assumption.
++        static Core _core(Control::TerminalEngine engine, bool withUnfocusedAppearance = true)
+         {
+             auto settings = winrt::make_self<MockControlSettings>();
+             settings->Engine(engine);
+             auto conn = winrt::make_self<MockConnection>();
+ 
++            const Control::IControlAppearance unfocused{
++                withUnfocusedAppearance ? settings.as<Control::IControlAppearance>() : nullptr
++            };
++
+             Core c;
+             c.interactivity = winrt::make_self<Control::implementation::ControlInteractivity>(
+-                *settings, *settings, *conn);
++                *settings, unfocused, *conn);
+             VERIFY_IS_NOT_NULL(c.interactivity);
+ 
+             // Same as the rest of this suite: cascadia's core starts a real
+@@ -128,9 +137,16 @@ namespace ControlUnitTests
+     }
+ 
+     // The first ask for a needle: the search has been started and nothing has
+-    // come back yet. SearchInvalidated is what makes TermControl redraw the
+-    // scrollbar, and a negative total is what the status box reads as
+-    // "Searching..." - both are true, and neither is a guess.
++    // come back yet.
++    //
++    // There is no honest *number* for that. -1 renders as "Searching...", which
++    // at ghostty's speed is gone before it can be read and looks like the status
++    // box glitching; 0 claims there are no matches for a search that has not
++    // run. SearchStatusUnchanged is the third answer - leave the status alone
++    // until there is something true to put in it.
++    //
++    // SearchInvalidated still goes out, because the scrollbar has to rebuild
++    // whether or not there is a count yet.
+     void GhosttySearchTests::ANewNeedleIsInvalidatedAndNotYetCounted()
+     {
+         const auto c = _core(Control::TerminalEngine::Ghostty);
+@@ -141,7 +157,9 @@ namespace ControlUnitTests
+ 
+         const auto results = c.core.Search(_request(L"needle", false));
+         VERIFY_IS_TRUE(results.SearchInvalidated, L"a new needle invalidates the previous results");
+-        VERIFY_ARE_EQUAL(-1, results.TotalMatches, L"nothing has been counted yet - not zero, unknown");
++        VERIFY_ARE_EQUAL(Control::implementation::SearchStatusUnchanged,
++                         results.TotalMatches,
++                         L"nothing is known yet - do not put a number on it");
+         VERIFY_ARE_EQUAL(-1, results.CurrentMatch);
+         VERIFY_IS_FALSE(results.SearchRegexInvalid, L"there is no regex to be invalid");
+     }
+@@ -164,6 +182,38 @@ namespace ControlUnitTests
+                        L"a different needle is a different search");
+     }
+ 
++    // Not search, but it shares this suite's fixture and it is the one thing
++    // here that took the whole window down.
++    //
++    // TermControl reads the appearance the core hands it without checking -
++    // _UpdateSettingsFromUIThread does `_focused ? FocusedAppearance() :
++    // UnfocusedAppearance()` and dereferences the result - so a null is an
++    // access violation on the next settings reload, not a missing feature.
++    // Most profiles have no unfocused appearance, so "most profiles, any
++    // settings change, pane not focused" crashed Windows Terminal.
++    //
++    // Cascadia's contract: UnfocusedAppearance falls back to the settings
++    // object and is never null, and a separate flag says whether a distinct
++    // one was configured. Both engines have to keep it.
++    void GhosttySearchTests::UnfocusedAppearanceIsNeverNull()
++    {
++        const auto c = _core(Control::TerminalEngine::Ghostty, false);
++
++        VERIFY_IS_NOT_NULL(c.core.FocusedAppearance());
++        VERIFY_IS_NOT_NULL(c.core.UnfocusedAppearance(),
++                           L"a profile with no unfocused appearance must still get one");
++        VERIFY_IS_FALSE(c.core.HasUnfocusedAppearance(),
++                        L"...and must still report that it has none of its own");
++
++        // The reload path: TermControl passes UnfocusedAppearance() straight
++        // back in, so a core that returned null once would keep returning it.
++        auto settings = winrt::make_self<MockControlSettings>();
++        c.core.UpdateSettings(*settings, nullptr);
++
++        VERIFY_IS_NOT_NULL(c.core.UnfocusedAppearance(),
++                           L"and must survive the settings reload that reads it back");
++    }
++
+     // Clearing the box ends the search rather than searching for nothing, and
+     // it forgets the needle - so retyping the same one starts over instead of
+     // being mistaken for navigation within a search that no longer exists.

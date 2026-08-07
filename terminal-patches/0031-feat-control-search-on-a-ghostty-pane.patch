@@ -1,0 +1,630 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Thu, 6 Aug 2026 07:21:45 -0700
+Subject: [PATCH] feat(control): search on a ghostty pane
+
+The needle, the count and the navigation all work; what needed designing was
+the seam. IControlCore::Search is synchronous - Windows Terminal asks and
+expects the answer in the return value - while ghostty searches on a thread of
+its own and reports the counts back later, as SEARCH_TOTAL and SEARCH_SELECTED
+actions, after the call has already returned.
+
+So Search() starts the work and returns what it knows. For a new needle that is
+nothing, and it says so with a negative total rather than a zero: SearchBoxControl
+renders a negative total as "Searching...", so the honest answer and the
+right-looking one are the same answer, where zero would claim there are no
+matches for a search that has not run. SearchResultsChanged brings TermControl
+back round to ask again when the real numbers land - it already re-queries on
+OutputIdle, but a search typed into a quiet terminal produces no output to be
+idle after.
+
+The regex and case toggles are disabled, not ignored. ghostty's needle is a
+plain byte string, so SearchSupportsRegex/SearchSupportsCaseSensitivity report
+what each engine can honour and the search box turns off what it cannot - and
+unchecks it, because a toggle left lit while its meaning is gone is the same
+lie in a quieter form.
+
+Scrollbar pips stay empty rather than wrong: ghostty reports counts, not match
+positions, and a partial list would draw pips in the wrong places. Documented
+diff.
+
+Proven end to end in scripts/smoke-harness.ps1, which searches a fixture with
+three occurrences and walks next/next/previous - the counts arriving late,
+through the app tick, exactly as they do in a pane. Five unit tests cover what
+Search() returns while it waits.
+
+WT suites: terminalCore 54/54, unitSettingsModel 159/159, unitControl 60/60,
+terminalApp 51/51.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BgDGqEqRBB8L5Ueoq1uuxy
+---
+ src/cascadia/TerminalControl/ControlCore.h    |  13 +-
+ .../TerminalControl/ControlInteractivity.h    |   3 +
+ .../TerminalControl/GhosttyControlCore.cpp    |  95 ++++++++-
+ .../TerminalControl/GhosttyControlCore.h      |  14 ++
+ src/cascadia/TerminalControl/IControlCore.idl |  10 +
+ .../TerminalControl/SearchBoxControl.cpp      |  22 ++
+ .../TerminalControl/SearchBoxControl.h        |   1 +
+ .../TerminalControl/SearchBoxControl.idl      |   5 +-
+ src/cascadia/TerminalControl/TermControl.cpp  |  14 ++
+ src/cascadia/TerminalControl/TermControl.h    |   2 +
+ .../Control.UnitTests.vcxproj                 |   1 +
+ .../UnitTests_Control/GhosttySearchTests.cpp  | 188 ++++++++++++++++++
+ 12 files changed, 363 insertions(+), 5 deletions(-)
+ create mode 100644 src/cascadia/UnitTests_Control/GhosttySearchTests.cpp
+
+diff --git a/src/cascadia/TerminalControl/ControlCore.h b/src/cascadia/TerminalControl/ControlCore.h
+index dfba3227d..09c312217 100644
+--- a/src/cascadia/TerminalControl/ControlCore.h
++++ b/src/cascadia/TerminalControl/ControlCore.h
+@@ -40,6 +40,7 @@ namespace ControlUnitTests
+     class ControlInteractivityTests;
+     class GhosttyEngineSelectionTests;
+     class SelectionDragGeometryTests;
++    class GhosttySearchTests;
+ };
+ 
+ #define RUNTIME_SETTING(type, name, setting)                 \
+@@ -225,7 +226,10 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         void SetSelectionAnchor(const Core::Point positionCore);
+         void SetEndSelectionPoint(const Core::Point positionCore);
+ 
+-        SearchResults Search(const SearchRequest& request);
++        SearchResults Search(const SearchRequest& request);
++        // Cascadia's searcher does both.
++        bool SearchSupportsRegex() const noexcept { return true; }
++        bool SearchSupportsCaseSensitivity() const noexcept { return true; }
+         Windows::Foundation::Collections::IVector<int32_t> SearchResultRows() const;
+         bool IsBufferRowInViewport(int32_t bufferRow) const;
+         void ClearSearch();
+@@ -294,7 +298,10 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         til::typed_event<IInspectable, Control::UpdateSelectionMarkersEventArgs> UpdateSelectionMarkers;
+         til::typed_event<IInspectable, Control::OpenHyperlinkEventArgs> OpenHyperlink;
+         til::typed_event<IInspectable, Control::CompletionsChangedEventArgs> CompletionsChanged;
+-        til::typed_event<IInspectable, Control::SearchMissingCommandEventArgs> SearchMissingCommand;
++        til::typed_event<IInspectable, Control::SearchMissingCommandEventArgs> SearchMissingCommand;
++        // Declared to satisfy IControlCore and never raised: cascadia's search
++        // answers inside Search(), so there is never anything to announce later.
++        til::typed_event<> SearchResultsChanged;
+         til::typed_event<IInspectable, Control::ShowNotificationEventArgs> ShowNotification;
+         til::typed_event<> RefreshQuickFixUI;
+         til::typed_event<IInspectable, Control::WindowSizeChangedEventArgs> WindowSizeChanged;
+@@ -472,6 +479,8 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // Reads the selection back in cell coordinates, to measure what a
+         // pixel drag actually selected.
+         friend class ControlUnitTests::SelectionDragGeometryTests;
++        // Needs _inUnitTests, so a cascadia core it builds can be torn down.
++        friend class ControlUnitTests::GhosttySearchTests;
+         bool _inUnitTests{ false };
+     };
+ }
+diff --git a/src/cascadia/TerminalControl/ControlInteractivity.h b/src/cascadia/TerminalControl/ControlInteractivity.h
+index ef98c3609..df74223d0 100644
+--- a/src/cascadia/TerminalControl/ControlInteractivity.h
++++ b/src/cascadia/TerminalControl/ControlInteractivity.h
+@@ -29,6 +29,7 @@ namespace ControlUnitTests
+     class ControlInteractivityTests;
+     class GhosttyEngineSelectionTests;
+     class SelectionDragGeometryTests;
++    class GhosttySearchTests;
+ };
+ 
+ namespace winrt::Microsoft::Terminal::Control::implementation
+@@ -182,6 +183,8 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         friend class ControlUnitTests::GhosttyEngineSelectionTests;
+         // Drives PointerPressed/Moved in pixels against cascadia's own core.
+         friend class ControlUnitTests::SelectionDragGeometryTests;
++        // Needs _cascadiaCore() to tell which engine answered.
++        friend class ControlUnitTests::GhosttySearchTests;
+     };
+ }
+ 
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index e40ddb833..37bb4820a 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -420,6 +420,37 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             return true;
+         }
+ 
++        // The answers to a search, arriving after Search() has already had to
++        // return. Both carry -1 for "not known", which is what ghostty means by
++        // a null total or null selection, and what WT's status box renders as
++        // "Searching..." - so the value crosses unchanged.
++        case GHOSTTY_ACTION_SEARCH_TOTAL:
++        {
++            const auto total = static_cast<int32_t>(action.action.search_total.total);
++            _raiseOnUiThread([this, total]() {
++                _searchTotal = total;
++                SearchResultsChanged.raise(*this, nullptr);
++            });
++            return true;
++        }
++
++        case GHOSTTY_ACTION_SEARCH_SELECTED:
++        {
++            const auto selected = static_cast<int32_t>(action.action.search_selected.selected);
++            _raiseOnUiThread([this, selected]() {
++                _searchSelected = selected;
++                SearchResultsChanged.raise(*this, nullptr);
++            });
++            return true;
++        }
++
++        // ghostty asks the embedder to open its search UI. WT's search box is
++        // opened by WT's own action, and this only ever arrives because we sent
++        // a search - so it is claimed rather than left to log as unhandled.
++        case GHOSTTY_ACTION_START_SEARCH:
++        case GHOSTTY_ACTION_END_SEARCH:
++            return true;
++
+         case GHOSTTY_ACTION_SWAP_CHAIN_CHANGED:
+         {
+             // The handle travels in the event args, boxed as a uint64 -
+@@ -1132,10 +1163,70 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     Control::SelectionData GhosttyControlCore::SelectionInfo() const { return {}; }
+     void GhosttyControlCore::AnchorContextMenu(const Core::Point /*position*/) {}
+ 
+-    SearchResults GhosttyControlCore::Search(const SearchRequest& /*request*/) { return {}; }
++    // Search, across a synchronous/asynchronous seam.
++    //
++    // WT asks a question and expects the answer in the return value. ghostty
++    // runs its search on a thread of its own and reports the counts back later,
++    // as SEARCH_TOTAL and SEARCH_SELECTED actions. So this starts the work and
++    // returns what is known now - which, for a brand-new needle, is nothing.
++    //
++    // That gap is not papered over. A negative total is what SearchBoxControl
++    // renders as "Searching...", so the honest answer and the right-looking one
++    // are the same answer. When the counts do arrive, SearchResultsChanged
++    // brings TermControl back round to ask again.
++    //
++    // Case sensitivity and regex are not forwarded because ghostty's needle is
++    // a plain byte string. SearchSupportsRegex/SearchSupportsCaseSensitivity
++    // report that, and the search box disables the toggles - the request's
++    // fields are ignored here rather than silently changing nothing.
++    SearchResults GhosttyControlCore::Search(const SearchRequest& request)
++    {
++        if (request.Text.empty())
++        {
++            ClearSearch();
++            return {};
++        }
++
++        const auto needle = std::wstring{ request.Text };
++        const auto isNewNeedle = needle != _searchNeedle;
++
++        if (isNewNeedle)
++        {
++            _searchNeedle = needle;
++            _searchTotal = -1;
++            _searchSelected = -1;
++            // ghostty replaces any active search, so this is both "start" and
++            // "change the terms".
++            _bindingAction(fmt::format("search:{}", til::u16u8(needle)));
++        }
++        else if (request.ExecuteSearch)
++        {
++            _bindingAction(request.GoForward ? "navigate_search:next" : "navigate_search:previous");
++        }
++
++        return {
++            .TotalMatches = _searchTotal,
++            .CurrentMatch = _searchSelected,
++            .SearchInvalidated = isNewNeedle,
++            // ghostty has no regex to be invalid, and the toggle is disabled.
++            .SearchRegexInvalid = false,
++        };
++    }
++
++    // Scrollbar pips need a row per match, and ghostty reports counts rather
++    // than positions - SEARCH_TOTAL is a number, and the match geometry never
++    // leaves the renderer. Empty, therefore, rather than wrong: a partial list
++    // would draw pips in the wrong places. Tracked as a documented diff.
+     Windows::Foundation::Collections::IVector<int32_t> GhosttyControlCore::SearchResultRows() const { return winrt::single_threaded_vector<int32_t>(); }
+     bool GhosttyControlCore::IsBufferRowInViewport(int32_t bufferRow) const { return bufferRow >= _scrollOffset && bufferRow < _scrollOffset + _viewHeight; }
+-    void GhosttyControlCore::ClearSearch() {}
++
++    void GhosttyControlCore::ClearSearch()
++    {
++        _searchNeedle.clear();
++        _searchTotal = -1;
++        _searchSelected = -1;
++        _bindingAction("end_search");
++    }
+ 
+     Windows::Foundation::Collections::IVector<Control::ScrollMark> GhosttyControlCore::ScrollMarks() const { return winrt::single_threaded_vector<Control::ScrollMark>(); }
+     void GhosttyControlCore::AddMark(const Control::ScrollMark& /*mark*/) {}
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.h b/src/cascadia/TerminalControl/GhosttyControlCore.h
+index a7016e6bb..394c7fc1f 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.h
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.h
+@@ -165,6 +165,10 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         Windows::Foundation::Collections::IVector<int32_t> SearchResultRows() const;
+         bool IsBufferRowInViewport(int32_t bufferRow) const;
+         void ClearSearch();
++        // ghostty's needle is a plain byte string: no regex, no case folding.
++        // Both toggles are disabled in the search box rather than left inert.
++        bool SearchSupportsRegex() const noexcept { return false; }
++        bool SearchSupportsCaseSensitivity() const noexcept { return false; }
+ 
+         void LeftClickOnTerminal(const Core::Point terminalPositionCore, const int32_t numberOfClicks, const bool altEnabled, const bool shiftEnabled, const bool isOnOriginalPosition, bool& selectionNeedsToBeCopied);
+ 
+@@ -229,6 +233,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         til::typed_event<IInspectable, Control::OpenHyperlinkEventArgs> OpenHyperlink;
+         til::typed_event<IInspectable, Control::CompletionsChangedEventArgs> CompletionsChanged;
+         til::typed_event<IInspectable, Control::SearchMissingCommandEventArgs> SearchMissingCommand;
++        til::typed_event<> SearchResultsChanged;
+         til::typed_event<IInspectable, Control::ShowNotificationEventArgs> ShowNotification;
+         til::typed_event<> RefreshQuickFixUI;
+         til::typed_event<IInspectable, Control::WindowSizeChangedEventArgs> WindowSizeChanged;
+@@ -317,6 +322,15 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         int32_t _viewHeight{ 0 };
+         int32_t _bufferHeight{ 0 };
+ 
++        // Search state. ghostty answers a search on its own thread and reports
++        // the counts back as actions, but IControlCore::Search is synchronous -
++        // so Search() starts the work and returns the last counts that arrived.
++        // -1 is not a placeholder: SearchBoxControl renders a negative total as
++        // "Searching...", which is exactly what is true until they do.
++        std::wstring _searchNeedle;
++        int32_t _searchTotal{ -1 };
++        int32_t _searchSelected{ -1 };
++
+         winrt::Windows::System::DispatcherQueue _dispatcher{ nullptr };
+     };
+ }
+diff --git a/src/cascadia/TerminalControl/IControlCore.idl b/src/cascadia/TerminalControl/IControlCore.idl
+index 13c1487a9..f3255dcac 100644
+--- a/src/cascadia/TerminalControl/IControlCore.idl
++++ b/src/cascadia/TerminalControl/IControlCore.idl
+@@ -164,6 +164,12 @@ namespace Microsoft.Terminal.Control
+         SearchResults Search(SearchRequest request);
+         void ClearSearch();
+ 
++        // What the engine's search can actually do. The search box disables the
++        // toggles an engine does not support, because a toggle that silently
++        // does nothing misrepresents the results it comes back with.
++        Boolean SearchSupportsRegex { get; };
++        Boolean SearchSupportsCaseSensitivity { get; };
++
+         Microsoft.Terminal.Core.Color ForegroundColor { get; };
+         Microsoft.Terminal.Core.Color BackgroundColor { get; };
+ 
+@@ -272,6 +278,10 @@ namespace Microsoft.Terminal.Control
+         event Windows.Foundation.TypedEventHandler<Object, Object> RendererEnteredErrorState;
+         event Windows.Foundation.TypedEventHandler<Object, ShowWindowArgs> ShowWindowChanged;
+         event Windows.Foundation.TypedEventHandler<Object, SearchMissingCommandEventArgs> SearchMissingCommand;
++        // An engine whose search answers asynchronously raises this when new
++        // totals arrive; Search() is synchronous and can only return what it
++        // knows at the time. Cascadia's search is synchronous and never raises it.
++        event Windows.Foundation.TypedEventHandler<Object, Object> SearchResultsChanged;
+         event Windows.Foundation.TypedEventHandler<Object, ShowNotificationEventArgs> ShowNotification;
+         event Windows.Foundation.TypedEventHandler<Object, Object> RefreshQuickFixUI;
+         event Windows.Foundation.TypedEventHandler<Object, WindowSizeChangedEventArgs> WindowSizeChanged;
+diff --git a/src/cascadia/TerminalControl/SearchBoxControl.cpp b/src/cascadia/TerminalControl/SearchBoxControl.cpp
+index d37a94358..ae4dd2853 100644
+--- a/src/cascadia/TerminalControl/SearchBoxControl.cpp
++++ b/src/cascadia/TerminalControl/SearchBoxControl.cpp
+@@ -240,6 +240,28 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         return RegexButton().IsChecked().GetBoolean();
+     }
+ 
++    // Not every engine's search can honour these. ghostty's needle is a plain
++    // byte string - no regex and no case folding - so leaving the toggles
++    // clickable would let a user ask for something and then be told, by results
++    // that look authoritative, that they got it.
++    //
++    // Unchecked as well as disabled: a toggle left lit while its meaning is
++    // gone is the same lie in a quieter form.
++    void SearchBoxControl::SetSupportedOptions(bool regularExpression, bool caseSensitive)
++    {
++        if (!regularExpression)
++        {
++            RegexButton().IsChecked(false);
++        }
++        RegexButton().IsEnabled(regularExpression);
++
++        if (!caseSensitive)
++        {
++            CaseSensitivityButton().IsChecked(false);
++        }
++        CaseSensitivityButton().IsEnabled(caseSensitive);
++    }
++
+     // Method Description:
+     // - Handler for pressing Enter on TextBox, trigger
+     //   text search
+diff --git a/src/cascadia/TerminalControl/SearchBoxControl.h b/src/cascadia/TerminalControl/SearchBoxControl.h
+index 57fd319de..3774bf945 100644
+--- a/src/cascadia/TerminalControl/SearchBoxControl.h
++++ b/src/cascadia/TerminalControl/SearchBoxControl.h
+@@ -43,6 +43,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         void SetFocusOnTextbox();
+         void PopulateTextbox(const winrt::hstring& text);
+         bool ContainsFocus();
++        void SetSupportedOptions(bool regularExpression, bool caseSensitive);
+         void SetStatus(int32_t totalMatches, int32_t currentMatch, bool searchRegexInvalid);
+         winrt::hstring GetAccessibleStatus(int32_t totalMatches, int32_t currentMatch, bool searchRegexInvalid);
+         void ClearStatus();
+diff --git a/src/cascadia/TerminalControl/SearchBoxControl.idl b/src/cascadia/TerminalControl/SearchBoxControl.idl
+index 61c133b1c..704b4f659 100644
+--- a/src/cascadia/TerminalControl/SearchBoxControl.idl
++++ b/src/cascadia/TerminalControl/SearchBoxControl.idl
+@@ -11,7 +11,10 @@ namespace Microsoft.Terminal.Control
+         void SetFocusOnTextbox();
+         void PopulateTextbox(String text);
+         Boolean ContainsFocus();
+-        void ClearStatus();
++        void ClearStatus();
++        // Turns off the toggles an engine's search cannot honour. A toggle
++        // that stays clickable and changes nothing misrepresents the results.
++        void SetSupportedOptions(Boolean regularExpression, Boolean caseSensitive);
+         Windows.Foundation.Rect ContentClipRect{ get; };
+         Double OpenAnimationStartPoint{ get; };
+ 
+diff --git a/src/cascadia/TerminalControl/TermControl.cpp b/src/cascadia/TerminalControl/TermControl.cpp
+index 222d24b8a..84124e4fd 100644
+--- a/src/cascadia/TerminalControl/TermControl.cpp
++++ b/src/cascadia/TerminalControl/TermControl.cpp
+@@ -359,6 +359,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         _revokers.CompletionsChanged = _core.CompletionsChanged(winrt::auto_revoke, { get_weak(), &TermControl::_bubbleCompletionsChanged });
+         _revokers.RestartTerminalRequested = _core.RestartTerminalRequested(winrt::auto_revoke, { get_weak(), &TermControl::_bubbleRestartTerminalRequested });
+         _revokers.SearchMissingCommand = _core.SearchMissingCommand(winrt::auto_revoke, { get_weak(), &TermControl::_bubbleSearchMissingCommand });
++        _revokers.SearchResultsChanged = _core.SearchResultsChanged(winrt::auto_revoke, { get_weak(), &TermControl::_coreSearchResultsChanged });
+         _revokers.ShowNotification = _core.ShowNotification(winrt::auto_revoke, { get_weak(), &TermControl::_bubbleShowNotification });
+         _revokers.WindowSizeChanged = _core.WindowSizeChanged(winrt::auto_revoke, { get_weak(), &TermControl::_bubbleWindowSizeChanged });
+         _revokers.WriteToClipboard = _core.WriteToClipboard(winrt::auto_revoke, { get_weak(), &TermControl::_bubbleWriteToClipboard });
+@@ -709,6 +710,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+                 // get at its private implementation
+                 _searchBox.copy_from(winrt::get_self<implementation::SearchBoxControl>(searchBox));
+ 
++                // Before anything can be typed into it: the engine behind this
++                // pane may have a search that cannot honour these.
++                _searchBox->SetSupportedOptions(_core.SearchSupportsRegex(),
++                                                _core.SearchSupportsCaseSensitivity());
++
+                 // If a text is selected inside terminal, use it to populate the search box.
+                 // If the search box already contains a value, it will be overridden.
+                 if (_core.HasSelection())
+@@ -3889,6 +3895,14 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         _refreshSearch();
+     }
+ 
++    // An engine whose search answers on its own thread has nothing to return
++    // from Search() the first time it is asked. This is it saying the counts
++    // have arrived, so the status box can stop reading "Searching...".
++    void TermControl::_coreSearchResultsChanged(const IInspectable& /*sender*/, const IInspectable& /*args*/)
++    {
++        _refreshSearch();
++    }
++
+     void TermControl::OwningHwnd(uint64_t owner)
+     {
+         _core.OwningHwnd(owner);
+diff --git a/src/cascadia/TerminalControl/TermControl.h b/src/cascadia/TerminalControl/TermControl.h
+index 5b8595838..d944c3480 100644
+--- a/src/cascadia/TerminalControl/TermControl.h
++++ b/src/cascadia/TerminalControl/TermControl.h
+@@ -418,6 +418,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         void _SearchChanged(const winrt::hstring& text, const bool goForward, const bool caseSensitive, const bool regularExpression);
+         void _CloseSearchBoxControl(const winrt::Windows::Foundation::IInspectable& sender, const Windows::UI::Xaml::RoutedEventArgs& args);
+         void _refreshSearch();
++        void _coreSearchResultsChanged(const IInspectable& sender, const IInspectable& args);
+         void _handleSearchResults(SearchResults results);
+ 
+         void _hoveredHyperlinkChanged(const IInspectable& sender, const IInspectable& args);
+@@ -471,6 +472,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             Control::IControlCore::CompletionsChanged_revoker CompletionsChanged;
+             Control::IControlCore::RestartTerminalRequested_revoker RestartTerminalRequested;
+             Control::IControlCore::SearchMissingCommand_revoker SearchMissingCommand;
++            Control::IControlCore::SearchResultsChanged_revoker SearchResultsChanged;
+             Control::IControlCore::ShowNotification_revoker ShowNotification;
+             Control::IControlCore::RefreshQuickFixUI_revoker RefreshQuickFixUI;
+             Control::IControlCore::WindowSizeChanged_revoker WindowSizeChanged;
+diff --git a/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj b/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
+index 39edb89b1..bf12a0184 100644
+--- a/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
++++ b/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
+@@ -37,6 +37,7 @@
+     <ClCompile Include="ControlCoreTests.cpp" />
+     <ClCompile Include="GhosttySettingsTests.cpp" />
+     <ClCompile Include="GhosttyEngineSelectionTests.cpp" />
++    <ClCompile Include="GhosttySearchTests.cpp" />
+     <ClCompile Include="GhosttyKeyTests.cpp" />
+     <ClCompile Include="GhosttyCopyFormatTests.cpp" />
+     <!-- Compiled straight into the tests: it is a pure function with no
+diff --git a/src/cascadia/UnitTests_Control/GhosttySearchTests.cpp b/src/cascadia/UnitTests_Control/GhosttySearchTests.cpp
+new file mode 100644
+index 000000000..e07bce73d
+--- /dev/null
++++ b/src/cascadia/UnitTests_Control/GhosttySearchTests.cpp
+@@ -0,0 +1,188 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++//
++// Search across a synchronous/asynchronous seam.
++//
++// IControlCore::Search is synchronous: Windows Terminal asks and expects the
++// answer in the return value. ghostty searches on a thread of its own and
++// reports the counts back later, as actions. So the ghostty core's Search()
++// starts the work and returns what it knows at the time - which, for a needle
++// it has not seen before, is nothing.
++//
++// What it returns while it waits is the part worth pinning. A negative total is
++// not a placeholder: SearchBoxControl renders it as "Searching...", so the
++// honest answer and the right-looking one are the same answer. Returning 0
++// would say "no matches" about a search that has not run.
++//
++// This drives the real core through IControlCore, so it needs no
++// implementation access - and on a machine where libghostty cannot start, the
++// factory hands back cascadia's core instead and the ghostty-specific
++// expectations are skipped rather than failed.
++
++#include "pch.h"
++#include "../TerminalControl/ControlInteractivity.h"
++#include "../TerminalControl/ControlCore.h"
++#include "MockControlSettings.h"
++#include "MockConnection.h"
++
++using namespace WEX::Logging;
++using namespace WEX::TestExecution;
++using namespace WEX::Common;
++
++using namespace winrt;
++using namespace winrt::Microsoft::Terminal;
++
++namespace ControlUnitTests
++{
++    class GhosttySearchTests
++    {
++        BEGIN_TEST_CLASS(GhosttySearchTests)
++            TEST_CLASS_PROPERTY(L"TestTimeout", L"0:1:00")
++        END_TEST_CLASS()
++
++        TEST_METHOD(CascadiaSupportsRegexAndCase);
++        TEST_METHOD(GhosttySupportsNeitherRegexNorCase);
++        TEST_METHOD(ANewNeedleIsInvalidatedAndNotYetCounted);
++        TEST_METHOD(NavigatingTheSameNeedleDoesNotInvalidate);
++        TEST_METHOD(AnEmptySearchClears);
++
++    private:
++        struct Core
++        {
++            winrt::com_ptr<Control::implementation::ControlInteractivity> interactivity;
++            Control::IControlCore core{ nullptr };
++            bool isGhostty{ false };
++        };
++
++        static Core _core(Control::TerminalEngine engine)
++        {
++            auto settings = winrt::make_self<MockControlSettings>();
++            settings->Engine(engine);
++            auto conn = winrt::make_self<MockConnection>();
++
++            Core c;
++            c.interactivity = winrt::make_self<Control::implementation::ControlInteractivity>(
++                *settings, *settings, *conn);
++            VERIFY_IS_NOT_NULL(c.interactivity);
++
++            // Same as the rest of this suite: cascadia's core starts a real
++            // renderer otherwise, and tearing one down in a test host hangs.
++            if (const auto cascadia = c.interactivity->_cascadiaCore())
++            {
++                cascadia->_inUnitTests = true;
++            }
++            else
++            {
++                c.isGhostty = true;
++            }
++            c.core = c.interactivity->Core();
++            VERIFY_IS_NOT_NULL(c.core);
++            return c;
++        }
++
++        // Returns false and logs when libghostty did not come up here, so the
++        // ghostty-specific tests skip rather than fail on such a machine.
++        static bool _requireGhostty(const Core& c)
++        {
++            if (!c.isGhostty)
++            {
++                Log::Comment(L"libghostty is unavailable here; the factory fell back to cascadia. Skipping.");
++            }
++            return c.isGhostty;
++        }
++
++        static Control::SearchRequest _request(std::wstring_view text, bool execute, bool forward = true)
++        {
++            return Control::SearchRequest{
++                .Text = winrt::hstring{ text },
++                .GoForward = forward,
++                .CaseSensitive = false,
++                .RegularExpression = false,
++                .ExecuteSearch = execute,
++                .ScrollIntoView = true,
++                .ScrollOffset = 0,
++            };
++        }
++    };
++
++    void GhosttySearchTests::CascadiaSupportsRegexAndCase()
++    {
++        const auto c = _core(Control::TerminalEngine::Cascadia);
++        VERIFY_IS_TRUE(c.core.SearchSupportsRegex());
++        VERIFY_IS_TRUE(c.core.SearchSupportsCaseSensitivity());
++    }
++
++    // ghostty's needle is a plain byte string - no regex, no case folding. The
++    // search box reads these and disables the toggles; a toggle left clickable
++    // would let a user ask for something and be told, by results that look
++    // authoritative, that they got it.
++    void GhosttySearchTests::GhosttySupportsNeitherRegexNorCase()
++    {
++        const auto c = _core(Control::TerminalEngine::Ghostty);
++        if (!_requireGhostty(c))
++        {
++            return;
++        }
++        VERIFY_IS_FALSE(c.core.SearchSupportsRegex());
++        VERIFY_IS_FALSE(c.core.SearchSupportsCaseSensitivity());
++    }
++
++    // The first ask for a needle: the search has been started and nothing has
++    // come back yet. SearchInvalidated is what makes TermControl redraw the
++    // scrollbar, and a negative total is what the status box reads as
++    // "Searching..." - both are true, and neither is a guess.
++    void GhosttySearchTests::ANewNeedleIsInvalidatedAndNotYetCounted()
++    {
++        const auto c = _core(Control::TerminalEngine::Ghostty);
++        if (!_requireGhostty(c))
++        {
++            return;
++        }
++
++        const auto results = c.core.Search(_request(L"needle", false));
++        VERIFY_IS_TRUE(results.SearchInvalidated, L"a new needle invalidates the previous results");
++        VERIFY_ARE_EQUAL(-1, results.TotalMatches, L"nothing has been counted yet - not zero, unknown");
++        VERIFY_ARE_EQUAL(-1, results.CurrentMatch);
++        VERIFY_IS_FALSE(results.SearchRegexInvalid, L"there is no regex to be invalid");
++    }
++
++    // Every keystroke in the search box asks again with the same needle, and
++    // Enter asks again with ExecuteSearch. Neither is a new search: saying so
++    // would make TermControl rebuild the scrollbar on every navigation.
++    void GhosttySearchTests::NavigatingTheSameNeedleDoesNotInvalidate()
++    {
++        const auto c = _core(Control::TerminalEngine::Ghostty);
++        if (!_requireGhostty(c))
++        {
++            return;
++        }
++
++        VERIFY_IS_TRUE(c.core.Search(_request(L"needle", false)).SearchInvalidated);
++        VERIFY_IS_FALSE(c.core.Search(_request(L"needle", true)).SearchInvalidated);
++        VERIFY_IS_FALSE(c.core.Search(_request(L"needle", true, false)).SearchInvalidated);
++        VERIFY_IS_TRUE(c.core.Search(_request(L"other", false)).SearchInvalidated,
++                       L"a different needle is a different search");
++    }
++
++    // Clearing the box ends the search rather than searching for nothing, and
++    // it forgets the needle - so retyping the same one starts over instead of
++    // being mistaken for navigation within a search that no longer exists.
++    void GhosttySearchTests::AnEmptySearchClears()
++    {
++        const auto c = _core(Control::TerminalEngine::Ghostty);
++        if (!_requireGhostty(c))
++        {
++            return;
++        }
++
++        c.core.Search(_request(L"needle", false));
++
++        const auto cleared = c.core.Search(_request(L"", false));
++        VERIFY_ARE_EQUAL(0, cleared.TotalMatches);
++        VERIFY_ARE_EQUAL(0, cleared.CurrentMatch);
++        VERIFY_IS_FALSE(cleared.SearchInvalidated);
++
++        VERIFY_IS_TRUE(c.core.Search(_request(L"needle", false)).SearchInvalidated,
++                       L"the same needle after a clear is a new search, not a navigation");
++    }
++}

@@ -1,0 +1,396 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 4 Aug 2026 16:00:00 -0700
+Subject: [PATCH] seam: promote ControlInteractivity's core surface to
+ IControlCore
+
+Adds the 17 members ControlInteractivity needs onto IControlCore, so it
+can eventually hold the interface rather than the concrete cascadia
+type. This is the prerequisite for a ghostty pane receiving input.
+
+Four signatures needed projectable forms:
+- til::point -> Core::Point on SetSelectionAnchor, SetEndSelectionPoint,
+  AnchorContextMenu, LeftClickOnTerminal and SendMouseEvent. til::point
+  converts both ways, so bodies are unchanged.
+- SendMouseEvent's TerminalInput::MouseButtonState is a struct of three
+  bools; the IDL already carried a projectable flags mirror. The
+  unpacking that lived in ControlInteractivity::toInternalMouseState
+  moved into ControlCore, so the projected type now reaches the engine
+  and each engine unpacks it itself.
+
+GetFont() needed no promotion at all: it was called once, only for
+.GetSize(), and IControlCore::FontSize is defined as exactly that value
+(ControlCore::FontSize -> _actualFont.GetSize()) cast to float. Swapped
+the call rather than widening the interface with a non-projectable
+FontInfo.
+
+Not yet done: _core itself is still com_ptr<ControlCore>. Flipping it to
+IControlCore is the next step and needs the UIA cluster
+(AttachUiaEngine/DetachUiaEngine/GetRenderData) guarded, since those
+stay concrete by design - see docs/phase-5-readiness.md.
+
+Control unit tests 32/32.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ee27Fih3vSPYsqrUBpUoc
+---
+ src/cascadia/TerminalControl/ControlCore.cpp  | 43 ++++++++++++------
+ src/cascadia/TerminalControl/ControlCore.h    | 24 +++++-----
+ .../TerminalControl/ControlInteractivity.cpp  | 38 +++++++++-------
+ src/cascadia/TerminalControl/IControlCore.idl | 44 +++++++++++++++++++
+ .../UnitTests_Control/ControlCoreTests.cpp    |  6 +--
+ 5 files changed, 111 insertions(+), 44 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/ControlCore.cpp b/src/cascadia/TerminalControl/ControlCore.cpp
+index 020f2fc75..5cbbfdaaa 100644
+--- a/src/cascadia/TerminalControl/ControlCore.cpp
++++ b/src/cascadia/TerminalControl/ControlCore.cpp
+@@ -1,4 +1,4 @@
+-// Copyright (c) Microsoft Corporation.
++﻿// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ 
+ #include "pch.h"
+@@ -723,12 +723,25 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         return false;
+     }
+ 
+-    bool ControlCore::SendMouseEvent(const til::point viewportPos,
+-                                     const unsigned int uiButton,
++    bool ControlCore::SendMouseEvent(const Core::Point viewportPosCore,
++                                     const uint32_t uiButton,
+                                      const ControlKeyStates states,
+-                                     const short wheelDelta,
+-                                     const TerminalInput::MouseButtonState state)
+-    {
++                                     const int16_t wheelDelta,
++                                     const Control::MouseButtonState stateProjected)
++    {
++        // Core::Point and Control::MouseButtonState are the projectable forms
++        // on IControlCore; convert to the internal types here so the body below
++        // is unchanged. Control::MouseButtonState is a flags enum mirroring
++        // TerminalInput::MouseButtonState, which is a struct of three bools -
++        // so this unpacks, it does not cast. (This is the conversion that used
++        // to live in ControlInteractivity::toInternalMouseState.)
++        const til::point viewportPos{ viewportPosCore };
++        const TerminalInput::MouseButtonState state{
++            WI_IsFlagSet(stateProjected, Control::MouseButtonState::IsLeftButtonDown),
++            WI_IsFlagSet(stateProjected, Control::MouseButtonState::IsMiddleButtonDown),
++            WI_IsFlagSet(stateProjected, Control::MouseButtonState::IsRightButtonDown)
++        };
++
+         TerminalInput::OutputType out;
+         {
+             const auto lock = _terminal->LockForReading();
+@@ -742,7 +755,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         return false;
+     }
+ 
+-    void ControlCore::UserScrollViewport(const int viewTop)
++    void ControlCore::UserScrollViewport(const int32_t viewTop)
+     {
+         {
+             // This is a scroll event that wasn't initiated by the terminal
+@@ -1308,8 +1321,9 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         _refreshSizeUnderLock();
+     }
+ 
+-    void ControlCore::SetSelectionAnchor(const til::point position)
++    void ControlCore::SetSelectionAnchor(const Core::Point positionCore)
+     {
++        const til::point position{ positionCore };
+         const auto lock = _terminal->LockForWriting();
+         _terminal->SetSelectionAnchor(position);
+     }
+@@ -1342,8 +1356,9 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     // - Sets selection's end position to match supplied cursor position, e.g. while mouse dragging.
+     // Arguments:
+     // - position: the point in terminal coordinates (in cells, not pixels)
+-    void ControlCore::SetEndSelectionPoint(const til::point position)
++    void ControlCore::SetEndSelectionPoint(const Core::Point positionCore)
+     {
++        const til::point position{ positionCore };
+         const auto lock = _terminal->LockForWriting();
+ 
+         if (!_terminal->IsSelectionActive())
+@@ -2071,7 +2086,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         const auto lock = _terminal->LockForWriting();
+         return _terminal->IsTrackingMouseInput();
+     }
+-    bool ControlCore::ShouldSendAlternateScroll(const unsigned int uiButton,
++    bool ControlCore::ShouldSendAlternateScroll(const uint32_t uiButton,
+                                                 const int32_t delta) const
+     {
+         const auto lock = _terminal->LockForWriting();
+@@ -2107,13 +2122,14 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     // There's so many accesses to the selection in the Core though, that I just
+     // put this here. The Control shouldn't be futzing that much with the
+     // selection itself.
+-    void ControlCore::LeftClickOnTerminal(const til::point terminalPosition,
+-                                          const int numberOfClicks,
++    void ControlCore::LeftClickOnTerminal(const Core::Point terminalPositionCore,
++                                          const int32_t numberOfClicks,
+                                           const bool altEnabled,
+                                           const bool shiftEnabled,
+                                           const bool isOnOriginalPosition,
+                                           bool& selectionNeedsToBeCopied)
+     {
++        const til::point terminalPosition{ terminalPositionCore };
+         const auto lock = _terminal->LockForWriting();
+         // handle ALT key
+         _terminal->SetBlockSelection(altEnabled);
+@@ -2886,8 +2902,9 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         }
+     }
+ 
+-    void ControlCore::AnchorContextMenu(const til::point viewportRelativeCharacterPosition)
++    void ControlCore::AnchorContextMenu(const Core::Point viewportRelativeCharacterPositionCore)
+     {
++        const til::point viewportRelativeCharacterPosition{ viewportRelativeCharacterPositionCore };
+         // viewportRelativeCharacterPosition is relative to the current
+         // viewport, so adjust for that:
+         const auto lock = _terminal->LockForReading();
+diff --git a/src/cascadia/TerminalControl/ControlCore.h b/src/cascadia/TerminalControl/ControlCore.h
+index 130013188..536f996ba 100644
+--- a/src/cascadia/TerminalControl/ControlCore.h
++++ b/src/cascadia/TerminalControl/ControlCore.h
+@@ -1,4 +1,4 @@
+-// Copyright (c) Microsoft Corporation.
++﻿// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ // Module Name:
+@@ -201,35 +201,35 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         bool SendCharEvent(const wchar_t ch,
+                            const WORD scanCode,
+                            const ::Microsoft::Terminal::Core::ControlKeyStates modifiers);
+-        bool SendMouseEvent(const til::point viewportPos,
+-                            const unsigned int uiButton,
++        bool SendMouseEvent(const Core::Point viewportPosCore,
++                            const uint32_t uiButton,
+                             const ::Microsoft::Terminal::Core::ControlKeyStates states,
+-                            const short wheelDelta,
+-                            const ::Microsoft::Console::VirtualTerminal::TerminalInput::MouseButtonState state);
+-        void UserScrollViewport(const int viewTop);
++                            const int16_t wheelDelta,
++                            const Control::MouseButtonState state);
++        void UserScrollViewport(const int32_t viewTop);
+ 
+         void ClearBuffer(Control::ClearBufferType clearType);
+ 
+ #pragma endregion
+ 
+         bool IsVtMouseModeEnabled() const;
+-        bool ShouldSendAlternateScroll(const unsigned int uiButton, const int32_t delta) const;
++        bool ShouldSendAlternateScroll(const uint32_t uiButton, const int32_t delta) const;
+         Core::Point CursorPosition() const;
+         bool ForceCursorVisible() const noexcept;
+         void ForceCursorVisible(bool force);
+ 
+         bool CopyOnSelect() const;
+         Control::SelectionData SelectionInfo() const;
+-        void SetSelectionAnchor(const til::point position);
+-        void SetEndSelectionPoint(const til::point position);
++        void SetSelectionAnchor(const Core::Point positionCore);
++        void SetEndSelectionPoint(const Core::Point positionCore);
+ 
+         SearchResults Search(const SearchRequest& request);
+         Windows::Foundation::Collections::IVector<int32_t> SearchResultRows() const;
+         bool IsBufferRowInViewport(int32_t bufferRow) const;
+         void ClearSearch();
+ 
+-        void LeftClickOnTerminal(const til::point terminalPosition,
+-                                 const int numberOfClicks,
++        void LeftClickOnTerminal(const Core::Point terminalPositionCore,
++                                 const int32_t numberOfClicks,
+                                  const bool altEnabled,
+                                  const bool shiftEnabled,
+                                  const bool isOnOriginalPosition,
+@@ -258,7 +258,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         void Connection(const TerminalConnection::ITerminalConnection& connection);
+         void HardResetWithoutErase();
+ 
+-        void AnchorContextMenu(til::point viewportRelativeCharacterPosition);
++        void AnchorContextMenu(const Core::Point viewportRelativeCharacterPositionCore);
+ 
+         bool ShouldShowSelectCommand();
+         bool ShouldShowSelectOutput();
+diff --git a/src/cascadia/TerminalControl/ControlInteractivity.cpp b/src/cascadia/TerminalControl/ControlInteractivity.cpp
+index 759aa2dc0..828d2bcf0 100644
+--- a/src/cascadia/TerminalControl/ControlInteractivity.cpp
++++ b/src/cascadia/TerminalControl/ControlInteractivity.cpp
+@@ -27,14 +27,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ {
+     std::atomic<uint64_t> ControlInteractivity::_nextId{ 1 };
+ 
+-    static constexpr TerminalInput::MouseButtonState toInternalMouseState(const Control::MouseButtonState& state)
+-    {
+-        return TerminalInput::MouseButtonState{
+-            WI_IsFlagSet(state, MouseButtonState::IsLeftButtonDown),
+-            WI_IsFlagSet(state, MouseButtonState::IsMiddleButtonDown),
+-            WI_IsFlagSet(state, MouseButtonState::IsRightButtonDown)
+-        };
+-    }
++    // toInternalMouseState used to live here, unpacking the projectable
++    // Control::MouseButtonState into TerminalInput's struct-of-bools. That
++    // conversion moved into ControlCore::SendMouseEvent when the method was
++    // promoted to IControlCore, so the projected type now reaches the engine
++    // unchanged and each engine unpacks it however it likes.
+ 
+     ControlInteractivity::ControlInteractivity(IControlSettings settings,
+                                                Control::IControlAppearance unfocusedAppearance,
+@@ -326,7 +323,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             // Only round for single-click: for double/triple-click, rounding
+             // can push the position to the next cell, selecting the wrong word.
+             const auto round = multiClickMapper == 1 && !_core->IsVtMouseModeEnabled();
+-            _core->LeftClickOnTerminal(_getTerminalPosition(til::point{ pixelPosition }, round),
++            _core->LeftClickOnTerminal(_getTerminalPosition(til::point{ pixelPosition }, round).to_core_point(),
+                                        multiClickMapper,
+                                        altEnabled,
+                                        shiftEnabled,
+@@ -354,7 +351,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+                 // Let the core know we're about to open a menu here. It has
+                 // some separate conditional logic based on _where_ the user
+                 // wanted to open the menu.
+-                _core->AnchorContextMenu(terminalPosition);
++                _core->AnchorContextMenu(terminalPosition.to_core_point());
+ 
+                 auto contextArgs = winrt::make<ContextMenuRequestedEventArgs>(til::point{ pixelPosition }.to_winrt_point());
+                 ContextMenuRequested.raise(*this, contextArgs);
+@@ -436,7 +433,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+                         //   side of the current cell.
+                         termPos.x++;
+                     }
+-                    _core->SetSelectionAnchor(termPos);
++                    _core->SetSelectionAnchor(termPos.to_core_point());
+ 
+                     // stop tracking the touchdown point
+                     _singleClickTouchdownPos = std::nullopt;
+@@ -737,7 +734,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     {
+         // Don't round in VT mouse mode; cell-level precision matters more
+         const auto round = !_core->IsVtMouseModeEnabled();
+-        _core->SetEndSelectionPoint(_getTerminalPosition(til::point{ pixelPosition }, round));
++        _core->SetEndSelectionPoint(_getTerminalPosition(til::point{ pixelPosition }, round).to_core_point());
+         _selectionNeedsToBeCopied = true;
+     }
+ 
+@@ -752,14 +749,23 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     // - the corresponding viewport terminal position for the given Point parameter
+     til::point ControlInteractivity::_getTerminalPosition(const til::point pixelPosition, bool roundToNearestCell)
+     {
+-        // Get the size of the font, which is in pixels
+-        const auto fontSize{ _core->GetFont().GetSize() };
++        // Get the size of the font, which is in pixels.
++        //
++        // Was _core->GetFont().GetSize(). FontSize() is already on IControlCore
++        // and is defined as exactly that value cast to float
++        // (ControlCore::FontSize -> _actualFont.GetSize()), so GetFont - which
++        // returns a non-projectable FontInfo - never needed promoting. The only
++        // difference is the type: Windows::Foundation::Size carries floats and
++        // capitalised members, where til::size carried CoordTypes.
++        const auto fontSizeF{ _core->FontSize() };
++        const til::size fontSize{ gsl::narrow_cast<til::CoordType>(fontSizeF.Width),
++                                  gsl::narrow_cast<til::CoordType>(fontSizeF.Height) };
+ 
+         if (roundToNearestCell)
+         {
+             // GH#5099: round the x-value to the nearest cell
+             til::point result;
+-            result.x = gsl::narrow_cast<til::CoordType>(std::round(gsl::narrow_cast<double>(pixelPosition.x) / fontSize.width));
++            result.x = gsl::narrow_cast<til::CoordType>(std::round(gsl::narrow_cast<double>(pixelPosition.x) / fontSizeF.Width));
+             result.y = pixelPosition.y / fontSize.height;
+             return result;
+         }
+@@ -776,7 +782,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         const auto adjustment = _core->BufferHeight() - _core->ScrollOffset() - _core->ViewHeight();
+         // If the click happened outside the active region, core should get a chance to filter it out or clamp it.
+         const auto adjustedY = terminalPosition.y - adjustment;
+-        return _core->SendMouseEvent({ terminalPosition.x, adjustedY }, pointerUpdateKind, modifiers, wheelDelta, toInternalMouseState(buttonState));
++        return _core->SendMouseEvent(til::point{ terminalPosition.x, adjustedY }.to_core_point(), pointerUpdateKind, modifiers, wheelDelta, buttonState);
+     }
+ 
+     // Method Description:
+diff --git a/src/cascadia/TerminalControl/IControlCore.idl b/src/cascadia/TerminalControl/IControlCore.idl
+index 026fe8434..13c1487a9 100644
+--- a/src/cascadia/TerminalControl/IControlCore.idl
++++ b/src/cascadia/TerminalControl/IControlCore.idl
+@@ -218,6 +218,50 @@ namespace Microsoft.Terminal.Control
+         // alt buffer - atomicity is the reason here, not a value mismatch.)
+         Boolean IsBufferRowInViewport(Int32 bufferRow);
+ 
++        // Promoted for ControlInteractivity (Phase 5). It drives all mouse and
++        // selection input, so a second engine cannot receive a click until these
++        // are on the interface rather than the concrete cascadia type.
++        //
++        // til::point is not projectable, so the coordinate parameters are
++        // Core::Point here; til::point converts both ways
++        // (til::point{Core::Point} and .to_core_point()).
++        void GotFocus();
++        void LostFocus();
++        void Close();
++        void Detach();
++        void AttachToNewControl();
++
++        Boolean CopyOnSelect { get; };
++        Boolean CopySelectionToClipboard(Boolean singleLine,
++                                         Boolean withControlSequences,
++                                         CopyFormat formats);
++
++        void SetSelectionAnchor(Microsoft.Terminal.Core.Point position);
++        void SetEndSelectionPoint(Microsoft.Terminal.Core.Point position);
++        void AnchorContextMenu(Microsoft.Terminal.Core.Point viewportRelativeCharacterPosition);
++
++        // selectionNeedsToBeCopied is an out-parameter on the C++ side; WinRT
++        // models that as a trailing out param.
++        void LeftClickOnTerminal(Microsoft.Terminal.Core.Point terminalPosition,
++                                 Int32 numberOfClicks,
++                                 Boolean altEnabled,
++                                 Boolean shiftEnabled,
++                                 Boolean isOnOriginalPosition,
++                                 out Boolean selectionNeedsToBeCopied);
++
++        Boolean IsVtMouseModeEnabled { get; };
++        Boolean ShouldSendAlternateScroll(UInt32 uiButton, Int32 delta);
++        // Takes the projectable MouseButtonState mirror declared above, not
++        // TerminalInput::MouseButtonState.
++        Boolean SendMouseEvent(Microsoft.Terminal.Core.Point viewportPos,
++                               UInt32 uiButton,
++                               Microsoft.Terminal.Core.ControlKeyStates states,
++                               Int16 wheelDelta,
++                               MouseButtonState state);
++
++        void UserScrollViewport(Int32 viewTop);
++        String GetHyperlink(Microsoft.Terminal.Core.Point position);
++
+         // These events are called from some background thread
+         event Windows.Foundation.TypedEventHandler<Object, TitleChangedEventArgs> TitleChanged;
+         event Windows.Foundation.TypedEventHandler<Object, WriteToClipboardEventArgs> WriteToClipboard;
+diff --git a/src/cascadia/UnitTests_Control/ControlCoreTests.cpp b/src/cascadia/UnitTests_Control/ControlCoreTests.cpp
+index 4b2f72576..591407c7e 100644
+--- a/src/cascadia/UnitTests_Control/ControlCoreTests.cpp
++++ b/src/cascadia/UnitTests_Control/ControlCoreTests.cpp
+@@ -1,4 +1,4 @@
+-// Copyright (c) Microsoft Corporation.
++﻿// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ 
+ #include "pch.h"
+@@ -908,7 +908,7 @@ namespace ControlUnitTests
+ 
+         auto needToCopy = false;
+         expectedSelectionUpdate = true;
+-        core->LeftClickOnTerminal(til::point{ 1, 1 },
++        core->LeftClickOnTerminal(til::point{ 1, 1 }.to_core_point(),
+                                   1,
+                                   false,
+                                   true,
+@@ -927,7 +927,7 @@ namespace ControlUnitTests
+         VERIFY_IS_TRUE(gotSelectionUpdate);
+ 
+         expectedSelectionUpdate = true;
+-        core->LeftClickOnTerminal(til::point{ 1, 2 },
++        core->LeftClickOnTerminal(til::point{ 1, 2 }.to_core_point(),
+                                   1,
+                                   false,
+                                   true,

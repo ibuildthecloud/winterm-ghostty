@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Thu, 6 Aug 2026 15:32:53 -0700
+Subject: [PATCH] feat(control): all six cursor shapes, exactly
+
+DoubleUnderscore and Vintage were both being sent as a plain underline. I called
+that an approximation; it was a different shape, and it looked like one - a
+stacked pair and a fat bottom bar are not underlines.
+
+ghostty patch 31 adds both, so all six of WT's shapes now map exactly and
+nothing is being rounded off. cursorHeight is still not forwarded: it exists to
+size Vintage, and underline_thick is a fixed quarter of the cell, which is what
+WT itself defaults cursorHeight to - sending a height would imply an effect
+ghostty has no setting for.
+
+WT suites: terminalCore 54/54, unitSettingsModel 159/159, unitControl 62/62,
+terminalApp 51/51.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BgDGqEqRBB8L5Ueoq1uuxy
+---
+ .../GhosttySettingsTranslator.cpp             | 21 +++++++++++++------
+ .../GhosttySettingsTests.cpp                  | 12 +++++------
+ 2 files changed, 21 insertions(+), 12 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+index 4d04dfe8b..614ab7d8b 100644
+--- a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
++++ b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+@@ -111,11 +111,16 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // beside it drew a bar, because the profile's cursorShape was never
+         // forwarded and ghostty used its own default.
+         //
+-        // ghostty offers four shapes to WT's six. DoubleUnderscore and Vintage
+-        // both become an underline - Vintage is a short underscore and ghostty
+-        // has no height control for it, which is also why CursorHeight is not
+-        // forwarded at all. Those two are the approximations; the other four
+-        // are exact.
++        // All six shapes map exactly. ghostty had four until patch 31 added the
++        // two DECSCUSR has no name for - a stacked double underline and the
++        // thick bottom bar the Windows console has drawn for decades. They were
++        // both collapsed onto a plain underline before that, which was not an
++        // approximation so much as a different shape.
++        //
++        // CursorHeight is still not forwarded: it exists to size Vintage, and
++        // cursor-style underline_thick is a fixed quarter of the cell - which is
++        // what WT itself defaults cursorHeight to. Sending a height would imply
++        // an effect ghostty has no setting for.
+         //
+         // Only the default is set here. A program can still ask for a different
+         // shape with DECSCUSR, on either engine, and ghostty's shell
+@@ -129,9 +134,13 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+                 set("cursor-style", "bar");
+                 break;
+             case Core::CursorStyle::Underscore:
++                set("cursor-style", "underline");
++                break;
+             case Core::CursorStyle::DoubleUnderscore:
++                set("cursor-style", "underline_double");
++                break;
+             case Core::CursorStyle::Vintage:
+-                set("cursor-style", "underline");
++                set("cursor-style", "underline_thick");
+                 break;
+             case Core::CursorStyle::EmptyBox:
+                 set("cursor-style", "block_hollow");
+diff --git a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+index 73ad2b208..d2de9437d 100644
+--- a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
++++ b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+@@ -187,9 +187,10 @@ namespace ControlUnitTests
+     // Found by hand: a ghostty pane drew a block cursor beside a cascadia pane
+     // drawing a bar, because the profile's cursorShape was never forwarded.
+     //
+-    // ghostty has four shapes to WT's six. Vintage and DoubleUnderscore both
+-    // land on underline - those two are approximations and the mapping should
+-    // say so out loud rather than be discovered later.
++    // All six map exactly. ghostty had four until patch 31 added the two
++    // DECSCUSR has no name for; before that these last two were collapsed onto
++    // a plain underline, which was not an approximation so much as a different
++    // shape, and it looked like it.
+     void GhosttySettingsTests::CursorShapeIsForwarded()
+     {
+         struct Case
+@@ -202,9 +203,8 @@ namespace ControlUnitTests
+             { Core::CursorStyle::FilledBox, "block" },
+             { Core::CursorStyle::EmptyBox, "block_hollow" },
+             { Core::CursorStyle::Underscore, "underline" },
+-            // Approximations: ghostty has neither.
+-            { Core::CursorStyle::DoubleUnderscore, "underline" },
+-            { Core::CursorStyle::Vintage, "underline" },
++            { Core::CursorStyle::DoubleUnderscore, "underline_double" },
++            { Core::CursorStyle::Vintage, "underline_thick" },
+         };
+ 
+         for (const auto& c : cases)

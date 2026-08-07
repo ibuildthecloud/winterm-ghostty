@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Wed, 5 Aug 2026 20:29:28 -0700
+Subject: [PATCH] feat(control): ReadEntireBuffer and prompt-level scrollToMark
+
+Both go through routes that exist rather than through new entry points, which
+is the standing Phase 6 principle.
+
+ReadEntireBuffer reads a GHOSTTY_POINT_SCREEN selection with TOP_LEFT and
+BOTTOM_RIGHT coords - the whole buffer without having to know how big it is.
+The shape is verified against the engine by a harness smoke check rather than
+assumed, because a wrong selection returns text too.
+
+ScrollToMark is jump_to_prompt, which is all ghostty can offer: its
+SemanticPrompt is a u2 holding none/prompt/prompt_continuation, so there are
+no command, output or error marks to move between.
+
+First and Last do not map to jump_to_prompt at all - it counts relative
+prompts, not absolute ones - so they scroll to the buffer edges instead.
+Treating them as a single step would be wrong in a way a user would notice,
+and silently doing nothing would be worse.
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 61 ++++++++++++++++++-
+ 1 file changed, 59 insertions(+), 2 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index d2bee9a30..2e73b270e 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -1069,7 +1069,34 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     void GhosttyControlCore::AddMark(const Control::ScrollMark& /*mark*/) {}
+     void GhosttyControlCore::ClearMark() {}
+     void GhosttyControlCore::ClearAllMarks() {}
+-    void GhosttyControlCore::ScrollToMark(const Control::ScrollToMarkDirection& /*direction*/) {}
++    // ghostty tracks prompts and nothing else - its SemanticPrompt is a u2
++    // with none/prompt/prompt_continuation - so this is prompt-to-prompt
++    // movement, which is what jump_to_prompt does. WT's mark categories
++    // (command/output/error) have no counterpart; see PLAN's Phase 6 block.
++    //
++    // The First/Last directions have no jump_to_prompt equivalent either: it
++    // counts relative prompts, not absolute ones. Treating them as one step is
++    // wrong in a way the user would notice, so they scroll to the buffer edge
++    // instead, which is at least what "first"/"last" means.
++    void GhosttyControlCore::ScrollToMark(const Control::ScrollToMarkDirection& direction)
++    {
++        switch (direction)
++        {
++        case Control::ScrollToMarkDirection::Previous:
++            _bindingAction("jump_to_prompt:-1");
++            break;
++        case Control::ScrollToMarkDirection::Next:
++            _bindingAction("jump_to_prompt:1");
++            break;
++        case Control::ScrollToMarkDirection::First:
++            _bindingAction("scroll_to_top");
++            break;
++        case Control::ScrollToMarkDirection::Last:
++            _bindingAction("scroll_to_bottom");
++            break;
++        }
++        _renderNow();
++    }
+     void GhosttyControlCore::SelectCommand(const bool /*goUp*/) {}
+     void GhosttyControlCore::SelectOutput(const bool /*goUp*/) {}
+     void GhosttyControlCore::ContextMenuSelectCommand() {}
+@@ -1091,7 +1118,37 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+     bool GhosttyControlCore::BracketedPasteEnabled() const noexcept { return false; }
+     void GhosttyControlCore::ClearBuffer(Control::ClearBufferType /*clearType*/) {}
+-    hstring GhosttyControlCore::ReadEntireBuffer() const { return {}; }
++    // The whole screen, scrollback included. GHOSTTY_POINT_SCREEN counts from
++    // the start of the scrollback rather than the viewport, and the TOP_LEFT /
++    // BOTTOM_RIGHT coords mean "the edge of that row" - so this is the entire
++    // buffer without having to know how big it is.
++    hstring GhosttyControlCore::ReadEntireBuffer() const
++    {
++        if (!_surface)
++        {
++            return {};
++        }
++
++        ghostty_selection_s all{};
++        all.top_left.tag = GHOSTTY_POINT_SCREEN;
++        all.top_left.coord = GHOSTTY_POINT_COORD_TOP_LEFT;
++        all.bottom_right.tag = GHOSTTY_POINT_SCREEN;
++        all.bottom_right.coord = GHOSTTY_POINT_COORD_BOTTOM_RIGHT;
++        all.rectangle = false;
++
++        ghostty_text_s text{};
++        if (!ghostty_surface_read_text(_surface, all, &text))
++        {
++            return {};
++        }
++        const auto release = wil::scope_exit([&]() { ghostty_surface_free_text(_surface, &text); });
++
++        if (!text.text || text.text_len == 0)
++        {
++            return {};
++        }
++        return winrt::hstring{ til::u8u16(std::string_view{ text.text, text.text_len }) };
++    }
+     Control::CommandHistoryContext GhosttyControlCore::CommandHistory() const { return nullptr; }
+     bool GhosttyControlCore::QuickFixesAvailable() const noexcept { return false; }
+     void GhosttyControlCore::UpdateQuickFixes(const Windows::Foundation::Collections::IVector<hstring>& /*quickFixes*/) {}

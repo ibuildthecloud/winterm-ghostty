@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 4 Aug 2026 14:25:50 -0700
+Subject: [PATCH] seam: pin SearchResultRows row de-duplication
+
+Promoting SearchResultRows to IControlCore moved the consecutive-
+duplicate filtering out of TermControl and behind the interface, because
+til::point_span is not projectable. That relocated real observable
+behaviour with no test covering it.
+
+TestSearchResultRowsAreDistinct pins the resulting contract: one entry
+per matching row, ascending, regardless of how many times the term
+occurs on that row. Three matches across two rows yield two entries.
+
+Mutation-tested: removing the dedup guard fails with Values (2, 3).
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ee27Fih3vSPYsqrUBpUoc
+---
+ .../UnitTests_Control/ControlCoreTests.cpp    | 42 +++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+diff --git a/src/cascadia/UnitTests_Control/ControlCoreTests.cpp b/src/cascadia/UnitTests_Control/ControlCoreTests.cpp
+index da0ffa365..4b2f72576 100644
+--- a/src/cascadia/UnitTests_Control/ControlCoreTests.cpp
++++ b/src/cascadia/UnitTests_Control/ControlCoreTests.cpp
+@@ -50,6 +50,7 @@ namespace ControlUnitTests
+ 
+         TEST_METHOD(TestIsBufferRowInViewport);
+         TEST_METHOD(TestIsBufferRowInViewportAltBuffer);
++        TEST_METHOD(TestSearchResultRowsAreDistinct);
+ 
+         TEST_CLASS_SETUP(ModuleSetup)
+         {
+@@ -332,6 +333,47 @@ namespace ControlUnitTests
+         VERIFY_IS_FALSE(core->IsBufferRowInViewport(viewport.BottomInclusive() + 1));
+     }
+ 
++    // SearchResultRows used to return std::vector<til::point_span> and the sole
++    // consumer (TermControl's scrollbar pips) filtered consecutive duplicates
++    // itself. til::point_span is not projectable, so promoting the escape to
++    // IControlCore (ADR 0001) moved that filtering behind the interface.
++    //
++    // This pins the contract that move created: one entry per matching row, in
++    // ascending order, however many times the term occurs on that row.
++    void ControlCoreTests::TestSearchResultRowsAreDistinct()
++    {
++        auto [settings, conn] = _createSettingsAndConnection();
++        auto core = createCore(*settings, *conn);
++        VERIFY_IS_NOT_NULL(core);
++        _standardInit(core);
++
++        // Row 0 holds the term twice, row 1 not at all, row 2 once.
++        conn->WriteInput(winrt_wstring_to_array_view(L"foo foo\r\n"));
++        conn->WriteInput(winrt_wstring_to_array_view(L"bar\r\n"));
++        conn->WriteInput(winrt_wstring_to_array_view(L"foo\r\n"));
++
++        Control::SearchRequest request{
++            L"foo", // Text
++            true, // GoForward
++            false, // CaseSensitive
++            false, // RegularExpression
++            true, // ExecuteSearch
++            false, // ScrollIntoView
++            0 // ScrollOffset
++        };
++        const auto results = core->Search(request);
++
++        // Three occurrences of the term...
++        VERIFY_ARE_EQUAL(3, results.TotalMatches);
++
++        // ...but only two rows to draw a pip on, and row 0 appears once despite
++        // holding two matches.
++        const auto rows = core->SearchResultRows();
++        VERIFY_ARE_EQUAL(2u, rows.Size(), L"two matching rows, not three matches");
++        VERIFY_ARE_EQUAL(0, rows.GetAt(0));
++        VERIFY_ARE_EQUAL(2, rows.GetAt(1));
++    }
++
+     void ControlCoreTests::TestClearScrollback()
+     {
+         auto [settings, conn] = _createSettingsAndConnection();

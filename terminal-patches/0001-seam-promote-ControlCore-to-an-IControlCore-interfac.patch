@@ -1,0 +1,926 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Mon, 3 Aug 2026 00:06:00 -0700
+Subject: [PATCH] seam: promote ControlCore to an IControlCore interface (ADR
+ 0001)
+
+Everything the shell consumes moves from the concrete ControlCore onto a
+new IControlCore WinRT interface, so a second engine can be dropped in
+beside the cascadia one. ControlCore becomes a marker class implementing
+IControlCore + ICoreState; TermControl and ControlInteractivity::Core()
+are typed against the interface.
+
+Members and events live on one interface rather than splitting the 27
+events onto an IControlCoreEvents: ICoreState already sets the
+one-extra-interface precedent here, and a split would add a second QI and
+complicate TermControl's revoker plumbing, which is written against a
+single object.
+
+Two of the six get_self escapes could not be promoted verbatim, because
+they existed precisely because their signatures are not projectable:
+
+- SearchResultRows returned std::vector<til::point_span>. Its only
+  consumer draws one scrollbar pip per row, so it now returns
+  IVector<Int32> of distinct rows and the duplicate filtering moved into
+  the implementation.
+- The QuickFix viewport check read GetRenderData()->GetViewport() with
+  both bounds under one console lock. It is now a single
+  IsBufferRowInViewport predicate to keep that atomicity. Deriving it
+  from ICoreState::ScrollOffset + ViewHeight would NOT be equivalent:
+  Terminal::_VisibleStartIndex() reports 0 in the alt buffer while
+  GetViewport().Top() does not.
+
+A seventh get_self site, TsfDataProvider::_getCore, is deliberately left
+alone: it hands out WT's internal Renderer*, which libghostty has no
+equivalent for. That is the TSF/IME coupling ADR 0001 already lists as
+reimplemented per engine.
+
+Deviation from the ADR: ControlInteractivity still holds the concrete
+type. It makes 58 calls across 34 core methods, most of them impl-level
+(AttachUiaEngine, SendMouseEvent, LeftClickOnTerminal,
+SetSelectionAnchor, GetRenderData, GetFont). Interface-typing it means
+promoting ~20 more members and is a Phase 5 prerequisite, not part of
+the mechanical promotion this ADR describes.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ee27Fih3vSPYsqrUBpUoc
+---
+ src/cascadia/TerminalControl/ControlCore.cpp  |  42 ++-
+ src/cascadia/TerminalControl/ControlCore.h    |   9 +-
+ src/cascadia/TerminalControl/ControlCore.idl  | 252 ++---------------
+ .../TerminalControl/ControlInteractivity.cpp  |   4 +-
+ .../TerminalControl/ControlInteractivity.h    |   4 +-
+ .../TerminalControl/ControlInteractivity.idl  |   5 +-
+ src/cascadia/TerminalControl/IControlCore.idl | 254 ++++++++++++++++++
+ src/cascadia/TerminalControl/TermControl.cpp  |  35 +--
+ src/cascadia/TerminalControl/TermControl.h    |  56 ++--
+ .../TerminalControlLib.vcxproj                |   1 +
+ 10 files changed, 372 insertions(+), 290 deletions(-)
+ create mode 100644 src/cascadia/TerminalControl/IControlCore.idl
+
+diff --git a/src/cascadia/TerminalControl/ControlCore.cpp b/src/cascadia/TerminalControl/ControlCore.cpp
+index 87ef33229..58ebe1840 100644
+--- a/src/cascadia/TerminalControl/ControlCore.cpp
++++ b/src/cascadia/TerminalControl/ControlCore.cpp
+@@ -1823,9 +1823,38 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         };
+     }
+ 
+-    const std::vector<til::point_span>& ControlCore::SearchResultRows() const noexcept
++    // Distinct buffer rows containing a search hit, in order.
++    //
++    // The results are spans, but the only consumer draws one scrollbar pip per
++    // row, so the consecutive-duplicate filtering that used to live in
++    // TermControl happens here instead: that keeps til::point_span - which is
++    // not projectable - off the IControlCore ABI.
++    Windows::Foundation::Collections::IVector<int32_t> ControlCore::SearchResultRows() const
++    {
++        std::vector<int32_t> rows;
++        auto lastRow = til::CoordTypeMin;
++        for (const auto& span : _searcher.Results())
++        {
++            if (lastRow != span.start.y)
++            {
++                lastRow = span.start.y;
++                rows.push_back(lastRow);
++            }
++        }
++        return winrt::single_threaded_vector<int32_t>(std::move(rows));
++    }
++
++    // Whether a buffer row is currently visible.
++    //
++    // Replaces a GetRenderData()->GetViewport() escape. Both bounds are read
++    // under a single lock, as the original did. ICoreState::ScrollOffset is not
++    // a substitute: Terminal::_VisibleStartIndex() reports 0 in the alt buffer
++    // while GetViewport().Top() does not.
++    bool ControlCore::IsBufferRowInViewport(int32_t bufferRow) const
+     {
+-        return _searcher.Results();
++        const auto lock = _terminal->LockForReading();
++        const auto viewport = _terminal->GetViewport();
++        return bufferRow >= viewport.Top() && bufferRow <= viewport.BottomInclusive();
+     }
+ 
+     void ControlCore::ClearSearch()
+@@ -1864,14 +1893,15 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         _closeConnection();
+     }
+ 
+-    void ControlCore::PersistTo(HANDLE handle) const
++    void ControlCore::PersistTo(int64_t handle) const
+     {
+         const auto lock = _terminal->LockForReading();
+-        _terminal->SerializeMainBuffer(handle);
++        _terminal->SerializeMainBuffer(reinterpret_cast<HANDLE>(handle));
+     }
+ 
+-    void ControlCore::RestoreFromPath(const wchar_t* path) const
++    void ControlCore::RestoreFromPath(const hstring& pathStr) const
+     {
++        const auto path = pathStr.c_str();
+         wil::unique_handle file{ CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr) };
+ 
+         // This block of code exists temporarily to fix buffer dumps that were
+@@ -2965,7 +2995,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+                               [](const ::MarkExtents& m) -> bool { return !m.HasOutput(); });
+     }
+ 
+-    void ControlCore::PreviewInput(std::wstring_view input)
++    void ControlCore::PreviewInput(const hstring& input)
+     {
+         _terminal->PreviewText(input);
+     }
+diff --git a/src/cascadia/TerminalControl/ControlCore.h b/src/cascadia/TerminalControl/ControlCore.h
+index e51154c22..130013188 100644
+--- a/src/cascadia/TerminalControl/ControlCore.h
++++ b/src/cascadia/TerminalControl/ControlCore.h
+@@ -153,8 +153,8 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         void ColorSelection(const Control::SelectionColor& fg, const Control::SelectionColor& bg, Core::MatchMode matchMode);
+ 
+         void Close();
+-        void PersistTo(HANDLE handle) const;
+-        void RestoreFromPath(const wchar_t* path) const;
++        void PersistTo(int64_t handle) const;
++        void RestoreFromPath(const hstring& path) const;
+ 
+         void ClearQuickFix();
+ 
+@@ -224,7 +224,8 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         void SetEndSelectionPoint(const til::point position);
+ 
+         SearchResults Search(const SearchRequest& request);
+-        const std::vector<til::point_span>& SearchResultRows() const noexcept;
++        Windows::Foundation::Collections::IVector<int32_t> SearchResultRows() const;
++        bool IsBufferRowInViewport(int32_t bufferRow) const;
+         void ClearSearch();
+ 
+         void LeftClickOnTerminal(const til::point terminalPosition,
+@@ -262,7 +263,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         bool ShouldShowSelectCommand();
+         bool ShouldShowSelectOutput();
+ 
+-        void PreviewInput(std::wstring_view input);
++        void PreviewInput(const hstring& input);
+ 
+         RUNTIME_SETTING(float, Opacity, _settings.Opacity());
+         RUNTIME_SETTING(float, FocusedOpacity, FocusedAppearance().Opacity());
+diff --git a/src/cascadia/TerminalControl/ControlCore.idl b/src/cascadia/TerminalControl/ControlCore.idl
+index d0ecdb789..fcc3c6952 100644
+--- a/src/cascadia/TerminalControl/ControlCore.idl
++++ b/src/cascadia/TerminalControl/ControlCore.idl
+@@ -1,225 +1,27 @@
+-// Copyright (c) Microsoft Corporation.
+-// Licensed under the MIT license.
+-
+-import "ICoreState.idl";
+-import "IControlSettings.idl";
+-import "EventArgs.idl";
+-
+-namespace Microsoft.Terminal.Control
+-{
+-
+-    // This is a mirror of
+-    // ::Microsoft::Console::VirtualTerminal::TerminalInput::MouseButtonState,
+-    // but projectable.
+-    // !! LOAD BEARING !! If you make this a struct with Booleans (like they
+-    // make the most sense as), then the app will crash trying to toss one of
+-    // these across the process boundary. I haven't the damndest idea why.
+-    [flags] enum MouseButtonState {
+-        IsLeftButtonDown = 0x1,
+-        IsMiddleButtonDown = 0x2,
+-        IsRightButtonDown = 0x4
+-    };
+-
+-    enum ClearBufferType
+-    {
+-        Screen,
+-        Scrollback,
+-        All
+-    };
+-
+-    enum SelectionInteractionMode
+-    {
+-        None,
+-        Mouse,
+-        Keyboard,
+-        Mark
+-    };
+-
+-    [flags] enum SelectionEndpointTarget {
+-        Start = 0x1,
+-        End = 0x2
+-    };
+-
+-    struct SelectionData
+-    {
+-        Microsoft.Terminal.Core.Point StartPos;
+-        Microsoft.Terminal.Core.Point EndPos;
+-        SelectionEndpointTarget Endpoint;
+-        Boolean StartAtLeftBoundary;
+-        Boolean EndAtRightBoundary;
+-    };
+-
+-    struct SearchRequest
+-    {
+-        String Text;
+-        Boolean GoForward;
+-        Boolean CaseSensitive;
+-        Boolean RegularExpression;
+-        Boolean ExecuteSearch;
+-        Boolean ScrollIntoView;
+-        Int32 ScrollOffset;
+-    };
+-
+-    struct SearchResults
+-    {
+-        Int32 TotalMatches;
+-        Int32 CurrentMatch;
+-        Boolean SearchInvalidated;
+-        Boolean SearchRegexInvalid;
+-    };
+-
+-    [default_interface] runtimeclass SelectionColor
+-    {
+-        SelectionColor();
+-        Microsoft.Terminal.Core.Color Color;
+-        // If true, color.R is a value between 0 and 15, indicating an indexed color.
+-        // This mirrors how TextColor works internally, which is the primary target of this interface.
+-        Boolean IsIndex16;
+-    };
+-
+-    [default_interface] runtimeclass CommandHistoryContext
+-    {
+-        IVector<String> History { get; };
+-        String CurrentCommandline { get; };
+-        IVector<String> QuickFixes { get; };
+-    };
+-
+-    [default_interface] runtimeclass ControlCore : ICoreState
+-    {
+-        ControlCore(IControlSettings settings,
+-                    IControlAppearance unfocusedAppearance,
+-                    Microsoft.Terminal.TerminalConnection.ITerminalConnection connection);
+-
+-        Boolean Initialize(Single actualWidth,
+-                           Single actualHeight,
+-                           Single compositionScale);
+-
+-        void UpdateSettings(IControlSettings settings, IControlAppearance appearance);
+-        void ApplyAppearance(Boolean focused);
+-
+-        Microsoft.Terminal.TerminalConnection.ITerminalConnection Connection;
+-        void HardResetWithoutErase();
+-
+-        IControlSettings Settings { get; };
+-        IControlAppearance FocusedAppearance { get; };
+-        IControlAppearance UnfocusedAppearance { get; };
+-        Boolean HasUnfocusedAppearance();
+-        void SetHighContrastMode(Boolean enabled);
+-
+-        void ApplyPreviewColorScheme(Microsoft.Terminal.Core.ICoreScheme scheme);
+-        void ResetPreviewColorScheme();
+-
+-        void SetOverrideColorScheme(Microsoft.Terminal.Core.ICoreScheme scheme);
+-
+-        UInt64 SwapChainHandle { get; };
+-
+-        Windows.Foundation.Size FontSize { get; };
+-        Windows.Foundation.Size FontSizeInDips { get; };
+-        UInt16 FontWeight { get; };
+-        Single Opacity { get; };
+-        Boolean UseAcrylic { get; };
+-
+-        Boolean TryMarkModeKeybinding(Int16 vkey,
+-                                      Microsoft.Terminal.Core.ControlKeyStates modifiers);
+-        Boolean TrySendKeyEvent(Int16 vkey,
+-                                Int16 scanCode,
+-                                Microsoft.Terminal.Core.ControlKeyStates modifiers,
+-                                Boolean keyDown);
+-        Boolean SendCharEvent(Char ch,
+-                              Int16 scanCode,
+-                              Microsoft.Terminal.Core.ControlKeyStates modifiers);
+-        void SendInput(String text);
+-        void PasteText(String text);
+-        void SelectAll();
+-        void ClearSelection();
+-        Boolean ToggleBlockSelection();
+-        void ToggleMarkMode();
+-        Boolean SwitchSelectionEndpoint();
+-        Boolean ExpandSelectionToWord();
+-        void ClearBuffer(ClearBufferType clearType);
+-
+-        void SetHoveredCell(Microsoft.Terminal.Core.Point terminalPosition);
+-        void ClearHoveredCell();
+-
+-        void ResetFontSize();
+-        void AdjustFontSize(Single fontSizeDelta);
+-        void SizeChanged(Single width, Single height);
+-        void ScaleChanged(Single scale);
+-        void SizeOrScaleChanged(Single width, Single height, Single scale);
+-
+-        void ToggleShaderEffects();
+-        void ToggleReadOnlyMode();
+-        void SetReadOnlyMode(Boolean readOnlyState);
+-
+-        Microsoft.Terminal.Core.Point CursorPosition { get; };
+-        Boolean ForceCursorVisible;
+-        void ResumeRendering();
+-
+-        SearchResults Search(SearchRequest request);
+-        void ClearSearch();
+-
+-        Microsoft.Terminal.Core.Color ForegroundColor { get; };
+-        Microsoft.Terminal.Core.Color BackgroundColor { get; };
+-
+-        SelectionData SelectionInfo { get; };
+-        SelectionInteractionMode SelectionMode();
+-
+-        String HoveredUriText { get; };
+-        Windows.Foundation.IReference<Microsoft.Terminal.Core.Point> HoveredCell { get; };
+-
+-        Boolean IsInReadOnlyMode { get; };
+-        void EnablePainting();
+-
+-        String ReadEntireBuffer();
+-        CommandHistoryContext CommandHistory();
+-        Boolean QuickFixesAvailable { get; };
+-
+-        void AdjustOpacity(Single Opacity, Boolean relative);
+-        void WindowVisibilityChanged(Boolean showOrHide);
+-
+-        void ColorSelection(SelectionColor fg, SelectionColor bg, Microsoft.Terminal.Core.MatchMode matchMode);
+-
+-        void ContextMenuSelectCommand();
+-        void ContextMenuSelectOutput();
+-        Boolean ShouldShowSelectCommand();
+-        Boolean ShouldShowSelectOutput();
+-
+-        void OpenCWD();
+-
+-        void ClearQuickFix();
+-
+-        // These events are called from some background thread
+-        event Windows.Foundation.TypedEventHandler<Object, TitleChangedEventArgs> TitleChanged;
+-        event Windows.Foundation.TypedEventHandler<Object, WriteToClipboardEventArgs> WriteToClipboard;
+-        event Windows.Foundation.TypedEventHandler<Object, Object> WarningBell;
+-        event Windows.Foundation.TypedEventHandler<Object, Object> TabColorChanged;
+-        event Windows.Foundation.TypedEventHandler<Object, Object> BackgroundColorChanged;
+-        event Windows.Foundation.TypedEventHandler<Object, Object> TaskbarProgressChanged;
+-        event Windows.Foundation.TypedEventHandler<Object, Object> RendererEnteredErrorState;
+-        event Windows.Foundation.TypedEventHandler<Object, ShowWindowArgs> ShowWindowChanged;
+-        event Windows.Foundation.TypedEventHandler<Object, SearchMissingCommandEventArgs> SearchMissingCommand;
+-        event Windows.Foundation.TypedEventHandler<Object, ShowNotificationEventArgs> ShowNotification;
+-        event Windows.Foundation.TypedEventHandler<Object, Object> RefreshQuickFixUI;
+-        event Windows.Foundation.TypedEventHandler<Object, WindowSizeChangedEventArgs> WindowSizeChanged;
+-
+-        // These events are always called from the UI thread (bugs aside)
+-        event Windows.Foundation.TypedEventHandler<Object, FontSizeChangedArgs> FontSizeChanged;
+-        event Windows.Foundation.TypedEventHandler<Object, ScrollPositionChangedArgs> ScrollPositionChanged;
+-        event Windows.Foundation.TypedEventHandler<Object, Object> ConnectionStateChanged;
+-        event Windows.Foundation.TypedEventHandler<Object, Object> HoveredHyperlinkChanged;
+-        event Windows.Foundation.TypedEventHandler<Object, Object> SwapChainChanged;
+-        event Windows.Foundation.TypedEventHandler<Object, RendererWarningArgs> RendererWarning;
+-        event Windows.Foundation.TypedEventHandler<Object, NoticeEventArgs> RaiseNotice;
+-        event Windows.Foundation.TypedEventHandler<Object, TransparencyChangedEventArgs> TransparencyChanged;
+-        event Windows.Foundation.TypedEventHandler<Object, Object> OutputIdle;
+-        event Windows.Foundation.TypedEventHandler<Object, UpdateSelectionMarkersEventArgs> UpdateSelectionMarkers;
+-        event Windows.Foundation.TypedEventHandler<Object, OpenHyperlinkEventArgs> OpenHyperlink;
+-        event Windows.Foundation.TypedEventHandler<Object, Object> CloseTerminalRequested;
+-        event Windows.Foundation.TypedEventHandler<Object, Object> RestartTerminalRequested;
+-
+-        event Windows.Foundation.TypedEventHandler<Object, Object> Attached;
+-
+-        event Windows.Foundation.TypedEventHandler<Object, CompletionsChangedEventArgs> CompletionsChanged;
+-
+-    };
+-}
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++
++import "IControlCore.idl";
++import "ICoreState.idl";
++import "IControlSettings.idl";
++import "EventArgs.idl";
++
++namespace Microsoft.Terminal.Control
++{
++    // The cascadia engine: implementation #1 of IControlCore (ADR 0001).
++    //
++    // Everything this class used to declare now lives on IControlCore, so the
++    // shell talks to the interface and a second engine can be dropped in beside
++    // this one. Only the constructor stays here - it is what the factory calls
++    // to produce this particular engine.
++    // [default_interface] marks this as a marker class. Every member now lives
++    // on IControlCore, so the class body holds only the constructor - and MIDL
++    // requires a runtimeclass that is constructed (or passed as a parameter) to
++    // have a default interface.
++    [default_interface] runtimeclass ControlCore : IControlCore, ICoreState
++    {
++        ControlCore(IControlSettings settings,
++                    IControlAppearance unfocusedAppearance,
++                    Microsoft.Terminal.TerminalConnection.ITerminalConnection connection);
++    };
++}
+diff --git a/src/cascadia/TerminalControl/ControlInteractivity.cpp b/src/cascadia/TerminalControl/ControlInteractivity.cpp
+index bd3091179..a1f93f299 100644
+--- a/src/cascadia/TerminalControl/ControlInteractivity.cpp
++++ b/src/cascadia/TerminalControl/ControlInteractivity.cpp
+@@ -1,4 +1,4 @@
+-// Copyright (c) Microsoft Corporation.
++﻿// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ 
+ #include "pch.h"
+@@ -123,7 +123,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         _multiClickTimer = GetDoubleClickTime() * 1000;
+     }
+ 
+-    Control::ControlCore ControlInteractivity::Core()
++    Control::IControlCore ControlInteractivity::Core()
+     {
+         return *_core;
+     }
+diff --git a/src/cascadia/TerminalControl/ControlInteractivity.h b/src/cascadia/TerminalControl/ControlInteractivity.h
+index 7f80c2f8e..69f86db79 100644
+--- a/src/cascadia/TerminalControl/ControlInteractivity.h
++++ b/src/cascadia/TerminalControl/ControlInteractivity.h
+@@ -1,4 +1,4 @@
+-// Copyright (c) Microsoft Corporation.
++﻿// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ //
+ // Module Name:
+@@ -42,7 +42,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         void LostFocus();
+         void UpdateSettings();
+         void Initialize();
+-        Control::ControlCore Core();
++        Control::IControlCore Core();
+ 
+         void Close();
+         void Detach();
+diff --git a/src/cascadia/TerminalControl/ControlInteractivity.idl b/src/cascadia/TerminalControl/ControlInteractivity.idl
+index 33d89722f..b0850bb78 100644
+--- a/src/cascadia/TerminalControl/ControlInteractivity.idl
++++ b/src/cascadia/TerminalControl/ControlInteractivity.idl
+@@ -1,8 +1,9 @@
+-// Copyright (c) Microsoft Corporation.
++﻿// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ 
+ import "ICoreState.idl";
+ import "IControlSettings.idl";
++import "IControlCore.idl";
+ import "ControlCore.idl";
+ import "EventArgs.idl";
+ import "InteractivityAutomationPeer.idl";
+@@ -17,7 +18,7 @@ namespace Microsoft.Terminal.Control
+                              IControlAppearance unfocusedAppearance,
+                              Microsoft.Terminal.TerminalConnection.ITerminalConnection connection);
+ 
+-        ControlCore Core { get; };
++        IControlCore Core { get; };
+         void UpdateSettings();
+         void Initialize();
+         void GotFocus();
+diff --git a/src/cascadia/TerminalControl/IControlCore.idl b/src/cascadia/TerminalControl/IControlCore.idl
+new file mode 100644
+index 000000000..5363c3553
+--- /dev/null
++++ b/src/cascadia/TerminalControl/IControlCore.idl
+@@ -0,0 +1,254 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++
++import "ICoreState.idl";
++import "IControlSettings.idl";
++import "EventArgs.idl";
++
++namespace Microsoft.Terminal.Control
++{
++
++    // This is a mirror of
++    // ::Microsoft::Console::VirtualTerminal::TerminalInput::MouseButtonState,
++    // but projectable.
++    // !! LOAD BEARING !! If you make this a struct with Booleans (like they
++    // make the most sense as), then the app will crash trying to toss one of
++    // these across the process boundary. I haven't the damndest idea why.
++    [flags] enum MouseButtonState {
++        IsLeftButtonDown = 0x1,
++        IsMiddleButtonDown = 0x2,
++        IsRightButtonDown = 0x4
++    };
++
++    enum ClearBufferType
++    {
++        Screen,
++        Scrollback,
++        All
++    };
++
++    enum SelectionInteractionMode
++    {
++        None,
++        Mouse,
++        Keyboard,
++        Mark
++    };
++
++    [flags] enum SelectionEndpointTarget {
++        Start = 0x1,
++        End = 0x2
++    };
++
++    struct SelectionData
++    {
++        Microsoft.Terminal.Core.Point StartPos;
++        Microsoft.Terminal.Core.Point EndPos;
++        SelectionEndpointTarget Endpoint;
++        Boolean StartAtLeftBoundary;
++        Boolean EndAtRightBoundary;
++    };
++
++    struct SearchRequest
++    {
++        String Text;
++        Boolean GoForward;
++        Boolean CaseSensitive;
++        Boolean RegularExpression;
++        Boolean ExecuteSearch;
++        Boolean ScrollIntoView;
++        Int32 ScrollOffset;
++    };
++
++    struct SearchResults
++    {
++        Int32 TotalMatches;
++        Int32 CurrentMatch;
++        Boolean SearchInvalidated;
++        Boolean SearchRegexInvalid;
++    };
++
++    [default_interface] runtimeclass SelectionColor
++    {
++        SelectionColor();
++        Microsoft.Terminal.Core.Color Color;
++        // If true, color.R is a value between 0 and 15, indicating an indexed color.
++        // This mirrors how TextColor works internally, which is the primary target of this interface.
++        Boolean IsIndex16;
++    };
++
++    [default_interface] runtimeclass CommandHistoryContext
++    {
++        IVector<String> History { get; };
++        String CurrentCommandline { get; };
++        IVector<String> QuickFixes { get; };
++    };
++
++    // The engine-agnostic contract the shell consumes (ADR 0001). Everything
++    // above this interface - TermControl, tabs, panes, profiles, settings - is
++    // written against it rather than against a concrete engine, so a second
++    // implementation can be dropped in beside the cascadia one.
++    //
++    // Members and events live together on this single interface rather than
++    // splitting the events onto an IControlCoreEvents: ICoreState already
++    // establishes the one-extra-interface pattern here, and a split would add a
++    // second QueryInterface and complicate TermControl's revoker plumbing, which
++    // is written against a single object.
++    interface IControlCore requires ICoreState
++    {
++        Boolean Initialize(Single actualWidth,
++                           Single actualHeight,
++                           Single compositionScale);
++
++        void UpdateSettings(IControlSettings settings, IControlAppearance appearance);
++        void ApplyAppearance(Boolean focused);
++
++        Microsoft.Terminal.TerminalConnection.ITerminalConnection Connection;
++        void HardResetWithoutErase();
++
++        IControlSettings Settings { get; };
++        IControlAppearance FocusedAppearance { get; };
++        IControlAppearance UnfocusedAppearance { get; };
++        Boolean HasUnfocusedAppearance();
++        void SetHighContrastMode(Boolean enabled);
++
++        void ApplyPreviewColorScheme(Microsoft.Terminal.Core.ICoreScheme scheme);
++        void ResetPreviewColorScheme();
++
++        void SetOverrideColorScheme(Microsoft.Terminal.Core.ICoreScheme scheme);
++
++        UInt64 SwapChainHandle { get; };
++
++        Windows.Foundation.Size FontSize { get; };
++        Windows.Foundation.Size FontSizeInDips { get; };
++        UInt16 FontWeight { get; };
++        Single Opacity { get; };
++        Boolean UseAcrylic { get; };
++
++        Boolean TryMarkModeKeybinding(Int16 vkey,
++                                      Microsoft.Terminal.Core.ControlKeyStates modifiers);
++        Boolean TrySendKeyEvent(Int16 vkey,
++                                Int16 scanCode,
++                                Microsoft.Terminal.Core.ControlKeyStates modifiers,
++                                Boolean keyDown);
++        Boolean SendCharEvent(Char ch,
++                              Int16 scanCode,
++                              Microsoft.Terminal.Core.ControlKeyStates modifiers);
++        void SendInput(String text);
++        void PasteText(String text);
++        void SelectAll();
++        void ClearSelection();
++        Boolean ToggleBlockSelection();
++        void ToggleMarkMode();
++        Boolean SwitchSelectionEndpoint();
++        Boolean ExpandSelectionToWord();
++        void ClearBuffer(ClearBufferType clearType);
++
++        void SetHoveredCell(Microsoft.Terminal.Core.Point terminalPosition);
++        void ClearHoveredCell();
++
++        void ResetFontSize();
++        void AdjustFontSize(Single fontSizeDelta);
++        void SizeChanged(Single width, Single height);
++        void ScaleChanged(Single scale);
++        void SizeOrScaleChanged(Single width, Single height, Single scale);
++
++        void ToggleShaderEffects();
++        void ToggleReadOnlyMode();
++        void SetReadOnlyMode(Boolean readOnlyState);
++
++        Microsoft.Terminal.Core.Point CursorPosition { get; };
++        Boolean ForceCursorVisible;
++        void ResumeRendering();
++
++        SearchResults Search(SearchRequest request);
++        void ClearSearch();
++
++        Microsoft.Terminal.Core.Color ForegroundColor { get; };
++        Microsoft.Terminal.Core.Color BackgroundColor { get; };
++
++        SelectionData SelectionInfo { get; };
++        SelectionInteractionMode SelectionMode();
++
++        String HoveredUriText { get; };
++        Windows.Foundation.IReference<Microsoft.Terminal.Core.Point> HoveredCell { get; };
++
++        Boolean IsInReadOnlyMode { get; };
++        void EnablePainting();
++
++        String ReadEntireBuffer();
++        CommandHistoryContext CommandHistory();
++        Boolean QuickFixesAvailable { get; };
++
++        void AdjustOpacity(Single Opacity, Boolean relative);
++        void WindowVisibilityChanged(Boolean showOrHide);
++
++        void ColorSelection(SelectionColor fg, SelectionColor bg, Microsoft.Terminal.Core.MatchMode matchMode);
++
++        void ContextMenuSelectCommand();
++        void ContextMenuSelectOutput();
++        Boolean ShouldShowSelectCommand();
++        Boolean ShouldShowSelectOutput();
++
++        void OpenCWD();
++
++        void ClearQuickFix();
++
++        // Promoted from get_self<ControlCore> escapes (ADR 0001). These were
++        // reaching through the projection into the concrete cascadia type,
++        // which a second engine could not satisfy.
++        // Distinct buffer rows containing a search hit, in order. The only
++        // consumer draws one scrollbar pip per row, so projecting rows rather
++        // than til::point_span keeps the ABI simple and moves the
++        // consecutive-duplicate filtering to the implementation.
++        IVector<Int32> SearchResultRows();
++        // Int64 rather than UInt64 to match the existing ITermControl
++        // projection of the same call.
++        void PersistTo(Int64 handle);
++        void RestoreFromPath(String path);
++        void UpdateQuickFixes(IVector<String> quickFixes);
++        void PreviewInput(String text);
++        // The QuickFix viewport query, which previously reached through
++        // GetRenderData()->GetViewport() while holding the console lock.
++        //
++        // Deliberately a single predicate rather than separate Top/Bottom
++        // accessors: the original read both bounds under one lock, and
++        // ICoreState's ScrollOffset cannot substitute because
++        // Terminal::_VisibleStartIndex() special-cases the alt buffer to 0
++        // while GetViewport().Top() does not.
++        Boolean IsBufferRowInViewport(Int32 bufferRow);
++
++        // These events are called from some background thread
++        event Windows.Foundation.TypedEventHandler<Object, TitleChangedEventArgs> TitleChanged;
++        event Windows.Foundation.TypedEventHandler<Object, WriteToClipboardEventArgs> WriteToClipboard;
++        event Windows.Foundation.TypedEventHandler<Object, Object> WarningBell;
++        event Windows.Foundation.TypedEventHandler<Object, Object> TabColorChanged;
++        event Windows.Foundation.TypedEventHandler<Object, Object> BackgroundColorChanged;
++        event Windows.Foundation.TypedEventHandler<Object, Object> TaskbarProgressChanged;
++        event Windows.Foundation.TypedEventHandler<Object, Object> RendererEnteredErrorState;
++        event Windows.Foundation.TypedEventHandler<Object, ShowWindowArgs> ShowWindowChanged;
++        event Windows.Foundation.TypedEventHandler<Object, SearchMissingCommandEventArgs> SearchMissingCommand;
++        event Windows.Foundation.TypedEventHandler<Object, ShowNotificationEventArgs> ShowNotification;
++        event Windows.Foundation.TypedEventHandler<Object, Object> RefreshQuickFixUI;
++        event Windows.Foundation.TypedEventHandler<Object, WindowSizeChangedEventArgs> WindowSizeChanged;
++
++        // These events are always called from the UI thread (bugs aside)
++        event Windows.Foundation.TypedEventHandler<Object, FontSizeChangedArgs> FontSizeChanged;
++        event Windows.Foundation.TypedEventHandler<Object, ScrollPositionChangedArgs> ScrollPositionChanged;
++        event Windows.Foundation.TypedEventHandler<Object, Object> ConnectionStateChanged;
++        event Windows.Foundation.TypedEventHandler<Object, Object> HoveredHyperlinkChanged;
++        event Windows.Foundation.TypedEventHandler<Object, Object> SwapChainChanged;
++        event Windows.Foundation.TypedEventHandler<Object, RendererWarningArgs> RendererWarning;
++        event Windows.Foundation.TypedEventHandler<Object, NoticeEventArgs> RaiseNotice;
++        event Windows.Foundation.TypedEventHandler<Object, TransparencyChangedEventArgs> TransparencyChanged;
++        event Windows.Foundation.TypedEventHandler<Object, Object> OutputIdle;
++        event Windows.Foundation.TypedEventHandler<Object, UpdateSelectionMarkersEventArgs> UpdateSelectionMarkers;
++        event Windows.Foundation.TypedEventHandler<Object, OpenHyperlinkEventArgs> OpenHyperlink;
++        event Windows.Foundation.TypedEventHandler<Object, Object> CloseTerminalRequested;
++        event Windows.Foundation.TypedEventHandler<Object, Object> RestartTerminalRequested;
++
++        event Windows.Foundation.TypedEventHandler<Object, Object> Attached;
++
++        event Windows.Foundation.TypedEventHandler<Object, CompletionsChangedEventArgs> CompletionsChanged;
++    };
++}
+diff --git a/src/cascadia/TerminalControl/TermControl.cpp b/src/cascadia/TerminalControl/TermControl.cpp
+index 1557b9686..843fc6069 100644
+--- a/src/cascadia/TerminalControl/TermControl.cpp
++++ b/src/cascadia/TerminalControl/TermControl.cpp
+@@ -1,4 +1,4 @@
+-// Copyright (c) Microsoft Corporation.
++﻿// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ 
+ #include "pch.h"
+@@ -647,20 +647,17 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+             if (_searchBox && _searchBox->IsOpen())
+             {
+-                const auto core = winrt::get_self<ControlCore>(_core);
+-                const auto& searchMatches = core->SearchResultRows();
+-                const auto color = core->ForegroundColor();
++                // The core now returns distinct rows, so the duplicate
++                // filtering that used to live here has moved behind the
++                // interface (til::point_span is not projectable).
++                const auto searchRows = _core.SearchResultRows();
++                const auto color = _core.ForegroundColor();
+                 const auto rightAlignedOffset = (scrollBarWidthInPx - pipWidth) * sizeof(til::color);
+-                til::CoordType lastRow = til::CoordTypeMin;
+ 
+-                for (const auto& span : searchMatches)
++                for (const auto row : searchRows)
+                 {
+-                    if (lastRow != span.start.y)
+-                    {
+-                        lastRow = span.start.y;
+-                        const auto base = dataAt(lastRow) + rightAlignedOffset;
+-                        drawPip(base, color);
+-                    }
++                    const auto base = dataAt(row) + rightAlignedOffset;
++                    drawPip(base, color);
+                 }
+             }
+ 
+@@ -1465,7 +1462,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+                 co_return;
+             }
+ 
+-            winrt::get_self<ControlCore>(_core)->RestoreFromPath(path.c_str());
++            _core.RestoreFromPath(path);
+         }
+         CATCH_LOG();
+ 
+@@ -2637,7 +2634,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // file then.
+         if (_initializedTerminal)
+         {
+-            winrt::get_self<ControlCore>(_core)->PersistTo(reinterpret_cast<HANDLE>(handle));
++            _core.PersistTo(handle);
+         }
+     }
+ 
+@@ -3744,7 +3741,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+     void TermControl::UpdateWinGetSuggestions(Windows::Foundation::Collections::IVector<hstring> suggestions)
+     {
+-        get_self<ControlCore>(_core)->UpdateQuickFixes(suggestions);
++        _core.UpdateQuickFixes(suggestions);
+     }
+ 
+     void TermControl::AdjustOpacity(const float opacity, const bool relative)
+@@ -3864,7 +3861,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+     void TermControl::PreviewInput(const winrt::hstring& text)
+     {
+-        get_self<ControlCore>(_core)->PreviewInput(text);
++        _core.PreviewInput(text);
+ 
+         if (!text.empty())
+         {
+@@ -4037,11 +4034,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         PropertyChanged.raise(*this, Windows::UI::Xaml::Data::PropertyChangedEventArgs{ L"QuickFixButtonCollapsedWidth" });
+         VisualStateManager::GoToState(*this, !_quickFixButtonCollapsible ? StateNormal : StateCollapsed, false);
+ 
+-        const auto rd = get_self<ControlCore>(_core)->GetRenderData();
+-        rd->LockConsole();
+-        const auto viewportBufferPosition = rd->GetViewport();
+-        rd->UnlockConsole();
+-        if (_quickFixBufferPos < viewportBufferPosition.Top() || _quickFixBufferPos > viewportBufferPosition.BottomInclusive())
++        if (!_core.IsBufferRowInViewport(_quickFixBufferPos))
+         {
+             quickFixBtn.Visibility(Visibility::Collapsed);
+             return;
+diff --git a/src/cascadia/TerminalControl/TermControl.h b/src/cascadia/TerminalControl/TermControl.h
+index 4011c76fc..50857e396 100644
+--- a/src/cascadia/TerminalControl/TermControl.h
++++ b/src/cascadia/TerminalControl/TermControl.h
+@@ -1,4 +1,4 @@
+-// Copyright (c) Microsoft Corporation.
++﻿// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ 
+ #pragma once
+@@ -250,7 +250,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // Further, the TermControlAutomationPeer must be destructed after _uiaEngine!
+         Control::TermControlAutomationPeer _automationPeer{ nullptr };
+         Control::ControlInteractivity _interactivity{ nullptr };
+-        Control::ControlCore _core{ nullptr };
++        Control::IControlCore _core{ nullptr };
+         Control::IKeyBindings _keyBindings{ nullptr };
+         TsfDataProvider _tsfDataProvider{ this };
+         winrt::com_ptr<SearchBoxControl> _searchBox;
+@@ -448,34 +448,34 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         struct Revokers
+         {
+-            Control::ControlCore::ScrollPositionChanged_revoker coreScrollPositionChanged;
+-            Control::ControlCore::WarningBell_revoker WarningBell;
+-            Control::ControlCore::RendererEnteredErrorState_revoker RendererEnteredErrorState;
+-            Control::ControlCore::BackgroundColorChanged_revoker BackgroundColorChanged;
+-            Control::ControlCore::FontSizeChanged_revoker FontSizeChanged;
+-            Control::ControlCore::TransparencyChanged_revoker TransparencyChanged;
+-            Control::ControlCore::RaiseNotice_revoker RaiseNotice;
+-            Control::ControlCore::HoveredHyperlinkChanged_revoker HoveredHyperlinkChanged;
+-            Control::ControlCore::OutputIdle_revoker OutputIdle;
+-            Control::ControlCore::UpdateSelectionMarkers_revoker UpdateSelectionMarkers;
+-            Control::ControlCore::OpenHyperlink_revoker coreOpenHyperlink;
+-            Control::ControlCore::TitleChanged_revoker TitleChanged;
+-            Control::ControlCore::WriteToClipboard_revoker WriteToClipboard;
+-            Control::ControlCore::TabColorChanged_revoker TabColorChanged;
+-            Control::ControlCore::TaskbarProgressChanged_revoker TaskbarProgressChanged;
+-            Control::ControlCore::ConnectionStateChanged_revoker ConnectionStateChanged;
+-            Control::ControlCore::ShowWindowChanged_revoker ShowWindowChanged;
+-            Control::ControlCore::CloseTerminalRequested_revoker CloseTerminalRequested;
+-            Control::ControlCore::CompletionsChanged_revoker CompletionsChanged;
+-            Control::ControlCore::RestartTerminalRequested_revoker RestartTerminalRequested;
+-            Control::ControlCore::SearchMissingCommand_revoker SearchMissingCommand;
+-            Control::ControlCore::ShowNotification_revoker ShowNotification;
+-            Control::ControlCore::RefreshQuickFixUI_revoker RefreshQuickFixUI;
+-            Control::ControlCore::WindowSizeChanged_revoker WindowSizeChanged;
++            Control::IControlCore::ScrollPositionChanged_revoker coreScrollPositionChanged;
++            Control::IControlCore::WarningBell_revoker WarningBell;
++            Control::IControlCore::RendererEnteredErrorState_revoker RendererEnteredErrorState;
++            Control::IControlCore::BackgroundColorChanged_revoker BackgroundColorChanged;
++            Control::IControlCore::FontSizeChanged_revoker FontSizeChanged;
++            Control::IControlCore::TransparencyChanged_revoker TransparencyChanged;
++            Control::IControlCore::RaiseNotice_revoker RaiseNotice;
++            Control::IControlCore::HoveredHyperlinkChanged_revoker HoveredHyperlinkChanged;
++            Control::IControlCore::OutputIdle_revoker OutputIdle;
++            Control::IControlCore::UpdateSelectionMarkers_revoker UpdateSelectionMarkers;
++            Control::IControlCore::OpenHyperlink_revoker coreOpenHyperlink;
++            Control::IControlCore::TitleChanged_revoker TitleChanged;
++            Control::IControlCore::WriteToClipboard_revoker WriteToClipboard;
++            Control::IControlCore::TabColorChanged_revoker TabColorChanged;
++            Control::IControlCore::TaskbarProgressChanged_revoker TaskbarProgressChanged;
++            Control::IControlCore::ConnectionStateChanged_revoker ConnectionStateChanged;
++            Control::IControlCore::ShowWindowChanged_revoker ShowWindowChanged;
++            Control::IControlCore::CloseTerminalRequested_revoker CloseTerminalRequested;
++            Control::IControlCore::CompletionsChanged_revoker CompletionsChanged;
++            Control::IControlCore::RestartTerminalRequested_revoker RestartTerminalRequested;
++            Control::IControlCore::SearchMissingCommand_revoker SearchMissingCommand;
++            Control::IControlCore::ShowNotification_revoker ShowNotification;
++            Control::IControlCore::RefreshQuickFixUI_revoker RefreshQuickFixUI;
++            Control::IControlCore::WindowSizeChanged_revoker WindowSizeChanged;
+ 
+             // These are set up in _InitializeTerminal
+-            Control::ControlCore::RendererWarning_revoker RendererWarning;
+-            Control::ControlCore::SwapChainChanged_revoker SwapChainChanged;
++            Control::IControlCore::RendererWarning_revoker RendererWarning;
++            Control::IControlCore::SwapChainChanged_revoker SwapChainChanged;
+             Windows::UI::ViewManagement::AccessibilitySettings::HighContrastChanged_revoker HighContrastChanged;
+ 
+             Control::ControlInteractivity::OpenHyperlink_revoker interactivityOpenHyperlink;
+diff --git a/src/cascadia/TerminalControl/TerminalControlLib.vcxproj b/src/cascadia/TerminalControl/TerminalControlLib.vcxproj
+index 90d053424..d43265b8b 100644
+--- a/src/cascadia/TerminalControl/TerminalControlLib.vcxproj
++++ b/src/cascadia/TerminalControl/TerminalControlLib.vcxproj
+@@ -107,6 +107,7 @@
+   </ItemGroup>
+   <!-- ========================= idl Files ======================== -->
+   <ItemGroup>
++    <Midl Include="IControlCore.idl" />
+     <Midl Include="ControlCore.idl" />
+     <Midl Include="ControlInteractivity.idl" />
+     <Midl Include="ScrollBarVisualStateManager.idl" />
