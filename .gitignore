@@ -65,3 +65,6 @@ harness/pdbaddr/*.ilk
 
 # Crash dumps from debugging sessions are artifacts, not deliverables.
 *.dmp
+
+# Harness run logs
+harness/*/*.err
