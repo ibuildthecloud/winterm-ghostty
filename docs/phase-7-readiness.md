@@ -229,13 +229,33 @@ In order, because each one gates the next:
    fix rather than an optimization — the freeze it works around is still a real
    bug, currently papered over by a throttle.
 
-   The mechanism is now pinned down precisely, which makes this specifiable
-   rather than exploratory: the IOCP async carries a **single atomic bool**
-   (`backend/iocp.zig:1336-1338`) that the loop clears with one swap per tick
-   (`iocp.zig:283-312`). There is no generation counter and no pending-notify
-   count, so a notify arriving after the callback sampled state but before the
-   swap is indistinguishable from the one that caused the wake. Our fork already
-   documents the consequence at `Surface.zig:916-937`.
+   > **Corrected 2026-08-07. The paragraph that stood here was wrong.** It said
+   > the IOCP async loses a notify that arrives after the callback samples
+   > state. Reading the whole path shows it does not:
+   >
+   > - the loop does `swap(false)` before the callback (`iocp.zig:291`), but
+   > - a notify during the callback sets the flag back to true *and* posts a
+   >   packet (`async.zig:601-611`, `iocp.zig:853-865`), and
+   > - on `.rearm`, `start_completion` → `perform` → `.async_wait` pushes the
+   >   completion back onto the list **without clearing the flag**
+   >   (`iocp.zig:740-743`), and
+   > - `wakeupCallback` returns `.rearm` unconditionally (`Thread.zig:588`).
+   >
+   > So the next drain swaps `true` and runs the callback again. The notify
+   > survives. There is no lost wakeup to fix.
+   >
+   > Phase 5's own evidence — "80 notifies, 80 parser calls, <20 renderer
+   > wakes" — is **coalescing working as designed**, not a defect. The symptom
+   > that mattered was rendering stopping *entirely*, and coalescing does not
+   > explain that.
+   >
+   > **So the cause of the Phase 5 freeze has never been established**, and
+   > `ghostty_surface_render_now`, the `til::throttled_func` and this 26% are all
+   > a workaround for something we have not diagnosed. The fork's comment at
+   > `Surface.zig:916-937` states the same unsupported mechanism and needs the
+   > same correction.
+   >
+   > Next step is a reproduction with instrumentation, not a change.
 6. **Occlusion and scroll-as-rotation**, the remaining named items. Occlusion
    has a head start: `ghostty_surface_set_occlusion` already exists and gates
    `renderCallback` (`Thread.zig:648`), so an occluded pane already does no
