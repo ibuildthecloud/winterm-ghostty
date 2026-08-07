@@ -221,7 +221,7 @@ The Kitty image aspect ratio of KD-01. That is a separate cause — see KD-03.
 
 ---
 
-### KD-03 — `c`+`r` image placement stretches instead of fitting
+### KD-03 — `c`+`r` image placement stretches — **resolved 2026-08-07: correct, matches kitty**
 
 **Upstream ghostty behaviour, not our port**, and the actual cause of KD-01's
 distortion. Recorded here because it is user-visible and unresolved, not because
@@ -254,20 +254,44 @@ under ghostty's stretch it becomes 2:1 tall, which is exactly the reported
 symptom (measured ink aspect 0.484 against a ground truth of 0.969 from
 rendering the same SVG square with ImageMagick).
 
-#### Unresolved
+#### Resolved: kitty does the same thing
 
-kitty's specification says the image "will be scaled (enlarged/shrunk) as needed
-to **fit** the specified area", which reads as fit-preserving-aspect and matches
-what chafa assumes — but **this has not been checked against a real kitty**, and
-that check is what would decide whether ghostty diverges from the protocol or
-chafa relies on behaviour the spec does not promise. Until then this is a
-discrepancy with evidence, not a verdict.
+Checked against kitty's source rather than its prose. `update_dest_rect` in
+`kitty/graphics.c` computes an aspect-preserving dimension **only when one is
+zero**:
 
-If ghostty does diverge, the fix is upstream and affects every platform, not
-just Windows.
+```c
+const bool auto_cols = num_cols == 0, auto_rows = num_rows == 0;
+if (auto_cols) { ... }
+if (auto_rows) { ... }
+ref->effective_num_rows = num_rows;
+ref->effective_num_cols = num_cols;
+```
 
-#### Workaround today
+With both `c` and `r` supplied it takes them as given. **kitty stretches, ghostty
+stretches, and our port matches both** — measured at 476x476 for `c=34,r=17`.
+There is nothing to fix here, and the same file would look the same in kitty.
 
-Omit `c`/`r` and send only `s`/`v`; natural-size placement is pixel-exact
-(verified). For chafa specifically, that means generating at display time is not
-enough — the letterboxing is in the canvas either way.
+The spec's word "fit" is what misled the earlier reading; the source is
+unambiguous.
+
+#### So the fix is on the generating side
+
+chafa rasterizes at a fixed 8x8 px per cell and letterboxes, while choosing
+`c`/`r` for the terminal's real 1:2 cells. Those two only agree on a
+square-celled terminal. `--stretch` makes the raster fill its canvas, so the
+terminal's stretch restores the aspect instead of compounding it:
+
+| invocation | drawn ink aspect (ground truth 0.969) |
+|---|---|
+| `chafa -f kitty favicon.svg` | 0.484 — 2x too tall |
+| `chafa -f kitty --stretch favicon.svg` | 2.011 — fills the whole 109x27 view, now 2x too wide |
+| **`chafa -f kitty --stretch --size 20x10 favicon.svg`** | **0.971 — correct** |
+
+`--stretch` alone is not enough: without `--size` it fills the view, and the view
+is itself 2:1. It has to be paired with a cell box of the right shape — with
+14x28 cells a square image needs `c = 2r`.
+
+Whether chafa should be doing this itself is a question for chafa; on the
+evidence here its kitty output is distorted on any terminal whose cells are not
+square, which is nearly all of them.
