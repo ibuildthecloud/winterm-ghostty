@@ -16,63 +16,77 @@ by reading source and had it turn out wrong.
 
 ---
 
-### KD-01 — Kitty graphics images render at the wrong scale
+### KD-01 — Kitty graphics images render distorted — **closed 2026-08-07, not a defect**
 
-**Reported** 2026-08-07 by the user, from use: an image sent with the Kitty
-graphics protocol appears — so transmission, storage, placement and the D3D11
-image pipeline all work — but it is drawn at the wrong size.
+**Reported** by the user, from use: an image sent with the Kitty graphics
+protocol appeared skewed — wrong aspect ratio, not merely the wrong size.
 
-**Not** the same thing as GD-14. Sixel is absent by design; this is a feature
-that works and is drawn incorrectly.
+**Measured, and the engine is right on every count.** Kept as a closed entry
+rather than deleted, because the wrong conclusion was reachable from every
+direction and the measurements are what stopped it.
 
-#### What is known
+#### What was measured
 
-- Something renders, so `prepKittyImage`, the placement list, the structured
-  buffer and `image.hlsl` are all functioning end to end.
-- Text on the same surface is correct, which rules out anything that scales the
-  whole swap chain uniformly — including patch 26's `SetMatrixTransform`, which
-  undoes XAML's scaling of a `SwapChainPanel` for every pipeline at once.
-- This machine composites at **1.5** (`CompositionScale 1.50`, recorded in
-  Phase 2), so a DIP-versus-physical-pixel error would show as a 1.5× or 1/1.5×
-  size error specifically.
+Three probes into a live ghostty pane, each photographed with
+`harness/wgc-shot` and measured in pixels rather than judged by eye:
 
-#### Two hypotheses, and they need different fixes
+1. **Natural size.** A 200x100 raw-RGBA image (`f=32`, explicit `s`/`v`, no
+   `c`/`r`) drew at exactly **200x100**, aspect 2.000, both axes scale 1.000,
+   with its orientation marker in the right corner.
+2. **Cell-sized.** The same image sent as `c=10,r=4` drew at **138x112** —
+   13.8 px per column, 28 px per row, this pane's real cell size — with a
+   five-band source rendering as five equal bands, in order, no offset and no
+   clamping. The full source was sampled and scaled to exactly the requested
+   cell box, which is what the protocol specifies for `c`/`r`.
+3. **The size report, asked from inside the pane** — the path that matters,
+   since a reply travels engine → WT connection → ConPTY rather than the
+   harness's own pty:
 
-1. **We draw it at the wrong size.** Images carry their own pixel geometry
-   (`dest_size` in `image.hlsl`, from `rp.dest_width`/`dest_height` via
-   `renderPlacement(storage, &image, cell_size.width, cell_size.height)`),
-   whereas text is positioned purely by the cell grid. So a cell size passed in
-   the wrong units would mis-size images while leaving text perfect. The
-   DIP-versus-physical class of bug has already bitten this project twice — in
-   `set_size`, and in the SwapChainPanel transform.
+   | query | reply | |
+   |---|---|---|
+   | `CSI 14 t` | window 1526 x 756 px | |
+   | `CSI 16 t` | **cell 14 wide x 28 high** | matches the measurement in (2) |
+   | `CSI 18 t` | 109 cols x 27 rows | 109x14 = 1526, 27x28 = 756 — consistent |
 
-2. **We tell the application the wrong size, and it sends a wrongly-sized
-   image.** Kitty clients commonly ask the terminal for its window and cell
-   pixel dimensions (`CSI 14 t` / `CSI 16 t`; ghostty implements size reports,
-   see `include/ghostty/vt/size_report.h`) and scale the image *before*
-   transmitting. If that report is wrong, the image arrives wrong and the
-   renderer draws exactly what it was given.
+#### The actual cause
 
-Hypothesis 2 would also mean the bug is invisible to any test that constructs
-the escape sequence itself, because such a test never asks.
+The producer's own output file was read. Its first APC control block is:
 
-#### The measurement that separates them
+```
+a=T,f=32,s=1264,v=632,c=158,r=79,m=1
+```
 
-Emit a Kitty graphics sequence carrying an image of a **known pixel size**, with
-the size specified explicitly rather than negotiated, then photograph the pane
-and measure the drawn rectangle:
+A 1264x632 source — exactly 2:1 — asked to be displayed over 158 columns by 79
+rows. Note `1264/158 = 8` and `632/79 = 8`: **the producer computed its cell
+counts assuming 8x8 pixel cells.**
 
-- drawn size ≠ requested size → **hypothesis 1**, and the ratio names the cause
-  (1.5 or 1/1.5 is DPI).
-- drawn size == requested size → **hypothesis 2**; then compare what `CSI 14 t`
-  and `CSI 16 t` report against the pane's real pixel dimensions.
+`c`/`r` in the Kitty protocol mean "scale this image to fill that many cells",
+so with real 14x28 cells the terminal correctly draws it at 158x14 = 2212 by
+79x28 = 2212 — **a perfect square**. Aspect 2.000 in, 1.000 out. That is the
+whole distortion, and kitty itself would render it identically.
 
-Both halves are automatable with `harness/wgc-shot` plus the focus/typing script
-from session 0008 — no human needed, and the measurement is in pixels rather
-than in someone's impression of "too big".
+#### What to do about it
 
-#### Owner
+Nothing here. In the producer, either:
 
-Phase 7 (presentation). It should be measured **before** the phase commits to
-damage-gated presentation, because the image pipeline's geometry is part of what
-a dirty-rect calculation would have to get right.
+- **omit `c`/`r`** and send only `s`/`v`, letting the terminal place the image at
+  its natural pixel size (probe 1 shows this is exact), or
+- **query `CSI 16 t`** and compute `c`/`r` from the reported cell size, which
+  this terminal answers correctly.
+
+#### The trap worth remembering
+
+Two of the three hypotheses this entry originally carried were wrong, and both
+were reachable by reading source: a row-pitch mismatch (dead — upstream converts
+every image to RGBA before upload, `image.zig:851-872`) and a DPI error in our
+geometry (dead — probe 1 is exact). A third, "our renderer mis-samples when
+scaling", survived one bad screenshot: a 13-row image placed near the bottom of
+the screen **scrolled while drawing**, which looks exactly like a vertical
+sampling offset. Shrinking the image until it could not scroll made the same
+test read clean.
+
+A self-describing source image — coloured bands rather than a solid fill — is
+what turned that around. It says directly which source rows landed where, so an
+offset, a squeeze and a clamp are distinguishable by looking instead of inferred
+from a bounding box.
+
