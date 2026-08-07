@@ -82,7 +82,21 @@ void extpty_resize(uint16_t cols, uint16_t rows) {
 void extpty_write(const uint8_t *data, size_t len) {
     if (!g_pty.in_write) return;
     if (trace_writes()) {
-        fprintf(stderr, "[extpty] write %zu bytes to child\n", len);
+        // Built into one buffer and written once. The reader thread traces to
+        // the same stderr, and a line assembled with several fprintf calls
+        // comes out interleaved with its lines - which makes the trace
+        // unparseable exactly when something is going wrong enough to be
+        // worth parsing.
+        char line[256];
+        int n = snprintf(line, sizeof(line), "[extpty] write %zu bytes to child:", len);
+        const size_t shown = len < 32 ? len : 32;
+        for (size_t i = 0; i < shown && n > 0 && (size_t)n < sizeof(line); i++) {
+            n += snprintf(line + n, sizeof(line) - (size_t)n, " %02x", data[i]);
+        }
+        if (n > 0 && (size_t)n < sizeof(line)) {
+            n += snprintf(line + n, sizeof(line) - (size_t)n, "%s\n", shown < len ? " ..." : "");
+        }
+        fputs(line, stderr);
         fflush(stderr);
     }
 

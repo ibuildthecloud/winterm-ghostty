@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Thu, 6 Aug 2026 19:30:01 -0700
+Subject: [PATCH] feat(settings): the engine is selectable in the Settings UI
+
+The `engine` setting has existed since Phase 4 but only in JSON - it had no
+EnumMappings entry and no control, so the one thing that makes this fork
+different was reachable only by hand-editing settings.json.
+
+It now appears in Profiles -> Advanced as "Terminal engine", above path
+translation, with the same SettingContainer treatment every other enum setting
+gets: inheritance, reset-to-default, and the override source.
+
+Five places, because that is what a profile enum costs in this codebase:
+EnumMappings (idl/h/cpp) so the strings come from the same JSON mapper the
+serializer uses, the view model's projected setting and bindable enum, the IDL
+so the XAML compiler can see ClearEngine and friends, the XAML itself, and the
+resource strings.
+
+The help text says what the JSON cannot: changing it affects new tabs and panes,
+because a pane keeps the engine it was opened with.
+
+WT suites unchanged; this is editor UI, which they do not reach.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BgDGqEqRBB8L5Ueoq1uuxy
+---
+ .../ProfileViewModel.cpp                      |  1 +
+ .../TerminalSettingsEditor/ProfileViewModel.h |  2 ++
+ .../ProfileViewModel.idl                      |  3 +++
+ .../Profiles_Advanced.xaml                    | 13 ++++++++++++
+ .../Resources/en-US/Resources.resw            | 20 +++++++++++++++++++
+ .../TerminalSettingsModel/EnumMappings.cpp    |  1 +
+ .../TerminalSettingsModel/EnumMappings.h      |  1 +
+ .../TerminalSettingsModel/EnumMappings.idl    |  1 +
+ 8 files changed, 42 insertions(+)
+
+diff --git a/src/cascadia/TerminalSettingsEditor/ProfileViewModel.cpp b/src/cascadia/TerminalSettingsEditor/ProfileViewModel.cpp
+index d7e1df4a8..70e9c9a43 100644
+--- a/src/cascadia/TerminalSettingsEditor/ProfileViewModel.cpp
++++ b/src/cascadia/TerminalSettingsEditor/ProfileViewModel.cpp
+@@ -40,6 +40,7 @@ namespace winrt::Microsoft::Terminal::Settings::Editor::implementation
+         INITIALIZE_BINDABLE_ENUM_SETTING_REVERSE_ORDER(CloseOnExitMode, CloseOnExitMode, winrt::Microsoft::Terminal::Settings::Model::CloseOnExitMode, L"Profile_CloseOnExit", L"Content");
+         INITIALIZE_BINDABLE_ENUM_SETTING(ScrollState, ScrollbarState, winrt::Microsoft::Terminal::Control::ScrollbarState, L"Profile_ScrollbarVisibility", L"Content");
+         INITIALIZE_BINDABLE_ENUM_SETTING(PathTranslationStyle, PathTranslationStyle, winrt::Microsoft::Terminal::Control::PathTranslationStyle, L"Profile_PathTranslationStyle", L"Content");
++        INITIALIZE_BINDABLE_ENUM_SETTING(Engine, TerminalEngine, winrt::Microsoft::Terminal::Control::TerminalEngine, L"Profile_Engine", L"Content");
+ 
+         _InitializeCurrentBellSounds();
+ 
+diff --git a/src/cascadia/TerminalSettingsEditor/ProfileViewModel.h b/src/cascadia/TerminalSettingsEditor/ProfileViewModel.h
+index 16d4d720f..ef736951f 100644
+--- a/src/cascadia/TerminalSettingsEditor/ProfileViewModel.h
++++ b/src/cascadia/TerminalSettingsEditor/ProfileViewModel.h
+@@ -147,6 +147,7 @@ namespace winrt::Microsoft::Terminal::Settings::Editor::implementation
+         OBSERVABLE_PROJECTED_SETTING(_profile, AnswerbackMessage);
+         OBSERVABLE_PROJECTED_SETTING(_profile, RainbowSuggestions);
+         OBSERVABLE_PROJECTED_SETTING(_profile, PathTranslationStyle);
++        OBSERVABLE_PROJECTED_SETTING(_profile, Engine);
+         OBSERVABLE_PROJECTED_SETTING(_profile, DragDropDelimiter);
+ 
+         WINRT_PROPERTY(bool, IsBaseLayer, false);
+@@ -155,6 +156,7 @@ namespace winrt::Microsoft::Terminal::Settings::Editor::implementation
+         GETSET_BINDABLE_ENUM_SETTING(CloseOnExitMode, Microsoft::Terminal::Settings::Model::CloseOnExitMode, CloseOnExit);
+         GETSET_BINDABLE_ENUM_SETTING(ScrollState, Microsoft::Terminal::Control::ScrollbarState, ScrollState);
+         GETSET_BINDABLE_ENUM_SETTING(PathTranslationStyle, Microsoft::Terminal::Control::PathTranslationStyle, PathTranslationStyle);
++        GETSET_BINDABLE_ENUM_SETTING(Engine, Microsoft::Terminal::Control::TerminalEngine, Engine);
+ 
+     private:
+         Model::Profile _profile;
+diff --git a/src/cascadia/TerminalSettingsEditor/ProfileViewModel.idl b/src/cascadia/TerminalSettingsEditor/ProfileViewModel.idl
+index 2d3c5c5d7..8a35b2693 100644
+--- a/src/cascadia/TerminalSettingsEditor/ProfileViewModel.idl
++++ b/src/cascadia/TerminalSettingsEditor/ProfileViewModel.idl
+@@ -72,6 +72,8 @@ namespace Microsoft.Terminal.Settings.Editor
+ 
+         IInspectable CurrentPathTranslationStyle;
+         Windows.Foundation.Collections.IObservableVector<Microsoft.Terminal.Settings.Editor.EnumEntry> PathTranslationStyleList { get; };
++        IInspectable CurrentEngine;
++        Windows.Foundation.Collections.IObservableVector<Microsoft.Terminal.Settings.Editor.EnumEntry> EngineList { get; };
+ 
+         String CurrentStartingDirectoryPreview { get; };
+         Boolean UseParentProcessDirectory;
+@@ -140,6 +142,7 @@ namespace Microsoft.Terminal.Settings.Editor
+         OBSERVABLE_PROJECTED_PROFILE_SETTING(String, AnswerbackMessage);
+         OBSERVABLE_PROJECTED_PROFILE_SETTING(Boolean, RainbowSuggestions);
+         OBSERVABLE_PROJECTED_PROFILE_SETTING(Microsoft.Terminal.Control.PathTranslationStyle, PathTranslationStyle);
++        OBSERVABLE_PROJECTED_PROFILE_SETTING(Microsoft.Terminal.Control.TerminalEngine, Engine);
+         OBSERVABLE_PROJECTED_PROFILE_SETTING(String, DragDropDelimiter);
+         OBSERVABLE_PROJECTED_PROFILE_SETTING(Boolean, AllowVtClipboardWrite);
+         OBSERVABLE_PROJECTED_PROFILE_SETTING(Boolean, AllowOscNotifications);
+diff --git a/src/cascadia/TerminalSettingsEditor/Profiles_Advanced.xaml b/src/cascadia/TerminalSettingsEditor/Profiles_Advanced.xaml
+index b00c1753b..b41abc6da 100644
+--- a/src/cascadia/TerminalSettingsEditor/Profiles_Advanced.xaml
++++ b/src/cascadia/TerminalSettingsEditor/Profiles_Advanced.xaml
+@@ -261,6 +261,19 @@
+                               Style="{StaticResource ToggleSwitchInExpanderStyle}" />
+             </local:SettingContainer>
+ 
++            <!--  Terminal engine (ADR 0007)  -->
++            <local:SettingContainer x:Name="Engine"
++                                    x:Uid="Profile_Engine"
++                                    ClearSettingValue="{x:Bind Profile.ClearEngine}"
++                                    HasSettingValue="{x:Bind Profile.HasEngine, Mode=OneWay}"
++                                    SettingOverrideSource="{x:Bind Profile.EngineOverrideSource, Mode=OneWay}">
++                <ComboBox AutomationProperties.AccessibilityView="Content"
++                          ItemTemplate="{StaticResource EnumComboBoxTemplate}"
++                          ItemsSource="{x:Bind Profile.EngineList, Mode=OneWay}"
++                          SelectedItem="{x:Bind Profile.CurrentEngine, Mode=TwoWay}"
++                          Style="{StaticResource ComboBoxSettingStyle}" />
++            </local:SettingContainer>
++
+             <!--  Path Translation  -->
+             <local:SettingContainer x:Name="PathTranslationStyle"
+                                     x:Uid="Profile_PathTranslationStyle"
+diff --git a/src/cascadia/TerminalSettingsEditor/Resources/en-US/Resources.resw b/src/cascadia/TerminalSettingsEditor/Resources/en-US/Resources.resw
+index e2630ff29..8d4c6666e 100644
+--- a/src/cascadia/TerminalSettingsEditor/Resources/en-US/Resources.resw
++++ b/src/cascadia/TerminalSettingsEditor/Resources/en-US/Resources.resw
+@@ -2633,6 +2633,26 @@
+     <value>When enabled, the tab bar will be visible when the app is full screen.</value>
+     <comment>A description for what the "show tabs in full screen" setting does.</comment>
+   </data>
++  <data name="Profile_Engine.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve">
++    <value>Terminal engine</value>
++    <comment>Name for a control to select which engine draws and runs the terminal.</comment>
++  </data>
++  <data name="Profile_Engine.Header" xml:space="preserve">
++    <value>Terminal engine</value>
++    <comment>Name for a control to select which engine draws and runs the terminal.</comment>
++  </data>
++  <data name="Profile_Engine.HelpText" xml:space="preserve">
++    <value>Which engine draws and runs this profile's terminal. Changing this affects new tabs and panes; existing ones keep the engine they were opened with.</value>
++    <comment>A description for what the "terminal engine" setting does. Presented near "Profile_Engine.Header".</comment>
++  </data>
++  <data name="Profile_EngineCascadia.Content" xml:space="preserve">
++    <value>Cascadia (default)</value>
++    <comment>{Locked="Cascadia"} An option to choose from for the "terminal engine" setting. Cascadia is the name of Windows Terminal's built-in engine.</comment>
++  </data>
++  <data name="Profile_EngineGhostty.Content" xml:space="preserve">
++    <value>Ghostty</value>
++    <comment>{Locked="Ghostty"} An option to choose from for the "terminal engine" setting. Ghostty is the name of a third-party terminal engine.</comment>
++  </data>
+   <data name="Profile_PathTranslationStyle.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve">
+     <value>Path translation</value>
+     <comment>Name for a control to select how file and directory paths are translated.</comment>
+diff --git a/src/cascadia/TerminalSettingsModel/EnumMappings.cpp b/src/cascadia/TerminalSettingsModel/EnumMappings.cpp
+index b92994c2d..fb092b6ff 100644
+--- a/src/cascadia/TerminalSettingsModel/EnumMappings.cpp
++++ b/src/cascadia/TerminalSettingsModel/EnumMappings.cpp
+@@ -54,6 +54,7 @@ namespace winrt::Microsoft::Terminal::Settings::Model::implementation
+     DEFINE_ENUM_MAP(Microsoft::Terminal::Settings::Model::IntenseStyle, IntenseTextStyle);
+     DEFINE_ENUM_MAP(Microsoft::Terminal::Core::AdjustTextMode, AdjustIndistinguishableColors);
+     DEFINE_ENUM_MAP(Microsoft::Terminal::Control::PathTranslationStyle, PathTranslationStyle);
++    DEFINE_ENUM_MAP(Microsoft::Terminal::Control::TerminalEngine, TerminalEngine);
+ 
+     // Actions
+     DEFINE_ENUM_MAP(Microsoft::Terminal::Settings::Model::ResizeDirection, ResizeDirection);
+diff --git a/src/cascadia/TerminalSettingsModel/EnumMappings.h b/src/cascadia/TerminalSettingsModel/EnumMappings.h
+index e85867045..bf0d47563 100644
+--- a/src/cascadia/TerminalSettingsModel/EnumMappings.h
++++ b/src/cascadia/TerminalSettingsModel/EnumMappings.h
+@@ -47,6 +47,7 @@ namespace winrt::Microsoft::Terminal::Settings::Model::implementation
+         static winrt::Windows::Foundation::Collections::IMap<winrt::hstring, Microsoft::Terminal::Control::ScrollbarState> ScrollbarState();
+         static winrt::Windows::Foundation::Collections::IMap<winrt::hstring, winrt::Windows::UI::Xaml::Media::Stretch> BackgroundImageStretchMode();
+         static winrt::Windows::Foundation::Collections::IMap<winrt::hstring, winrt::Microsoft::Terminal::Control::TextAntialiasingMode> TextAntialiasingMode();
++        static winrt::Windows::Foundation::Collections::IMap<winrt::hstring, winrt::Microsoft::Terminal::Control::TerminalEngine> TerminalEngine();
+         static winrt::Windows::Foundation::Collections::IMap<winrt::hstring, winrt::Microsoft::Terminal::Core::CursorStyle> CursorStyle();
+         static winrt::Windows::Foundation::Collections::IMap<winrt::hstring, uint16_t> FontWeight();
+         static winrt::Windows::Foundation::Collections::IMap<winrt::hstring, winrt::Microsoft::Terminal::Settings::Model::IntenseStyle> IntenseTextStyle();
+diff --git a/src/cascadia/TerminalSettingsModel/EnumMappings.idl b/src/cascadia/TerminalSettingsModel/EnumMappings.idl
+index 7f52aace4..dba982419 100644
+--- a/src/cascadia/TerminalSettingsModel/EnumMappings.idl
++++ b/src/cascadia/TerminalSettingsModel/EnumMappings.idl
+@@ -34,6 +34,7 @@ namespace Microsoft.Terminal.Settings.Model
+         static Windows.Foundation.Collections.IMap<String, UInt16> FontWeight { get; };
+         static Windows.Foundation.Collections.IMap<String, Microsoft.Terminal.Settings.Model.IntenseStyle> IntenseTextStyle { get; };
+         static Windows.Foundation.Collections.IMap<String, Microsoft.Terminal.Control.PathTranslationStyle> PathTranslationStyle { get; };
++        static Windows.Foundation.Collections.IMap<String, Microsoft.Terminal.Control.TerminalEngine> TerminalEngine { get; };
+ 
+         // Actions
+         static Windows.Foundation.Collections.IMap<String, Microsoft.Terminal.Settings.Model.ResizeDirection> ResizeDirection { get; };

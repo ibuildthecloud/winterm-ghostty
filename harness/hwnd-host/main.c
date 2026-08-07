@@ -854,6 +854,41 @@ int main(void) {
         }
     }
 
+    // GHOSTTY_HARNESS_KEY=<chars> sends each character as the key event a real
+    // keystroke would produce for it - scan code, mods, text and unshifted
+    // codepoint - and prints both what was handed to libghostty and (with
+    // GHOSTTY_HARNESS_TRACE_PTY=1) the bytes that came out the other side.
+    //
+    // This is the only way to see the encoding of a single key without a human
+    // at a keyboard. WM_CHAR round-trips prove nothing here: the question is
+    // always what ghostty_surface_key does with a *key* event, and the answer
+    // depends on mods, consumed_mods and unshifted_codepoint together.
+    {
+        WCHAR keys[64];
+        const DWORD n = GetEnvironmentVariableW(L"GHOSTTY_HARNESS_KEY", keys, 64);
+        if (n > 0 && n < 64) {
+            for (DWORD i = 0; i < n; i++) {
+                ghostty_input_key_s ev;
+                char text[8];
+                if (!winkeys_synthesize(keys[i], &ev, text)) {
+                    fprintf(stderr, "[hwnd-host] key U+%04X unreachable on this layout\n",
+                            (unsigned)keys[i]);
+                    continue;
+                }
+                fprintf(stderr,
+                        "[hwnd-host] key U+%04X scan=0x%02x mods=0x%x consumed=0x%x "
+                        "text=\"%s\" unshifted=U+%04X\n",
+                        (unsigned)keys[i], ev.keycode, (unsigned)ev.mods,
+                        (unsigned)ev.consumed_mods, ev.text ? ev.text : "",
+                        (unsigned)ev.unshifted_codepoint);
+                fflush(stderr);
+                fprintf(stderr, "[hwnd-host] key handled=%d\n",
+                        ghostty_surface_key(g_state.surface, ev) ? 1 : 0);
+                fflush(stderr);
+            }
+        }
+    }
+
     // Unattended runs need to end by themselves. A timer rather than a sleep
     // so the message loop keeps running: the bugs worth catching here happen
     // on the render and IO paths, which need the loop pumping to reach.

@@ -489,6 +489,45 @@ else {
     Add-Pass 'input reached the child through the external backend'
 }
 
+# --- 2b. A shifted key encodes as the character it types --------------------
+#
+# The `?` bug: `?` typed into a ghostty pane came out as `/`. The cause was on
+# Windows Terminal's side - it translated the key under the wrong keyboard
+# state - but the question "given the right event, does libghostty emit the
+# right byte?" is the one this side owns, and it had to be answered before the
+# other half could be blamed. So the harness synthesizes the key event a real
+# keystroke for a character would produce, and the pty trace says what came
+# out.
+#
+# `?` and `/` are the same key, telling Shift apart is the whole test, and the
+# expected bytes are one character each - which makes the assertion exact
+# rather than a substring hunt.
+Write-Host 'check: shifted keys encode as the character they type' -ForegroundColor Cyan
+$r = Invoke-Harness -Name 'key' -TimeoutMs $PtyTimeoutMs -Env @{
+    GHOSTTY_HARNESS_EXTERNAL  = '1'
+    GHOSTTY_HARNESS_KEY       = '?/aA'
+    GHOSTTY_HARNESS_TRACE_PTY = '1'
+    GHOSTTY_HARNESS_EXIT_MS   = '3000'
+}
+if ($r.TimedOut) {
+    Add-Failure 'harness hung sending key events'
+}
+elseif ($r.ExitCode -ne 0) {
+    Add-Failure ("harness exited 0x{0:X8} sending key events" -f $r.ExitCode)
+}
+else {
+    # Only the single-byte writes, in order: the child's own output causes
+    # writes too (a DA response at startup, for one).
+    $typed = -join ([regex]::Matches($r.Stderr, '\[extpty\] write 1 bytes to child: ([0-9a-f]{2})') |
+            ForEach-Object { [char][convert]::ToInt32($_.Groups[1].Value, 16) })
+    if ($typed -ne '?/aA') {
+        Add-Failure "keys encoded as '$typed', expected '?/aA'"
+    }
+    else {
+        Add-Pass 'shift is honoured: ? / a A each reached the child as themselves'
+    }
+}
+
 # --- 3. Output actually repaints the window ---------------------------------
 #
 # Everything above proves bytes moved. This proves they reached the screen:

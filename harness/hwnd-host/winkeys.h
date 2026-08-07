@@ -17,6 +17,14 @@
 bool winkeys_translate(UINT msg, WPARAM wparam, LPARAM lparam,
                        ghostty_input_key_s *out, char text_buf[8]);
 
+// Build the key event a keystroke that types `ch` on the current layout would
+// produce, without needing the key to actually be pressed. Everything except
+// where the keyboard state came from is shared with winkeys_translate, so this
+// is a faithful probe of the translation and not a second implementation.
+//
+// Returns false if the character is unreachable on the current layout.
+bool winkeys_synthesize(WCHAR ch, ghostty_input_key_s *out, char text_buf[8]);
+
 // The native keycode ghostty expects on Windows, built from a message's lParam.
 // Exposed for testing.
 uint32_t winkeys_keycode(LPARAM lparam);

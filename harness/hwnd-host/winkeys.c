@@ -83,6 +83,62 @@ static int keyText(UINT vk, UINT scancode, const BYTE *kbd, char *out, int out_l
     return bytes;
 }
 
+// Fill in `text` and `unshifted_codepoint` from a keyboard state. Shared by the
+// live path and the synthesized one so a probe cannot drift from what a real
+// keystroke produces.
+static void fillText(UINT vk, UINT scancode, const BYTE *kbd,
+                     ghostty_input_key_s *out, char text_buf[8]) {
+    keyText(vk, scancode, kbd, text_buf, 8);
+    out->text = text_buf[0] ? text_buf : NULL;
+
+    // The unshifted codepoint is what key bindings match against, so it
+    // has to ignore Shift and the lock keys - otherwise ctrl+shift+c
+    // would fail to match a binding written against `c`.
+    BYTE plain[256];
+    memcpy(plain, kbd, 256);
+    plain[VK_SHIFT] = plain[VK_LSHIFT] = plain[VK_RSHIFT] = 0;
+    plain[VK_CONTROL] = plain[VK_LCONTROL] = plain[VK_RCONTROL] = 0;
+    plain[VK_MENU] = plain[VK_LMENU] = plain[VK_RMENU] = 0;
+    plain[VK_CAPITAL] = 0;
+    char unshifted[8] = {0};
+    if (keyText(vk, scancode, plain, unshifted, 8) > 0 &&
+        (unsigned char)unshifted[0] < 0x80) {
+        out->unshifted_codepoint = (uint32_t)(unsigned char)unshifted[0];
+    }
+}
+
+bool winkeys_synthesize(WCHAR ch, ghostty_input_key_s *out, char text_buf[8]) {
+    memset(out, 0, sizeof(*out));
+    text_buf[0] = '\0';
+
+    // VkKeyScanW answers "which key, with which modifiers, types this
+    // character on the current layout" - the inverse of what a keystroke does,
+    // which is what lets a probe name a character rather than a scan code.
+    const SHORT vks = VkKeyScanW(ch);
+    if (vks == -1) return false;
+    const UINT vk = (UINT)(vks & 0xFF);
+    const int shift_state = (vks >> 8) & 0xFF;
+    const UINT scancode = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+    if (scancode == 0) return false;
+
+    BYTE kbd[256] = {0};
+    if (shift_state & 1) kbd[VK_SHIFT] = kbd[VK_LSHIFT] = 0x80;
+    if (shift_state & 2) kbd[VK_CONTROL] = kbd[VK_LCONTROL] = 0x80;
+    if (shift_state & 4) kbd[VK_MENU] = kbd[VK_LMENU] = 0x80;
+
+    out->action = GHOSTTY_ACTION_PRESS;
+    out->keycode = scancode;
+    out->composing = false;
+    int mods = GHOSTTY_MODS_NONE;
+    if (shift_state & 1) mods |= GHOSTTY_MODS_SHIFT;
+    if (shift_state & 2) mods |= GHOSTTY_MODS_CTRL;
+    if (shift_state & 4) mods |= GHOSTTY_MODS_ALT;
+    out->mods = (ghostty_input_mods_e)mods;
+
+    fillText(vk, scancode, kbd, out, text_buf);
+    return true;
+}
+
 bool winkeys_translate(UINT msg, WPARAM wparam, LPARAM lparam,
                        ghostty_input_key_s *out, char text_buf[8]) {
     const bool down = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN);
@@ -103,23 +159,7 @@ bool winkeys_translate(UINT msg, WPARAM wparam, LPARAM lparam,
     if (down) {
         BYTE kbd[256];
         if (GetKeyboardState(kbd)) {
-            keyText(vk, scancode, kbd, text_buf, 8);
-            out->text = text_buf[0] ? text_buf : NULL;
-
-            // The unshifted codepoint is what key bindings match against, so it
-            // has to ignore Shift and the lock keys - otherwise ctrl+shift+c
-            // would fail to match a binding written against `c`.
-            BYTE plain[256];
-            memcpy(plain, kbd, sizeof(plain));
-            plain[VK_SHIFT] = plain[VK_LSHIFT] = plain[VK_RSHIFT] = 0;
-            plain[VK_CONTROL] = plain[VK_LCONTROL] = plain[VK_RCONTROL] = 0;
-            plain[VK_MENU] = plain[VK_LMENU] = plain[VK_RMENU] = 0;
-            plain[VK_CAPITAL] = 0;
-            char unshifted[8] = {0};
-            if (keyText(vk, scancode, plain, unshifted, 8) > 0 &&
-                (unsigned char)unshifted[0] < 0x80) {
-                out->unshifted_codepoint = (uint32_t)(unsigned char)unshifted[0];
-            }
+            fillText(vk, scancode, kbd, out, text_buf);
         }
     }
 
