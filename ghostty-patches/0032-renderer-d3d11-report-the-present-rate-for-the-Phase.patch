@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Fri, 7 Aug 2026 12:37:40 -0700
+Subject: [PATCH] renderer/d3d11: report the present rate for the Phase 7 idle
+ criterion
+
+Phase 7's idle criterion is about what a pane costs when nothing is
+happening, and that is precisely the thing you cannot see: a surface
+presenting the same pixels 100 times a second looks exactly like one
+presenting nothing. So it has to be counted.
+
+GHOSTTY_D3D11_PRESENT_RATE=1 logs presents per second. Off by default -
+it is one line per second per surface, and it exists for measurement
+rather than for operation.
+
+Reported from present() itself, so a genuinely idle surface goes silent
+rather than logging a zero. That is the answer the criterion wants, but
+it reads as absent instrumentation, so the doc comment says to read it
+with the running total on the last line.
+
+Uses GetTickCount64 rather than std.time: Zig 0.16's std.time has no wall
+clock, and this backend is Windows-only anyway.
+
+First measurement, hwnd-host idle, ReleaseFast, hardware driver:
+
+    presents: 2 in 1219ms (1.6/sec), total 26
+
+Steady 1.6/sec with nothing on screen changing - which is exactly the
+600ms cursor blink (1000/600 = 1.67). Each blink costs a full rebuild and
+a full-surface present, because cursorTimerCallback notifies the general
+wakeup and rebuildCells sets cells_rebuilt unconditionally.
+
+zig build test passes.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/renderer/D3D11.zig | 55 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 55 insertions(+)
+
+diff --git a/src/renderer/D3D11.zig b/src/renderer/D3D11.zig
+index ccfac38db..961624be1 100644
+--- a/src/renderer/D3D11.zig
++++ b/src/renderer/D3D11.zig
+@@ -165,6 +165,60 @@ fn eqlIgnoreCaseUtf16(value: []const u16, comptime expect: []const u8) bool {
+ var simulate_loss_after: u32 = 0;
+ var frames_presented: u32 = 0;
+ 
++/// Presents-per-second reporting, for the Phase 7 idle criterion.
++///
++/// The criterion is about what an *idle* pane costs, and that is not something
++/// you can see: a pane presenting the same pixels 100 times a second looks
++/// exactly like one presenting nothing. So it has to be counted.
++///
++/// Off unless `GHOSTTY_D3D11_PRESENT_RATE=1`, because it is one log line per
++/// second per surface and it exists for measurement rather than for operation.
++///
++/// Reported from `present` itself, so a truly idle surface goes **silent**
++/// rather than logging a zero - which is the answer the criterion wants, but
++/// read it together with the `total` on the last line rather than as an absence
++/// of instrumentation.
++var present_rate_enabled: ?bool = null;
++var present_rate_last_ms: u64 = 0;
++var present_rate_last_count: u32 = 0;
++
++/// Zig 0.16's std.time has no wall clock, and this backend is Windows-only, so
++/// take the platform's. Monotonic since boot, millisecond resolution - ample
++/// for a once-a-second rate.
++extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
++
++fn reportPresentRate() void {
++    const enabled = present_rate_enabled orelse enabled: {
++        const value = global.environ().getWindows(
++            utf16("GHOSTTY_D3D11_PRESENT_RATE"),
++        );
++        const on = value != null and value.?.len > 0 and value.?[0] == '1';
++        present_rate_enabled = on;
++        break :enabled on;
++    };
++    if (!enabled) return;
++
++    const now = GetTickCount64();
++    if (present_rate_last_ms == 0) {
++        present_rate_last_ms = now;
++        present_rate_last_count = frames_presented;
++        return;
++    }
++
++    const elapsed = now -| present_rate_last_ms;
++    if (elapsed < 1000) return;
++
++    const delta = frames_presented -| present_rate_last_count;
++    present_rate_last_ms = now;
++    present_rate_last_count = frames_presented;
++    log.info("presents: {d} in {d}ms ({d:.1}/sec), total {d}", .{
++        delta,
++        elapsed,
++        @as(f64, @floatFromInt(delta)) * 1000.0 / @as(f64, @floatFromInt(elapsed)),
++        frames_presented,
++    });
++}
++
+ /// Read the driver override once at startup. Called by `surfaceInit`.
+ fn readDriverOverride() void {
+     const value = global.environ().getWindows(
+@@ -288,6 +342,7 @@ pub fn present(self: *D3D11, target: Target) !void {
+     }
+ 
+     frames_presented +|= 1;
++    reportPresentRate();
+     const simulated = simulate_loss_after > 0 and
+         frames_presented == simulate_loss_after;
+     if (simulated) log.warn("simulating device loss (frame {d})", .{frames_presented});
