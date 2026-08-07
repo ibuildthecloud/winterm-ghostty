@@ -70,27 +70,30 @@ honest answer. Searching, counting and next/previous navigation all work.
 
 ## Found while implementing Phase 6
 
-### GD-05 — IME does not work at all
+### GD-05 — IME — **closed 2026-08-06**
 
-A ghostty pane is never registered with TSF, so there is no composition window,
-no candidate window and no preedit. Typing through a CJK IME does nothing useful.
+Was: a ghostty pane never registered with TSF, so no preedit, no candidate
+window, no IME at all.
 
-The cause is structural rather than missing plumbing: WT's TSF `Implementation`
-reaches through `IDataProvider::GetRenderer()` and writes the preedit into WT's
-own `renderData->tsfPreview`, dereferencing that renderer without a null check
-(`src/tsf/Implementation.cpp:197`). A provider with no WT renderer to hand out
-cannot merely return null — the control must not register at all.
+Closed by making TSF stop reaching for a renderer. `IDataProvider::GetRenderer()`
+became `SetComposition`/`ClearComposition`, so where the preedit goes is the
+provider's business: cascadia writes it into its renderer exactly as before, a
+ghostty pane hands it to `ghostty_surface_preedit`. `GetCursorPosition` and
+`HandleOutput` now ask `IControlCore` rather than cascadia's core, which is what
+puts the candidate window at the cursor and stops committed text being swallowed.
 
-Closing it is a known shape and not small: replace `GetRenderer()` on
-`IDataProvider` with composition callbacks so TSF stops reaching for a renderer
-(which would also remove ADR 0001's seventh and last `get_self` escape), route
-the preedit to `ghostty_surface_preedit`, and answer `GetCursorPosition` from
-`ghostty_surface_ime_point`, which already returns the cursor rect in DIPs with
-the preedit width and padding accounted for.
+Verified by hand with the Japanese MS-IME: preedit at the cursor, candidate
+window in the same place cascadia puts it, committed text reaching the shell -
+and cascadia's own IME still working throughout, which is the regression check on
+the shared refactor. It also removed ADR 0001's seventh and last `get_self`
+escape.
 
-**It also cannot be verified here.** The exit criterion asks for a CJK language
-end-to-end including candidate-window placement, which needs an installed IME and
-a human at the keyboard. *Read.*
+Left here rather than deleted because the entry is what the criterion was
+tracked against, and because two things it cost are worth keeping: there were
+**three** implementors of `IDataProvider`, not one (conhost's is not built by the
+`terminal` project - only the package build catches it), and the first working
+build crashed on the first keystroke because `ghostty_surface_preedit` needs the
+16 MB `RunWithEngineStack` thread, not WT's 1 MB UI thread.
 
 ### GD-13 — Double-clicking past the end of a line selects nothing
 
