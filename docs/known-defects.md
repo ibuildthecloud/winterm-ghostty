@@ -16,16 +16,36 @@ by reading source and had it turn out wrong.
 
 ---
 
-### KD-01 — Kitty graphics images render distorted — **partially explained; see KD-02**
+### KD-01 — Kitty graphics images render distorted — **closed 2026-08-07, resolved**
 
 **Reported** by the user, from use: an image sent with the Kitty graphics
 protocol appeared skewed — wrong aspect ratio, not merely the wrong size.
 
-**The image *drawing* is right on every count — but the terminal lies to the
-child about its size, and that is [KD-02](#kd-02).** A client that sizes its
-output from the terminal is therefore given bad input, which is enough on its
-own to produce the reported distortion. This entry was briefly closed as "not a
-defect"; that verdict was wrong and is corrected here.
+**Resolved by one fix of ours and one upgrade of the client.** `chafa
+--format=kitty favicon.svg` now renders at **ink aspect 0.969** — exactly the
+ground truth from rendering the same SVG square with ImageMagick — full size and
+undistorted.
+
+Two independent causes, and it took both:
+
+1. **Ours: [KD-02](#kd-02)** — the child was told the terminal was 56x18 when it
+   was 109x27, so the image was sized against a view a third of the pane.
+2. **The client: chafa 1.14.0 cannot ask.** The pty carries no pixel dimensions
+   (`ws_xpixel=0`, a ConPTY property no Windows terminal can change), and 1.14.0
+   has no `--probe`. Its fallback picks `c`/`r` for 1:2 cells while rasterizing
+   at 8x8 square px per cell and letterboxing — two assumptions that cannot both
+   be right. chafa **1.16 added terminal probing**; on 1.18.2 the plain
+   invocation is correct.
+
+That the probe works is also a useful check on us: chafa's queries travel
+pane → ConPTY → WSL and the replies come back, and it derives the right cell
+geometry from them. Our `CSI 14 t` / `CSI 16 t` / `CSI 18 t` answers are correct
+end to end, not just when a Windows-side process asks.
+
+**This entry was briefly closed as "not a defect". That verdict was wrong** — it
+rested on a logo *looking* fine rather than on a measurement, which is the exact
+sloppiness the rest of this investigation avoided. It took the user pushing back
+twice to reopen it.
 
 #### What was measured
 
