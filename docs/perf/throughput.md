@@ -32,6 +32,12 @@ Run with `scripts/bench-throughput.ps1`.
 carrying, and it is consistent with the "input is a little laggy" observation
 from the interactive sessions.
 
+> **Superseded 2026-08-06.** This measures `hwnd-host`, not a Windows Terminal pane, and
+> the pane is what a user has. See the 2026-08-06 section below: libghostty in a pane
+> reaches parity with cascadia once a forced per-chunk render is removed, so this 2.9x is
+> a property of the harness rather than of the engine. Left in place because the method
+> and the detached/connected finding still stand.
+
 Faster than conhost by a wide margin, but conhost is not the bar — Windows
 Terminal is what this work would have to replace.
 
@@ -51,6 +57,65 @@ So the detached figures flattered us, and the gap is 2.9x rather than 2.4x.
 Worth recording because the intuition would have been the opposite — that a
 terminal doing real presentation work would look *worse* once it had to
 present.
+
+## Results — 2026-08-06: the harness was measuring the wrong thing
+
+The numbers above are the **harness**, and the harness is not a Windows Terminal pane.
+Re-measured with everything in Release/`ReleaseFast`, on a connected session, with nothing
+else compositing:
+
+| What | Throughput |
+|---|---|
+| stock Windows Terminal (cascadia) | **38.1 MB/s** |
+| libghostty in `hwnd-host` | 15.2 MB/s |
+| libghostty in a WT pane, as shipped that morning | **4.2 MB/s** |
+| libghostty in a WT pane, forced render removed entirely | **37.4 MB/s** |
+
+**The engine was never the problem.** With the forced render taken out, a ghostty pane
+drains at 37.4 against cascadia's 38.1 — parity. The 2.9x above measured `hwnd-host`'s own
+render pumping, and planning against it would have sent Phase 7 hunting in the renderer.
+
+### Where it went
+
+`GhosttyControlCore::_connectionOutputHandler` forced a synchronous `render_now` on *every*
+chunk of pty output, on the connection's output thread — the thread whose blocking is the
+backpressure to the child. Every chunk paid for a full rebuild-and-present before the next
+could be read. That call is not gratuitous: it is the Phase 5 fix for the pane freezing
+mid-output, because libghostty's wakeup coalesces and can drop the final batch.
+
+Throttling it (`til::throttled_func`, 8 ms) recovers most of the loss, and *how* it is
+throttled matters more than the interval:
+
+| | Throughput |
+|---|---|
+| render per chunk | 4.2 MB/s |
+| throttled, `leading + trailing` | 12.6 MB/s |
+| throttled, **`trailing` only** | **28.0 MB/s** median, 34.0 best |
+
+A leading invocation runs **inline on the calling thread**, so it goes on blocking the
+backpressure path once per interval and recovers only a third of the gap. Trailing alone
+puts every render on the timer thread. The trailing edge is also exactly the final render
+the freeze fix needs, so the guarantee is kept rather than traded away.
+
+### What is left
+
+~25%, and it is the cost of forcing renders at all. The proper fix is upstream: a wakeup
+that re-arms when a notify arrives mid-wake would make the forced render unnecessary and
+should reach ~37 MB/s. That is Phase 7 design work.
+
+### Method notes learned the hard way
+
+- **Other GPU load moves the number by 20%.** A single Windows Terminal window open
+  elsewhere took the harness from 15.2 to 12.3 MB/s. The script guards against a detached
+  session but not against this; close everything before measuring.
+- **Check which engine a profile actually resolves to.** `profiles.defaults.engine` is
+  inherited, so a profile with no explicit `engine` may not be the one you think. A
+  "cascadia vs ghostty" comparison that returned identical numbers turned out to be
+  ghostty measured twice.
+- **Cold windows are fine.** Launching a fresh window per run costs nothing measurable —
+  cascadia returned 210, 214, 210 ms. Startup is not in these numbers.
+- **First runs lie.** One trailing-only run came back 3235 ms against a 235-390 ms spread
+  over six. Take a median over several, and re-run before believing an outlier.
 
 ## Caveats
 

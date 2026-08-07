@@ -178,7 +178,7 @@ it, and `docs/manual-validation.md` carries what still needs a human.
 |---|---|
 | 0–5 | toolchain, D3D11 backend, fonts, the `IControlCore` seam, a working pane |
 | **6** | **interaction parity — complete**: selection, clipboard (plain + HTML), search, prompt marks, IME |
-| 7 | presentation & performance — **not started**. Throughput measured 2.9× slower than cascadia at Phase 3, **Debug on both sides**, and has not been re-measured since; treat that number as unknown rather than current. |
+| 7 | presentation & performance — **barely started**. A ghostty pane drained its pty at 4.2 MB/s against cascadia's 38.1; a forced render per chunk of output was the whole gap, and throttling it reached 28 MB/s median. See `docs/perf/throughput.md`. |
 | 8 | accessibility & packaging — **not started**. UIA/Narrator, MSIX, ARM64. |
 | 9 | upstreaming — ongoing |
 
