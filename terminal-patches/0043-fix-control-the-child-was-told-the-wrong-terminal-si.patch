@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Fri, 7 Aug 2026 11:22:49 -0700
+Subject: [PATCH] fix(control): the child was told the wrong terminal size
+
+A ghostty pane told its shell it was 56x18 while being 109x27. `stty size`
+disagreed with the pane's own CSI 18 t, long lines wrapped at half the
+width, and any full-screen program drew into a box a third of the pane.
+Resizing the window corrected it, which is what disguised a pty bug as a
+rendering quirk.
+
+ConptyConnection::Resize applies a size to the pseudoconsole only while the
+connection is Connected; before that it records the numbers for Start() to
+use. But Start() transitions to Connecting, *then* creates the
+pseudoconsole, and only reaches Connected afterwards - so a resize arriving
+in that window is recorded and applied to nothing.
+
+That window is exactly where ours arrives. TermControl initializes the core
+before starting the connection, libghostty sizes its surface during that
+initialization, and the resulting resize_pty callback is the one carrying
+the real grid. Captured from the app's own trace:
+
+    resizeConnection 56x18 cells        <- ghostty's default grid
+    set font-size = 12
+    cellSize 14x28 px
+    pushSize panel=1024.0x520.0 dips scale=1.500 -> 1536x780 px
+    resizeConnection 109x27 cells       <- correct, and lost
+
+The size was computed correctly every time. It never reached the
+pseudoconsole.
+
+The core now remembers the last grid size resize_pty asked for and replays
+it when the connection reports Connected. Resize is idempotent, so the
+replay costs nothing when the size already took.
+
+Verified: `wsl stty size` in a fresh pane answers 27 109, matching the
+pane's own CSI 18 t. Before, the same probe answered 18 56.
+
+unitControl 62 passed / 0 failed / 1 skipped.
+
+This has plausibly been wrong since Phase 5 - the phase report records the
+first ghostty pane running at 56x18 - and survived because nothing had ever
+asked the child how big it thought it was. That check is now manual-
+validation step 1b.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 34 +++++++++++++++++++
+ .../TerminalControl/GhosttyControlCore.h      | 10 ++++--
+ 2 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 75d6b5f78..5a6570182 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -368,6 +368,34 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+     void GhosttyControlCore::_connectionStateChangedHandler()
+     {
++        // Re-apply the grid size the moment the pty can receive it.
++        //
++        // ConptyConnection::Resize only reaches the pseudoconsole while the
++        // connection is Connected; before that it just remembers the numbers for
++        // Start() to use. But Start() transitions to Connecting, *then* creates
++        // the pseudoconsole, and only reaches Connected afterwards - so a resize
++        // arriving in that window is recorded and never applied to anything.
++        //
++        // That window is exactly where ours arrives. TermControl initializes the
++        // core before starting the connection, libghostty sizes its surface
++        // during that initialization, and the resulting resize_pty callback is
++        // the one carrying the real grid. The result was a child that spent its
++        // whole life believing the terminal was 56x18 while the pane was 109x27:
++        // `stty size` disagreed with the pane's own CSI 18 t, long lines wrapped
++        // at half the width, and any full-screen program drew into a box a third
++        // of the pane. Resizing the window fixed it, because by then the state
++        // was Connected - which is what made it look like a rendering quirk
++        // rather than a pty bug.
++        //
++        // Resize is idempotent, so replaying it costs nothing when the size
++        // already took.
++        if (_connection && !_closing && _ptyColumns > 0 && _ptyRows > 0 &&
++            _connection.State() == TerminalConnection::ConnectionState::Connected)
++        {
++            _trace(L"reapplying pty size %ux%u on connect", _ptyColumns, _ptyRows);
++            _connection.Resize(_ptyRows, _ptyColumns);
++        }
++
+         _raiseOnUiThread([this]() { ConnectionStateChanged.raise(*this, nullptr); });
+     }
+ 
+@@ -392,6 +420,12 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     void GhosttyControlCore::ResizeConnection(uint16_t columns, uint16_t rows) noexcept
+     try
+     {
++        // Remembered even when there is no connection to tell yet: this is the
++        // authoritative grid size, and _connectionStateChangedHandler replays it
++        // once the pty can actually receive it.
++        _ptyColumns = columns;
++        _ptyRows = rows;
++
+         if (!_connection || _closing)
+         {
+             return;
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.h b/src/cascadia/TerminalControl/GhosttyControlCore.h
+index 314370487..dc6432254 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.h
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.h
+@@ -276,8 +276,8 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         void _raiseOnUiThread(std::function<void()> action);
+ 
+         Control::IControlSettings _settings{ nullptr };
+-        Control::IControlAppearance _unfocusedAppearance{ nullptr };
+-        bool _hasUnfocusedAppearance{ false };
++        Control::IControlAppearance _unfocusedAppearance{ nullptr };
++        bool _hasUnfocusedAppearance{ false };
+         void _setUnfocusedAppearance(const IControlAppearance& newAppearance);
+         TerminalConnection::ITerminalConnection _connection{ nullptr };
+         TerminalConnection::ITerminalConnection::TerminalOutput_revoker _connectionOutputRevoker;
+@@ -313,6 +313,12 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // terminal is not using.
+         winrt::Windows::Foundation::Size _cellSize{ 0, 0 };
+ 
++        // The grid size libghostty last asked the pty for, re-applied when the
++        // connection reaches Connected. See _connectionStateChangedHandler for
++        // why remembering it is necessary rather than belt-and-braces.
++        uint16_t _ptyColumns{ 0 };
++        uint16_t _ptyRows{ 0 };
++
+         // The panel's size in DIPs, as TermControl reports it, kept separately
+         // from the pixel size handed to libghostty - see _pushSize().
+         float _panelWidth{ 0 };
