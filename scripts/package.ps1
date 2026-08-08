@@ -150,16 +150,27 @@ if ($LASTEXITCODE -ne 0) {
 # --- Certificate for distribution --------------------------------------------
 Export-Certificate -Cert $cert -FilePath $outCer -Type CERT | Out-Null
 
-# --- Framework dependency -----------------------------------------------------
-# The package declares a PackageDependency on Microsoft.UI.Xaml.2.8. A machine
-# with a current Windows Terminal already has it, but that cannot be assumed,
-# and when it is missing Add-AppxPackage fails with a bare 0x80073CF3 that says
-# nothing about which dependency. Shipping it costs 5 MB and turns that into a
-# -DependencyPath argument that is harmless when the framework is present.
+# --- Framework dependency: deliberately NOT shipped ---------------------------
+# The package declares a PackageDependency on Microsoft.UI.Xaml.2.8, and it is
+# not staged here on purpose.
+#
+# Anyone installing this already has Windows Terminal, which depends on the same
+# framework - and Windows 11 preinstalls it. Measured on the build machine: two
+# copies present, both Store-delivered, and both *newer* than the 8.2305.5001.0
+# the NuGet package carries. So the asset would be 5 MB of dead weight in the
+# normal case.
+#
+# It is also not ours to hand out casually. WinUI 2 is under Microsoft's own
+# licence terms, not MIT like the two upstreams; redistribution is permitted
+# (section 2, Distributable Code) but carries obligations, including passing
+# terms on to end users. Not shipping it avoids taking that on for a file the
+# recipient almost certainly already has.
+#
+# The cost is one bad error message: a genuinely missing framework fails with a
+# bare 0x80073CF3 naming no dependency. docs/install.md decodes it.
 $dep = Get-ChildItem (Join-Path $PkgProj 'AppPackages') -Recurse -Filter 'Microsoft.UI.Xaml.2.8.appx' -ErrorAction SilentlyContinue |
     Where-Object { $_.Directory.Name -eq 'x64' } | Select-Object -First 1
-if ($dep) { Copy-Item $dep.FullName (Join-Path $DistDir $dep.Name) -Force }
-else { Write-Host "  WARNING: Microsoft.UI.Xaml.2.8.appx (x64) not found; install will need it already present" -ForegroundColor Yellow }
+if ($dep) { Write-Host "  framework dependency available at $($dep.FullName) (not shipped - see comment)" -ForegroundColor DarkGray }
 
 # --- Checksums ----------------------------------------------------------------
 $sums = Join-Path $DistDir 'SHA256SUMS.txt'

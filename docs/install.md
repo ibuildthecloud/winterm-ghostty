@@ -24,7 +24,6 @@ Download from the [latest release](https://github.com/ibuildthecloud/winterm-gho
 |---|---|
 | `winterm-ghostty-<version>-x64.msix` | the application |
 | `winterm-ghostty-<version>.cer` | the public certificate the package is signed with |
-| `Microsoft.UI.Xaml.2.8.appx` | framework dependency, in case your machine lacks it |
 | `SHA256SUMS.txt` | checksums |
 
 Check what you downloaded:
@@ -44,15 +43,28 @@ Import-Certificate -FilePath .\winterm-ghostty-<version>.cer `
 Install:
 
 ```powershell
-Add-AppxPackage -Path .\winterm-ghostty-<version>-x64.msix `
-    -DependencyPath .\Microsoft.UI.Xaml.2.8.appx
+Add-AppxPackage -Path .\winterm-ghostty-<version>-x64.msix
 ```
 
-`-DependencyPath` is harmless if the framework is already present. Without it, a missing
-Microsoft.UI.Xaml.2.8 fails with a bare `0x80073CF3` that does not say which dependency
-is missing.
-
 Then launch **Terminal (ghostty)** from the Start menu, or run `wtg.exe`.
+
+### If that fails with 0x80073CF3
+
+That code means a missing framework dependency, and it does not say which one. It is
+almost always `Microsoft.UI.Xaml.2.8`.
+
+The release does not ship that framework, on the assumption that anyone installing this
+already has Windows Terminal — which depends on the same framework — and that Windows 11
+preinstalls it. If that assumption does not hold for you, install the framework first:
+
+```powershell
+winget install --id Microsoft.UI.Xaml.2.8
+```
+
+or take `Microsoft.UI.Xaml.2.8.appx` (x64) out of the
+[Microsoft.UI.Xaml NuGet package](https://www.nuget.org/packages/Microsoft.UI.Xaml/2.8.4)
+and `Add-AppxPackage` it. It is Microsoft-signed either way, so you can verify it
+against the Microsoft root rather than trusting us for it.
 
 ## Turn the ghostty engine on
 
