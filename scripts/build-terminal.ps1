@@ -128,8 +128,23 @@ if (-not $NoRestore) {
     # derives the packages folder from the *current* directory, so restoring
     # from anywhere but terminal/ fails with "Cannot determine the packages
     # folder". The projects look for terminal\packages, so name it.
+    #
+    # -ConfigFile is not optional either, and for a subtler reason. The terminal
+    # repo ships its own NuGet.Config that <clear/>s the default sources and adds
+    # only the public TerminalDependencies feed on Azure DevOps - the only place
+    # Microsoft.Taef, Microsoft.Internal.PGO-Helpers.Cpp and
+    # Microsoft.Internal.Windows.Terminal.ThemeHelpers are published. NuGet finds
+    # that config by walking up from the *current directory*, so invoking this
+    # from the parent repo restores against nuget.org instead and those three
+    # resolve nowhere - reported as "Unable to find version", never mentioning
+    # the feed that was not consulted.
+    #
+    # A machine that has restored once hides this entirely, because the packages
+    # are already sitting in terminal\packages. It took a clean CI runner to
+    # surface it.
     & $nuget restore (Join-Path $TerminalRoot 'dep\nuget\packages.config') `
-        -PackagesDirectory (Join-Path $TerminalRoot 'packages') -Verbosity quiet
+        -PackagesDirectory (Join-Path $TerminalRoot 'packages') `
+        -ConfigFile (Join-Path $TerminalRoot 'NuGet.Config') -Verbosity quiet
     if ($LASTEXITCODE -ne 0) { throw "nuget restore failed ($LASTEXITCODE)" }
 }
 if ($RestoreOnly) { return }
