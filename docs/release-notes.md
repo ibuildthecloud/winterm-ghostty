@@ -70,9 +70,9 @@ Each defect in `docs/known-defects.md` records what was measured rather than wha
 
 ## Signing
 
-Signed with a **self-signed certificate** (`CN=Darren Shepherd`) — there is no paid publisher identity behind this, so Windows has no reason to trust it until you say so. `docs/install.md` explains what that grants and how to undo it. If you would rather not, the patch series in `ghostty-patches/` and `terminal-patches/` exists so you can build it yourself.
+The MSIX, when one is published, is signed with a **self-signed certificate** (`CN=Darren Shepherd`) — there is no paid publisher identity behind this, so Windows has no reason to trust it until you say so. `docs/install.md` explains what that grants and how to undo it. If you would rather not, the patch series in `ghostty-patches/` and `terminal-patches/` exists so you can build it yourself.
 
-Verify what you downloaded against `SHA256SUMS.txt`.
+The portable ZIP is not signed and does not need to be - nothing installs it. Verify what you downloaded against `SHA256SUMS.txt`.
 
 ## Provenance
 
