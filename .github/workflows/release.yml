@@ -176,6 +176,15 @@ jobs:
           ./scripts/build-terminal.ps1 -Project terminal @common -NoRestore
           ./scripts/build-terminal.ps1 -Project package  @common -NoRestore
 
+      - name: Stage the portable ZIP
+        shell: pwsh
+        run: |
+          # Unconditional, and before signing: the portable distribution needs
+          # no certificate at all, so it is the one artifact that is always
+          # produced. Staging it first also means package.ps1's SHA256SUMS
+          # covers it.
+          ./scripts/package-portable.ps1
+
       - name: Import the signing certificate
         if: env.HAVE_CERT == 'true'
         shell: pwsh

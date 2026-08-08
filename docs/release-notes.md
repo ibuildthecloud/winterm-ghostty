@@ -8,9 +8,20 @@ It is a **working fork, not a finished product**; read [Known issues](#known-iss
 
 ## Install
 
-Full instructions, including what trusting the certificate actually grants: **[docs/install.md](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/install.md)**.
+Two ways. Full instructions: **[docs/install.md](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/install.md)**.
 
-The short version — trust the certificate from an **elevated** PowerShell:
+### Portable — no certificate, no admin, no install
+
+```powershell
+Expand-Archive .\winterm-ghostty-{{VERSION}}-x64-portable.zip -DestinationPath .
+.\terminal-{{VERSION}}\WindowsTerminal.exe
+```
+
+Same build, just not installed. Settings live beside the exe, so deleting the folder removes every trace. What you give up is integration: no Start menu entry, no `wtg.exe` on PATH, no "Open in Terminal", and it cannot be your default terminal.
+
+### MSIX — installed, and needs the certificate trusted once
+
+Trust the certificate from an **elevated** PowerShell:
 
 ```powershell
 Import-Certificate -FilePath .\winterm-ghostty-{{VERSION}}.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople

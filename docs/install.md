@@ -16,15 +16,61 @@ Microsoft or the ghostty project. Both upstreams are MIT; so is this.
 - It installs **alongside** Windows Terminal rather than replacing it. Different package
   identity, different execution alias, separate settings.
 
-## Install
+## Two ways to run it
+
+|  | portable ZIP | MSIX |
+|---|---|---|
+| certificate | **none needed** | must trust a self-signed one, once, as admin |
+| admin rights | no | yes, for the certificate |
+| Developer Mode | no | no |
+| Start menu, `wtg.exe` alias, "Open in Terminal" | no | yes |
+| settings live | beside the exe | `%LOCALAPPDATA%\Packages\WintermGhostty_*` |
+| uninstall | delete the folder | `Remove-AppxPackage` |
+
+**If you just want to try it, take the ZIP.** It is the same build; it simply
+isn't installed. Nothing is registered, nothing is left behind, and no decision
+about trusting a certificate is involved.
 
 Download from the [latest release](https://github.com/ibuildthecloud/winterm-ghostty/releases/latest):
 
 | file | what it is |
 |---|---|
-| `winterm-ghostty-<version>-x64.msix` | the application |
+| `winterm-ghostty-<version>-x64-portable.zip` | unzip and run — no install |
+| `winterm-ghostty-<version>-x64.msix` | the installable package |
 | `winterm-ghostty-<version>.cer` | the public certificate the package is signed with |
 | `SHA256SUMS.txt` | checksums |
+
+## Portable
+
+```powershell
+Expand-Archive .\winterm-ghostty-<version>-x64-portable.zip -DestinationPath .
+.\terminal-<version>\WindowsTerminal.exe
+```
+
+That is the whole procedure. The `.portable` marker file next to the exe is what
+keeps settings beside it instead of in `%LOCALAPPDATA%`, so the folder is
+self-contained and deleting it removes every trace.
+
+What you give up is integration, all of it downstream of not being installed:
+no Start menu entry, no `wtg.exe` on `PATH`, no "Open in Terminal" context menu,
+and it cannot be set as your default terminal.
+
+### Why there is no unsigned .msix
+
+A reasonable question, since Developer Mode exists. It does not help here:
+`Add-AppxPackage -AllowUnsigned` refuses this package with
+
+```
+0x80073D2C — the package deployment failed because its publisher is not in the unsigned namespace
+```
+
+`-AllowUnsigned` is not a "skip the signature" switch. It only accepts packages
+whose `Publisher` carries a special unsigned-namespace marker OID — and a
+manifest carrying that could no longer match a real certificate subject, so it
+could not also be signed. MSIX always wants a signature; the way to avoid one is
+to not use MSIX, which is what the ZIP is.
+
+## MSIX
 
 Check what you downloaded:
 
