@@ -403,3 +403,151 @@ Consequences:
 stop the cursor *appearing* to blink, but `Thread.zig:264-271` starts the blink
 timer unconditionally with no config gate, so the wakeups and presents would
 continue. Reaching zero needs the timer gated upstream as well.
+
+---
+
+### KD-06 — A ligature's second half blinks with the cursor
+
+**Reported** by the user, from use: type `--` at a shell prompt, move the cursor
+back onto the **first** dash, and the **second** dash blinks in antiphase with
+the block cursor. The user also established the workaround before any of this
+was measured: **Consolas does not do it, Cascadia Code does.**
+
+**Confirmed by measurement**, not by eye. Frames of a live pane captured with
+`harness/wgc-shot` and diffed per pixel; cells in this pane are 13 px wide with
+column 0 starting at x=18.
+
+| what is on the line | cursor parked on | pixels changing per blink |
+|---|---|---|
+| `--` | first dash | **365 px across x=[239..261] — two cells** |
+| `--` | second dash | 331 px, x=[252..264] — one cell |
+| `xy` | first letter | 338 px, x=[239..251] — one cell |
+
+338 px is exactly one 13x26 cell, i.e. the cursor block and nothing else. Only
+the first case leaks past the cursor's own cell, and it leaks **only on the three
+pixel rows that carry the dash's ink** — rows 89-91 of a 26-row cell. It is a
+glyph disappearing, not a rectangle being painted.
+
+Rendered directly, cursor-on versus cursor-off, the second dash is simply gone:
+
+```
+cursor on    @@@+=======%@                    <- col 17 block, col 18 EMPTY
+cursor off      ########-  *#######=          <- col 17 dash,  col 18 dash
+```
+
+#### Cause
+
+ghostty deliberately breaks font-shaping runs at the cursor cell
+(`font/shaper/run.zig:178`, `FontShapingBreak{ cursor: bool = true }`), so a
+ligature under the cursor is normally split into its component glyphs. That break
+is computed from `state.cursor.viewport` — a **position**, not the blink phase
+(`renderer/generic.zig:2658-2662`) — so shaping cannot legitimately differ
+between blink phases, and in the healthy cases above it does not.
+
+The break is only applied when the row is re-shaped, and
+`renderer/generic.zig:2408-2410` re-shapes a row only when it is dirty:
+
+```zig
+if (!rebuild) {
+    // Only rebuild if we are doing a full rebuild or this row is dirty.
+    if (!dirty.*) continue;
+```
+
+Moving the cursor changes no cell contents, so the row is not dirty and is not
+re-shaped. The `--` therefore keeps the **ligature** shaping it was given when
+the cursor was still to the right of it — one glyph, owned by the first cell,
+whose ink spans both cells. Drawing the block cursor over that first cell
+replaces what the first cell draws, and the ligature's right half goes with it.
+
+The two shapings are distinguishable in the captures, which is what makes this
+more than a story. A run correctly broken at the cursor renders the two cells as
+the *same* lone-dash glyph at the *same* sub-cell offset; a surviving ligature
+renders them at different offsets:
+
+```
+broken (correct)   #%%%%%%%%%*  #%%%%%%%%%*      <- identical, offset 1
+ligature (stale)      ########-  *#######=       <- offsets 3 and 1
+```
+
+Every observation follows from this:
+
+- **`xy` is unaffected** — no ligature, each cell owns its own glyph.
+- **Cursor on the *second* dash is unaffected** — the ligature glyph is owned by
+  the first cell, which is not the cell the cursor is covering.
+- **Consolas is unaffected** — it has no `--` ligature to strand.
+
+#### The ordering is what decides it, and it is why this was hard to reproduce
+
+Four printf-based repro attempts failed before the mechanism was clear. Writing
+`--` and the cursor-back escape in one burst means the renderer's *first* shaping
+of that row already has the cursor on the dash, so the run is broken correctly
+and nothing is wrong. Inserting a pause between the two writes — the order a
+person produces by typing and then pressing Left — reproduces the stale ligature
+from a plain `printf`, with no shell, no readline and no typing involved.
+
+**So the trigger is "shape, then move the cursor onto it", not typing.** Any
+repro that emits text and cursor movement together will report this bug as
+absent.
+
+#### Scope
+
+The row-dirty gate and the cursor break are both in code shared with upstream
+(`renderer/generic.zig`, `font/shaper/run.zig`), not in our D3D11 backend, so
+**this is very likely an upstream ghostty defect that we inherit** rather than a
+port bug. That has not been confirmed against a native ghostty build, and it
+should be before anything is filed upstream — see below.
+
+#### The measurement that would settle the remaining questions
+
+1. **Is it upstream?** Same sequence on a native ghostty (macOS or Linux) with a
+   ligating font: print `--`, wait a frame, move the cursor onto the first dash,
+   watch the second. One run answers it.
+2. **Which half of the fix is right?** Either mark the cursor's old and new rows
+   dirty when the cursor moves within the viewport, or make the cursor position
+   part of what invalidates a row's cached shaping. The first is cheaper; the
+   second is harder to get wrong. Both need a throughput re-measure, because
+   dirtying a row per cursor move touches the hot path.
+
+Both remain open. The third question this entry carried — *does disabling the
+break confirm the mechanism* — has been answered, below.
+
+#### Confirmed by disabling the break — 2026-08-08
+
+This is why the entry states a cause rather than a hypothesis.
+`FontShapingBreak.cursor` was temporarily defaulted to `false` in
+`config/Config.zig`, libghostty rebuilt (`ReleaseFast`,
+`-Dfont-backend=directwrite_harfbuzz`) and dropped into the dev package.
+
+**Note which way that knob points.** `no-cursor` sets `cursor: false`, and
+`shape.zig:89` then does `if (!config.cursor) self.cursor_x = null` — it
+*disables* the break. So it predicts the symptom becomes **universal**, appearing
+in the write-and-move-in-one-burst case that renders correctly today. Predicting
+a change in a case that currently *works* is a much sharper test than watching a
+symptom disappear.
+
+| case | break on (normal) | break off |
+|---|---|---|
+| `…q--`, cursor on first dash | **338 px, x=[239..251]** — one cell, correct | **365 px, x=[239..261]** — two cells, the bug |
+| `…qxy`, cursor on the `x` | 338 px | **338 px — unchanged** |
+
+The prediction held exactly, down to the pixel range, and the no-ligature control
+did not move — so the effect is ligature-specific and not a general widening.
+The rendering matches the report too: cursor on, column 18 empty; cursor off,
+both dashes at the ligature's two distinct sub-cell offsets.
+
+```
+break off, cursor on    @@@********%@                 <- col 17 block, col 18 EMPTY
+break off, cursor off      ********-  +*******+       <- ligature, offsets 3 and 1
+```
+
+The change was reverted and libghostty rebuilt; the same case measured 338 px
+again afterwards, which is what confirms the revert rather than a file hash.
+
+**`no-cursor` is therefore not a workaround**, and exposing it as a WT profile
+setting would only hand users a switch that makes this worse. That is worth
+saying explicitly because "expose the setting we don't forward" is the obvious
+wrong move from reading `GhosttySettingsTranslator` alone.
+
+#### Workaround today
+
+Use a font without a `--` ligature. Consolas is confirmed clear.
