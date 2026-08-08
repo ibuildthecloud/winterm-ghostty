@@ -144,9 +144,33 @@ jobs:
           # in, so a step that omits it produces binaries registering the Dev
           # class IDs while the manifest declares the Release ones - a package
           # that builds, installs, and then hands off to nothing.
-          ./scripts/build-terminal.ps1 -Project src\host\proxy\Host.Proxy.vcxproj -Configuration Release -Branding Release
-          ./scripts/build-terminal.ps1 -Project terminal -Configuration Release -Branding Release -NoRestore
-          ./scripts/build-terminal.ps1 -Project package  -Configuration Release -Branding Release -NoRestore
+          $common = @('-Configuration', 'Release', '-Branding', 'Release')
+
+          # 1. MIDL proxy: generates ITerminalHandoff.h.
+          ./scripts/build-terminal.ps1 -Project src\host\proxy\Host.Proxy.vcxproj @common
+
+          # 2. The winmd producers, explicitly and before anything that consumes
+          #    their cppwinrt projections.
+          #
+          #    TerminalSettingsAppAdapterLib reaches the build graph as
+          #    WindowsTerminal -> TerminalApp -> TerminalAppLib -> AppAdapterLib,
+          #    but it consumes Microsoft.Terminal.Settings.Model.winmd (and
+          #    Control, Connection, Core) through bare <Reference><HintPath>
+          #    entries rather than <ProjectReference>. There is therefore no
+          #    dependency edge, and under /m:4 it can start before the winmds
+          #    exist - failing with
+          #      C1083: Cannot open include file:
+          #             'winrt/Microsoft.Terminal.Settings.Model.h'
+          #
+          #    Building the producers first makes the order explicit instead of
+          #    relying on luck. A warm tree hides this completely, which is why
+          #    the sequence in README.md is enough locally and not here.
+          ./scripts/build-terminal.ps1 -Project src\cascadia\TerminalSettingsModel\dll\Microsoft.Terminal.Settings.Model.vcxproj @common -NoRestore
+          ./scripts/build-terminal.ps1 -Project src\cascadia\TerminalControl\dll\TerminalControl.vcxproj @common -NoRestore
+
+          # 3. The app, then the package.
+          ./scripts/build-terminal.ps1 -Project terminal @common -NoRestore
+          ./scripts/build-terminal.ps1 -Project package  @common -NoRestore
 
       - name: Import the signing certificate
         if: env.HAVE_CERT == 'true'
