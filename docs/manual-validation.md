@@ -90,10 +90,14 @@ a minimal one in the session scratchpad, `dbwin.ps1`) while opening a pane:
    appears**.
 3. Over RDP, repeat 1. **Pass:** whichever driver it picks, the pane renders.
 
-**Status:** step 1 verified in a pane (`driver=hardware feature_level=11_1`).
-Steps 2 and 3 are **not** done — the session disconnected, and nothing that
-needs a window works on a detached session. Phase 3 verified forced WARP in the
-harness only, so the pane half of this criterion is still open.
+**Status: all three verified 2026-08-07, in a pane, over a live RDP session**
+(`rdp-tcp#0`, Active). A GPU *is* exposed to the remote session here, so a pane
+picks `driver=hardware feature_level=11_1` over RDP; forced WARP renders
+`driver=warp feature_level=11_1`. No dialog in either case.
+
+The two renders were compared rather than eyeballed: 344,199 sampled pixels,
+**0 differing by more than 8**, max channel delta 1. WARP output is
+pixel-equivalent to hardware.
 
 ## 2. Non-ASCII output
 

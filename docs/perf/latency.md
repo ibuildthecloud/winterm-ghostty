@@ -84,6 +84,33 @@ through `OutputDebugString`.
 `IDXGIDevice1::SetMaximumFrameLatency(1)` governs the same queue, is accepted
 (`hr=0`), and is what ships.
 
+## What WARP costs — 2026-08-07
+
+The degradation ladder falls to WARP when no GPU is available, and until now
+"is WARP fast enough" had never been measured. Forced with
+`GHOSTTY_D3D11_DRIVER=warp`, in a pane, over RDP:
+
+| | throughput | latency median |
+|---|---|---|
+| hardware | 28.6 MB/s | 45.9 ms |
+| **WARP** | **26.8 MB/s** | **93.5 ms** (min 70.8, max 131.7) |
+
+**Throughput barely moves — 6% — and latency more than doubles.** A CPU
+rasterizer keeps up with a flood of text perfectly well and is poor at
+responding quickly to one keystroke, which is not the shape most people would
+guess.
+
+That asymmetry is worth holding next to cascadia's second backend. `BackendD2D`
+exists, in its own README's words, "for low latency remote desktop and older/no
+GPUs" — and the AtlasEngine source is candid that its authors were unsure of the
+speed case: *"I'm not sure whether Direct2D is actually faster on WARP, but it's
+definitely better tested."* On this evidence the case for a second backend is
+about **latency**, not throughput, on machines where WARP is the only option.
+
+Caveat: this machine has a GPU and RDP exposes it, so WARP was forced rather
+than fallen back to. A genuinely GPU-less machine is the case that matters and
+is untested.
+
 ## Where the rest of the gap plausibly lives
 
 Not yet investigated, so this is a candidate rather than a finding — but a
