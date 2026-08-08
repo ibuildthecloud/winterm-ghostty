@@ -315,3 +315,91 @@ is itself 2:1. It has to be paired with a cell box of the right shape — with
 Whether chafa should be doing this itself is a question for chafa; on the
 evidence here its kitty output is distorted on any terminal whose cells are not
 square, which is nearly all of them.
+
+---
+
+### KD-04 — A background pane keeps blinking and keeps presenting
+
+**Found** 2026-08-07 by measurement, while asking whether the idle present rate
+drops to zero when a pane is not focused. It does not.
+
+Counters through a run that focused a pane for 6 s, moved focus to another
+**window** for 12 s, then came back:
+
+```
+notify=5 wakeup=7  update=7  present=8
+...                                        <- +2/sec, unbroken
+notify=5 wakeup=53 update=53 present=54
+```
+
+No gap. The pane presented at the blink rate for the whole unfocused period.
+
+#### Both ends are correct; the wire between them is missing
+
+- ghostty cancels the blink timer on focus loss, properly
+  (`renderer/Thread.zig:402-446` — `.focus` mailbox handler).
+- `GhosttyControlCore::LostFocus` calls `ghostty_surface_set_focus(surface,
+  false)` faithfully.
+- **`LostFocus` is never raised.** It comes from XAML's routed
+  `GotFocus`/`LostFocus` on the *control*, which do not fire when a different
+  top-level window takes the foreground — the control keeps logical focus
+  inside its own app.
+
+So the Phase 6 unfocused-cursor work (patch 30, `cursor-style-unfocused`), which
+a human did verify, was exercising **pane-to-pane** focus inside one window.
+Window-level deactivation is a case nobody tried.
+
+#### What it costs
+
+- A background terminal draws a **blinking, focused-looking cursor**. Visually
+  wrong: a background terminal should not look focused.
+- Its render thread keeps waking ~1.7 times a second per pane, rebuilding the
+  whole grid and presenting the whole surface each time.
+- It is the second lever on Phase 7's idle criterion, and unlike cursor-blink
+  configuration this one is a bug rather than a knob.
+
+#### Unknown, and worth measuring before fixing
+
+**Does a cascadia pane do the same?** If it does, this is a shared Windows
+Terminal gap rather than ours, and the fix belongs somewhere both engines see.
+If it does not, cascadia has a signal we are not using. Cheap to check: two
+screenshots of an inactive pane 300 ms apart, diffed over the cursor cell.
+
+#### Why it is not fixed here
+
+`IControlCore::WindowVisibilityChanged` exists but is minimise/restore, not
+activation — the wrong signal. Doing it properly means hooking window activation
+in `TermControl` and driving focus from it, which changes behaviour on a path
+**cascadia also runs through**, so it needs a cascadia-side regression check
+too. Deferred deliberately, not overlooked.
+
+---
+
+### KD-05 — The system's cursor-blink settings are ignored
+
+Cascadia reads them (`TerminalCore/terminalrenderdata.cpp:41-52`):
+
+```cpp
+const auto enabled = GetSystemMetrics(SM_CARETBLINKINGENABLED);
+const auto interval = GetCaretBlinkTime();
+_cursorBlinkInterval = enabled && interval <= 10000 ? milliseconds(interval)
+                                                   : TimerDuration::max();
+```
+
+So with blinking disabled system-wide, cascadia's blink timer never fires.
+
+`GhosttySettingsTranslator.cpp` contains **no mention of blink at all**:
+`cursor-style-blink` is never set, and ghostty's interval is the hard-coded
+600 ms of `CURSOR_BLINK_INTERVAL`.
+
+Consequences:
+
+- **Turning off cursor blinking in Windows — frequently an accessibility
+  setting — has no effect on a ghostty pane.** That is the part that matters.
+- The blink *rate* is user-configurable on Windows (200–1200 ms) and is ignored.
+- An idle pane pays ~1.7 presents/sec that a cascadia pane would not.
+
+**Note the fix is not purely ours.** Setting `cursor-style-blink = false` would
+stop the cursor *appearing* to blink, but `Thread.zig:264-271` starts the blink
+timer unconditionally with no config gate, so the wakeups and presents would
+continue. Reaching zero needs the timer gated upstream as well.
