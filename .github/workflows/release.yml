@@ -144,7 +144,11 @@ jobs:
           # in, so a step that omits it produces binaries registering the Dev
           # class IDs while the manifest declares the Release ones - a package
           # that builds, installs, and then hands off to nothing.
-          $common = @('-Configuration', 'Release', '-Branding', 'Release')
+          # A hashtable, not an array: splatting an array passes its elements
+          # POSITIONALLY, so @('-Configuration','Release',...) hands the literal
+          # string "-Configuration" to the first positional parameter. Hashtable
+          # splatting is what maps keys onto parameter names.
+          $common = @{ Configuration = 'Release'; Branding = 'Release' }
 
           # 1. MIDL proxy: generates ITerminalHandoff.h.
           ./scripts/build-terminal.ps1 -Project src\host\proxy\Host.Proxy.vcxproj @common
