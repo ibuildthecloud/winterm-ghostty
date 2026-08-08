@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Sat, 8 Aug 2026 11:57:28 -0700
+Subject: [PATCH] terminal/kitty: an exact S is not an over-long read
+
+File-medium image transmission (t=f, t=t) has been rejected with
+"EINVAL: invalid data" since the Zig 0.15 translation, for every client
+that sends S - which is every client.
+
+cb295b84a turned
+
+    reader.readAllArrayList(&managed, size)
+
+into
+
+    reader.appendRemaining(alloc, &managed, .limited(size))
+
+and the two disagree about what the bound means. The old call read up to
+`size` bytes and only failed when more remained. The new one reports a
+*consumed* limit as error.StreamTooLong. S is the exact byte count the
+client wants read, so the ordinary case - a file whose length is exactly
+S - lands on that error and the transfer is refused. Reaching the limit
+is success here, not failure; only an omitted S makes the limit mean
+"too large", and there it is max_size, far past anything renderable.
+
+Measured with a=q probes against the Windows DLL, on a 4-byte file:
+
+    S omitted   OK
+    S=4         EINVAL: invalid data
+    S=3         EINVAL: invalid data
+    S=5         OK
+    S=8         OK
+
+and with a real 1024x720 RGBA frame, S=2949120 failed while an omitted
+S succeeded. After this patch all of them answer OK.
+
+Nothing about this is Windows-specific; it was found there only because
+that is where a kitty client was pointed at the fork. Worth offering
+upstream as-is.
+
+Every existing file test leaves `size` unset, which reads to EOF and so
+never reaches the limit - which is how the whole medium regressed in
+silence. The added test sets it, and fails without the fix.
+
+zig build test passes.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/terminal/kitty/graphics_image.zig | 61 +++++++++++++++++++++++++--
+ 1 file changed, 58 insertions(+), 3 deletions(-)
+
+diff --git a/src/terminal/kitty/graphics_image.zig b/src/terminal/kitty/graphics_image.zig
+index ef584c09a..ad694c90c 100644
+--- a/src/terminal/kitty/graphics_image.zig
++++ b/src/terminal/kitty/graphics_image.zig
+@@ -344,9 +344,19 @@ pub const LoadingImage = struct {
+         var managed: std.ArrayList(u8) = .empty;
+         errdefer managed.deinit(alloc);
+         const size: usize = if (t.size > 0) @min(t.size, max_size) else max_size;
+-        reader.appendRemaining(alloc, &managed, .limited(size)) catch {
+-            log.warn("failed to read temporary file: {?}", .{buf_reader.err});
+-            return error.InvalidData;
++        reader.appendRemaining(alloc, &managed, .limited(size)) catch |err| switch (err) {
++            // Reaching the limit is the normal case, not a failure: `S` is the
++            // exact byte count the client asked us to read, not an upper bound
++            // we have to stay under. `appendRemaining` reports a consumed
++            // limit as `error.StreamTooLong`, so a file whose length is
++            // exactly `S` - which is what every client sends - would otherwise
++            // be rejected. Only when `S` is omitted does the limit mean "too
++            // large", and there `max_size` is far past anything renderable.
++            error.StreamTooLong => {},
++            else => {
++                log.warn("failed to read temporary file: {?}", .{buf_reader.err});
++                return error.InvalidData;
++            },
+         };
+ 
+         // Set our data
+@@ -912,6 +922,51 @@ test "image load: rgb, not compressed, regular file" {
+     try tmp_dir.dir.access(testing.io, path, .{});
+ }
+ 
++test "image load: rgb, not compressed, regular file, exact size" {
++    // Every other file test leaves `size` unset, which reads to EOF. Clients
++    // send `S` set to the byte count they want read, and a file that is
++    // exactly that long is the ordinary case - so it is the one worth pinning.
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    const io = testing.io;
++
++    var tmp_dir = testing.tmpDir(.{});
++    defer tmp_dir.cleanup();
++    const data = @embedFile("testdata/image-rgb-none-20x15-2147483647-raw.data");
++    try tmp_dir.dir.writeFile(testing.io, .{
++        .sub_path = "image.data",
++        .data = data,
++    });
++
++    var buf: [std.fs.max_path_bytes]u8 = undefined;
++    const path = buf[0..try tmp_dir.dir.realPathFile(testing.io, "image.data", &buf)];
++
++    var cmd: command.Command = .{
++        .control = .{ .transmit = .{
++            .format = .rgb,
++            .medium = .file,
++            .compression = .none,
++            .width = 20,
++            .height = 15,
++            .image_id = 31,
++            .size = data.len,
++        } },
++        .data = try alloc.dupe(u8, path),
++    };
++    defer cmd.deinit(alloc);
++    var dir_path_buf: [std.fs.max_path_bytes]u8 = undefined;
++    var loading = try LoadingImage.init(
++        io,
++        alloc,
++        &cmd,
++        .allWithTempDir(dir_path_buf[0..try tmp_dir.dir.realPath(testing.io, &dir_path_buf)]),
++    );
++    defer loading.deinit(alloc);
++    var img = try loading.complete(alloc);
++    defer img.deinit(alloc);
++    try testing.expect(img.compression == .none);
++}
++
+ test "image load: rgb, not compressed, relative regular file" {
+     const testing = std.testing;
+     const alloc = testing.allocator;
