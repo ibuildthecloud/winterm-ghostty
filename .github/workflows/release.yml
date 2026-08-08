@@ -1,0 +1,216 @@
+# Build and publish a signed, sideloadable MSIX.
+#
+# v0.1.0 was built on a laptop and uploaded by hand, which means nobody -
+# including its author on another machine - can reproduce that binary. This
+# workflow exists to make that untrue: it reconstructs both forks from the
+# recorded upstream pins plus the tracked patch series, so the only inputs are
+# in git.
+#
+# It does NOT run the test suites. That belongs in a separate CI workflow;
+# this one is about producing an artifact.
+name: release
+
+on:
+  # Tag push is the real trigger: `git tag v0.2.0 && git push --tags`.
+  push:
+    tags: ['v*']
+  # Dispatch builds the same artifact without publishing, so the workflow can
+  # be proven before a tag exists to prove it with.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Package version (4-part, e.g. 0.2.0.0)'
+        required: true
+        default: '0.1.0.0'
+
+permissions:
+  contents: write   # needed to create the release; nothing else
+
+env:
+  # Kept in step with DESIGN.md's pin table, and checked against it below - a
+  # silently stale pin here would build a different fork than the one the
+  # patches were exported from.
+  GHOSTTY_PIN: 4d605bf0d819df901a0332bbb320dc849fdd82e4
+  TERMINAL_PIN: ca7996296a48322c1c7310af59d4ee2949421679
+
+jobs:
+  build:
+    # windows-2025 for the Windows SDK generation this build needs (>= 10.0.26100,
+    # including dxc). windows-2022 ships an older SDK.
+    runs-on: windows-2025
+    timeout-minutes: 240
+
+    env:
+      # The `secrets` context is NOT available in a step-level `if`, but job
+      # env can read it. Map it once here and branch on the result, rather
+      # than writing conditions that silently evaluate to false forever.
+      HAVE_CERT: ${{ secrets.SIGNING_PFX_BASE64 != '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Work out the version
+        id: version
+        shell: pwsh
+        run: |
+          if ('${{ github.event_name }}' -eq 'push') {
+            # refs/tags/v0.2.0 -> 0.2.0.0. MSIX versions are always 4-part.
+            $v = '${{ github.ref_name }}' -replace '^v',''
+            while (($v -split '\.').Count -lt 4) { $v = "$v.0" }
+          } else {
+            $v = '${{ inputs.version }}'
+          }
+          if ($v -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw "not a 4-part version: $v" }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "building version $v"
+
+      - name: Check the pins still match DESIGN.md
+        shell: pwsh
+        run: |
+          # DESIGN.md is the record of record for upstream pins. If this
+          # workflow drifts from it, the artifact is built from a base the
+          # patch series was never exported against - which usually shows up
+          # as a confusing `git am` failure rather than an obvious one.
+          $design = Get-Content DESIGN.md -Raw
+          foreach ($p in @($env:GHOSTTY_PIN, $env:TERMINAL_PIN)) {
+            if ($design -notmatch [regex]::Escape($p)) {
+              throw "pin $p is not recorded in DESIGN.md - one of the two is stale"
+            }
+          }
+          Write-Host 'pins agree with DESIGN.md'
+
+      - name: Reconstruct the forks
+        shell: pwsh
+        run: |
+          # git am needs an identity even though nothing is pushed from here.
+          git config --global user.name  'winterm-ghostty release workflow'
+          git config --global user.email 'noreply@github.com'
+          # --keep-cr is not optional: Windows Terminal marks its sources -text,
+          # so the blobs really are CRLF, and git am strips trailing CRs by
+          # default - which makes every patch fail to apply.
+          git config --global core.autocrlf false
+
+          function Restore-Fork($name, $url, $pin, $patches) {
+            Write-Host "==> $name @ $pin" -ForegroundColor Cyan
+            # Fetch just the pinned commit rather than the whole history; the
+            # terminal repo in particular is large and none of it is needed.
+            git init $name -q
+            git -C $name remote add origin $url
+            git -C $name fetch --depth 1 origin $pin -q
+            git -C $name checkout -b windows FETCH_HEAD -q
+            $list = Get-ChildItem $patches -Filter *.patch | Sort-Object Name
+            git -C $name am --keep-cr @($list.FullName)
+            if ($LASTEXITCODE -ne 0) { throw "$name : git am failed" }
+            Write-Host "    $($list.Count) patches applied"
+          }
+
+          Restore-Fork ghostty  https://github.com/ghostty-org/ghostty  $env:GHOSTTY_PIN  "$PWD/ghostty-patches"
+          Restore-Fork terminal https://github.com/microsoft/terminal   $env:TERMINAL_PIN "$PWD/terminal-patches"
+
+      - name: Stamp the version into both manifests
+        shell: pwsh
+        run: |
+          $v = '${{ steps.version.outputs.version }}'
+          foreach ($m in 'Package.appxmanifest', 'Package-Dev.appxmanifest') {
+            $p = "terminal/src/cascadia/CascadiaPackage/$m"
+            $s = Get-Content $p -Raw
+            $s = [regex]::Replace($s, '(<Identity\s+Name="[^"]*"\s+Publisher="[^"]*"\s+Version=")[^"]*(")', "`${1}$v`${2}")
+            Set-Content $p -Value $s -NoNewline
+            Write-Host "$m -> $v"
+          }
+
+      - name: Build libghostty
+        shell: pwsh
+        run: ./scripts/build-ghostty.ps1 -Optimize ReleaseFast -Dfont-backend=directwrite_harfbuzz
+
+      - name: Build the package (Release branding)
+        shell: pwsh
+        run: |
+          # Release branding selects Package.appxmanifest and defines
+          # WT_BRANDING_RELEASE, which picks the matching CLSID triple in C++.
+          # Without it the build silently produces the Dev channel instead.
+          ./scripts/build-terminal.ps1 -Project package -Configuration Release /p:WindowsTerminalBranding=Release
+
+      - name: Import the signing certificate
+        if: env.HAVE_CERT == 'true'
+        shell: pwsh
+        env:
+          PFX_B64: ${{ secrets.SIGNING_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.SIGNING_PFX_PASSWORD }}
+        run: |
+          $bytes = [Convert]::FromBase64String($env:PFX_B64)
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, $bytes)
+          $pw = ConvertTo-SecureString $env:PFX_PASSWORD -AsPlainText -Force
+          # CurrentUser\My is where package.ps1 looks the certificate up, by
+          # subject rather than thumbprint.
+          Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pw | Out-Null
+          Remove-Item $pfx -Force
+          Write-Host 'certificate imported'
+
+      - name: Sign and stage
+        if: env.HAVE_CERT == 'true'
+        shell: pwsh
+        run: ./scripts/package.ps1 -SkipBuild
+
+      - name: Stage unsigned (no certificate configured)
+        if: env.HAVE_CERT != 'true'
+        shell: pwsh
+        run: |
+          # Still produce something inspectable, so a workflow run without the
+          # secret proves the build rather than proving nothing.
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $msix = Get-ChildItem terminal/src/cascadia/CascadiaPackage/AppPackages -Recurse -Filter *.msix |
+                  Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $msix) { throw 'no .msix produced' }
+          Copy-Item $msix.FullName "dist/winterm-ghostty-${{ steps.version.outputs.version }}-x64-UNSIGNED.msix"
+          Write-Host '::warning::SIGNING_PFX_BASE64 is not set - the package is UNSIGNED and cannot be installed as-is'
+
+      - name: Report what was built
+        shell: pwsh
+        run: |
+          Get-ChildItem dist -File | ForEach-Object { '{0,-46} {1,12:N0} bytes' -f $_.Name, $_.Length }
+          # Read the identity back out of the artifact rather than trusting the
+          # inputs; this is the thing being shipped.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $msix = Get-ChildItem dist -Filter *.msix | Select-Object -First 1
+          $zip = [IO.Compression.ZipFile]::OpenRead($msix.FullName)
+          try {
+            $e = $zip.Entries | Where-Object Name -eq 'AppxManifest.xml'
+            $r = New-Object IO.StreamReader($e.Open())
+            $x = [xml]$r.ReadToEnd(); $r.Close()
+            $id = $x.Package.Identity
+            Write-Host "identity  $($id.Name) $($id.Version) $($id.Publisher)"
+            if ($id.Name -ne 'WintermGhostty') { throw "wrong branding: got $($id.Name), expected WintermGhostty (was /p:WindowsTerminalBranding=Release passed?)" }
+          } finally { $zip.Dispose() }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: winterm-ghostty-${{ steps.version.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: ${{ github.event_name == 'push' && env.HAVE_CERT == 'true' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The notes source carries {{VERSION}} placeholders so the install
+          # commands in it name the actual files being published.
+          $notes = (Get-Content docs/release-notes.md -Raw).Replace('{{VERSION}}', '${{ steps.version.outputs.version }}')
+          $file = Join-Path $env:RUNNER_TEMP 'notes.md'
+          Set-Content $file -Value $notes -NoNewline
+          $assets = @(Get-ChildItem dist -File | ForEach-Object { $_.FullName })
+          gh release create '${{ github.ref_name }}' `
+            --repo '${{ github.repository }}' `
+            --title '${{ github.ref_name }}' `
+            --notes-file $file `
+            @assets
+
+      - name: Refuse to publish an unsigned tag
+        if: ${{ github.event_name == 'push' && env.HAVE_CERT != 'true' }}
+        shell: pwsh
+        run: throw 'Tag pushed but SIGNING_PFX_BASE64 is not configured. An unsigned MSIX cannot be installed, so there is nothing worth publishing.'

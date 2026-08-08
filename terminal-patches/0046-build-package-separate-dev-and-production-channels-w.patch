@@ -1,0 +1,380 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Sat, 8 Aug 2026 11:06:11 -0700
+Subject: [PATCH] build(package): separate dev and production channels, with
+ our own CLSIDs
+
+Patch 45 shipped by hijacking the Dev manifest, which meant the local
+iteration build and the released build were one identity: installing a
+release replaced the thing you develop against. Upstream already has the
+machinery for this - four brandings selected by WindowsTerminalBranding,
+each with its own manifest, alias and CLSID triple - so use it.
+
+  Release branding  WintermGhostty      wtg.exe    the shipped package
+  Dev branding      WintermGhosttyDev   wtgd.exe   local iteration
+
+Both now carry freshly generated CLSIDs. That is the substantive half of
+this change. COM registrations are machine-global, so inheriting
+upstream's meant fighting the matching real Windows Terminal channel over
+the "Open in Terminal" verb and default-terminal handoff - and moving the
+shipped build to Release branding without regenerating would have moved
+that fight from Windows Terminal Dev, a niche install, to Windows
+Terminal stable, which is everywhere. Eight GUIDs in total: console
+handoff, terminal handoff, shell extension and proxy stub, per channel.
+
+The first three exist twice each - in the manifest and in a C++ header
+that selects on WT_BRANDING_* - and both copies have to agree or the
+class registers under one id and is created under another. The proxy stub
+ids live only in the manifests; nothing in the IDL or C++ names them.
+
+WtExeUtils.h follows: WtExe/WtdExe become wtg.exe/wtgd.exe, and
+IsDevBuild() matches WintermGhosttyDev. It has to be the longer name -
+"WintermGhostty" is a prefix of "WintermGhosttyDev", so testing for the
+shorter one would call every production install a dev build.
+---
+ .../CascadiaPackage/Package-Dev.appxmanifest  | 37 ++++++++---------
+ .../CascadiaPackage/Package.appxmanifest      | 41 +++++++++++--------
+ .../Resources/en-US/Resources.resw            | 16 ++++----
+ .../ShellExtension/OpenTerminalHere.h         |  4 +-
+ .../TerminalConnection/CTerminalHandoff.h     |  4 +-
+ src/cascadia/WinRTUtils/inc/WtExeUtils.h      |  6 +--
+ src/host/exe/CConsoleHandoff.h                |  4 +-
+ 7 files changed, 60 insertions(+), 52 deletions(-)
+
+diff --git a/src/cascadia/CascadiaPackage/Package-Dev.appxmanifest b/src/cascadia/CascadiaPackage/Package-Dev.appxmanifest
+index add30f893..ee27d3470 100644
+--- a/src/cascadia/CascadiaPackage/Package-Dev.appxmanifest
++++ b/src/cascadia/CascadiaPackage/Package-Dev.appxmanifest
+@@ -25,7 +25,7 @@
+        collide with a real Windows Terminal Dev install - same Name, same
+        package family, so one would replace the other. -->
+   <Identity
+-    Name="WintermGhostty"
++    Name="WintermGhosttyDev"
+     Publisher="CN=Darren Shepherd"
+     Version="0.1.0.0" />
+ 
+@@ -76,17 +76,16 @@
+       </uap:VisualElements>
+ 
+       <Extensions>
+-        <!-- Alias wtg, not wtd. An app execution alias is machine-global:
+-             shipping "wtd.exe" would take the alias away from a real Windows
+-             Terminal Dev install, and people running a Dev build are exactly
+-             who would install this.
++        <!-- wtgd: the dev channel's alias, distinct from the shipped wtg.exe
++             so both can be installed at once, and from upstream's wtd.exe so
++             neither takes the alias from a real Windows Terminal Dev install.
+              Executable stays wtd.exe - that names a file *inside* the package,
+              which is what src\cascadia\wt builds under Dev branding, and the
+-             two do not have to match. The alias file Windows creates is named
+-             after Alias, so WtExeUtils.h looks for wtg.exe. -->
++             two do not have to match; MakeAppx rejects an Executable naming a
++             file the package does not contain. -->
+         <uap3:Extension Category="windows.appExecutionAlias" Executable="wtd.exe" EntryPoint="Windows.FullTrustApplication">
+           <uap3:AppExecutionAlias>
+-            <desktop:ExecutionAlias Alias="wtg.exe" />
++            <desktop:ExecutionAlias Alias="wtgd.exe" />
+           </uap3:AppExecutionAlias>
+         </uap3:Extension>
+         <uap5:Extension Category="windows.startupTask">
+@@ -107,7 +106,7 @@
+                 Description="Console host built from microsoft/terminal open source repository"
+                 PublicFolder="Public">
+                 <uap3:Properties>
+-                    <Clsid>{1F9F2BF5-5BC3-4F17-B0E6-912413F1F451}</Clsid>
++                    <Clsid>{92C4D240-B5D7-4947-8541-49288C449395}</Clsid>
+                 </uap3:Properties>
+             </uap3:AppExtension>
+         </uap3:Extension>
+@@ -118,38 +117,38 @@
+                 Description="Terminal host built from microsoft/terminal open source repository"
+                 PublicFolder="Public">
+                 <uap3:Properties>
+-                    <Clsid>{051F34EE-C1FD-4B19-AF75-9BA54648434C}</Clsid>
++                    <Clsid>{FDA66AED-07EE-48FD-AA92-84CFCBAD2BA6}</Clsid>
+                 </uap3:Properties>
+             </uap3:AppExtension>
+         </uap3:Extension>
+         <com:Extension Category="windows.comInterface">
+             <com:ComInterface>
+-                <com:ProxyStub Id="DEC4804D-56D1-4F73-9FBE-6828E7C85C56" DisplayName="OpenConsoleHandoffProxy" Path="OpenConsoleProxy.dll"/>
+-                <com:Interface Id="E686C757-9A35-4A1C-B3CE-0BCC8B5C69F4" ProxyStubClsid="DEC4804D-56D1-4F73-9FBE-6828E7C85C56"/>
+-                <com:Interface Id="6F23DA90-15C5-4203-9DB0-64E73F1B1B00" ProxyStubClsid="DEC4804D-56D1-4F73-9FBE-6828E7C85C56"/> <!-- ITerminalHandoff3 -->
+-                <com:Interface Id="746E6BC0-AB05-4E38-AB14-71E86763141F" ProxyStubClsid="DEC4804D-56D1-4F73-9FBE-6828E7C85C56"/>
++                <com:ProxyStub Id="227241F5-AB32-4525-AA48-0F5E794F8559" DisplayName="OpenConsoleHandoffProxy" Path="OpenConsoleProxy.dll"/>
++                <com:Interface Id="E686C757-9A35-4A1C-B3CE-0BCC8B5C69F4" ProxyStubClsid="227241F5-AB32-4525-AA48-0F5E794F8559"/>
++                <com:Interface Id="6F23DA90-15C5-4203-9DB0-64E73F1B1B00" ProxyStubClsid="227241F5-AB32-4525-AA48-0F5E794F8559"/> <!-- ITerminalHandoff3 -->
++                <com:Interface Id="746E6BC0-AB05-4E38-AB14-71E86763141F" ProxyStubClsid="227241F5-AB32-4525-AA48-0F5E794F8559"/>
+             </com:ComInterface>
+         </com:Extension>
+         <com:Extension Category="windows.comServer">
+             <com:ComServer>
+                 <com:ExeServer DisplayName="OpenConsole" Executable="OpenConsole.exe">
+-                    <com:Class Id="1F9F2BF5-5BC3-4F17-B0E6-912413F1F451"/>
++                    <com:Class Id="92C4D240-B5D7-4947-8541-49288C449395"/>
+                 </com:ExeServer>
+                 <com:ExeServer DisplayName="WindowsTerminal" Executable="WindowsTerminal.exe">
+-                    <com:Class Id="051F34EE-C1FD-4B19-AF75-9BA54648434C"/>
++                    <com:Class Id="FDA66AED-07EE-48FD-AA92-84CFCBAD2BA6"/>
+                 </com:ExeServer>
+                 <com:SurrogateServer DisplayName="WindowsTerminalShellExt">
+-                    <com:Class Id="52065414-e077-47ec-a3ac-1cc5455e1b54" Path="WindowsTerminalShellExt.dll" ThreadingModel="STA"/>
++                    <com:Class Id="6C25E032-CBE8-4AF7-B61F-4928AE3AE14E" Path="WindowsTerminalShellExt.dll" ThreadingModel="STA"/>
+                 </com:SurrogateServer>
+             </com:ComServer>
+         </com:Extension>
+         <desktop4:Extension Category="windows.fileExplorerContextMenus">
+             <desktop4:FileExplorerContextMenus>
+                 <desktop5:ItemType Type="Directory">
+-                    <desktop5:Verb Id="OpenTerminalDev" Clsid="52065414-e077-47ec-a3ac-1cc5455e1b54" />
++                    <desktop5:Verb Id="OpenTerminalDev" Clsid="6C25E032-CBE8-4AF7-B61F-4928AE3AE14E" />
+                 </desktop5:ItemType>
+                 <desktop5:ItemType Type="Directory\Background">
+-                  <desktop5:Verb Id="OpenTerminalDev" Clsid="52065414-e077-47ec-a3ac-1cc5455e1b54" />
++                  <desktop5:Verb Id="OpenTerminalDev" Clsid="6C25E032-CBE8-4AF7-B61F-4928AE3AE14E" />
+                 </desktop5:ItemType>
+             </desktop4:FileExplorerContextMenus>
+         </desktop4:Extension>
+diff --git a/src/cascadia/CascadiaPackage/Package.appxmanifest b/src/cascadia/CascadiaPackage/Package.appxmanifest
+index 679f3b9a5..04cbdbb5e 100644
+--- a/src/cascadia/CascadiaPackage/Package.appxmanifest
++++ b/src/cascadia/CascadiaPackage/Package.appxmanifest
+@@ -18,14 +18,23 @@
+   xmlns:virtualization="http://schemas.microsoft.com/appx/manifest/virtualization/windows10"
+   IgnorableNamespaces="uap mp rescap uap3 uap17 desktop6 virtualization">
+ 
++  <!-- This fork ships under its own identity, and it has to. An MSIX signature
++       is only valid if the certificate subject matches Publisher exactly, so
++       upstream's "CN=Microsoft Corporation" is unsignable by anyone else; and
++       Name forms the package family, so keeping upstream's would replace a real
++       Windows Terminal install rather than sit beside one.
++       Every CLSID below is freshly generated for the same class of reason: COM
++       registrations are machine-global, so inheriting upstream's means fighting
++       the matching real Windows Terminal channel over the "Open in Terminal"
++       verb and default-terminal handoff. -->
+   <Identity
+-    Name="Microsoft.WindowsTerminal"
+-    Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
+-    Version="1.0.0.0" />
++    Name="WintermGhostty"
++    Publisher="CN=Darren Shepherd"
++    Version="0.1.0.0" />
+ 
+   <Properties>
+     <DisplayName>ms-resource:AppStoreName</DisplayName>
+-    <PublisherDisplayName>Microsoft Corporation</PublisherDisplayName>
++    <PublisherDisplayName>Darren Shepherd</PublisherDisplayName>
+     <Logo>Images\StoreLogo.png</Logo>
+     <!-- Older versions of Windows 10 respect this -->
+     <desktop6:RegistryWriteVirtualization>disabled</desktop6:RegistryWriteVirtualization>
+@@ -160,7 +169,7 @@
+       <Extensions>
+         <uap3:Extension Category="windows.appExecutionAlias" Executable="wt.exe" EntryPoint="Windows.FullTrustApplication">
+           <uap3:AppExecutionAlias>
+-            <desktop:ExecutionAlias Alias="wt.exe" />
++            <desktop:ExecutionAlias Alias="wtg.exe" />
+           </uap3:AppExecutionAlias>
+         </uap3:Extension>
+         <uap3:Extension Category="windows.appExtensionHost">
+@@ -181,7 +190,7 @@
+                 Description="Console host built from microsoft/terminal open source repository"
+                 PublicFolder="Public">
+                 <uap3:Properties>
+-                    <Clsid>{2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69}</Clsid>
++                    <Clsid>{5A9E0A31-1E92-4518-AD6A-DB71BBE3B62A}</Clsid>
+                 </uap3:Properties>
+             </uap3:AppExtension>
+         </uap3:Extension>
+@@ -192,38 +201,38 @@
+                 Description="Terminal host built from microsoft/terminal open source repository"
+                 PublicFolder="Public">
+                 <uap3:Properties>
+-                    <Clsid>{E12CFF52-A866-4C77-9A90-F570A7AA2C6B}</Clsid>
++                    <Clsid>{CAD463CF-32DE-4BD9-9500-D6C6546E9418}</Clsid>
+                 </uap3:Properties>
+             </uap3:AppExtension>
+         </uap3:Extension>
+         <com:Extension Category="windows.comInterface">
+             <com:ComInterface>
+-                <com:ProxyStub Id="3171DE52-6EFA-4AEF-8A9F-D02BD67E7A4F" DisplayName="OpenConsoleHandoffProxy" Path="OpenConsoleProxy.dll"/>
+-                <com:Interface Id="E686C757-9A35-4A1C-B3CE-0BCC8B5C69F4" ProxyStubClsid="3171DE52-6EFA-4AEF-8A9F-D02BD67E7A4F"/>
+-                <com:Interface Id="6F23DA90-15C5-4203-9DB0-64E73F1B1B00" ProxyStubClsid="3171DE52-6EFA-4AEF-8A9F-D02BD67E7A4F"/> <!-- ITerminalHandoff3 -->
+-                <com:Interface Id="746E6BC0-AB05-4E38-AB14-71E86763141F" ProxyStubClsid="3171DE52-6EFA-4AEF-8A9F-D02BD67E7A4F"/>
++                <com:ProxyStub Id="52F2F508-D5FA-4A75-82EB-3AA8924F394D" DisplayName="OpenConsoleHandoffProxy" Path="OpenConsoleProxy.dll"/>
++                <com:Interface Id="E686C757-9A35-4A1C-B3CE-0BCC8B5C69F4" ProxyStubClsid="52F2F508-D5FA-4A75-82EB-3AA8924F394D"/>
++                <com:Interface Id="6F23DA90-15C5-4203-9DB0-64E73F1B1B00" ProxyStubClsid="52F2F508-D5FA-4A75-82EB-3AA8924F394D"/> <!-- ITerminalHandoff3 -->
++                <com:Interface Id="746E6BC0-AB05-4E38-AB14-71E86763141F" ProxyStubClsid="52F2F508-D5FA-4A75-82EB-3AA8924F394D"/>
+             </com:ComInterface>
+         </com:Extension>
+         <com:Extension Category="windows.comServer">
+             <com:ComServer>
+                 <com:ExeServer DisplayName="OpenConsole" Executable="OpenConsole.exe">
+-                    <com:Class Id="2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69"/>
++                    <com:Class Id="5A9E0A31-1E92-4518-AD6A-DB71BBE3B62A"/>
+                 </com:ExeServer>
+                 <com:ExeServer DisplayName="WindowsTerminal" Executable="WindowsTerminal.exe">
+-                    <com:Class Id="E12CFF52-A866-4C77-9A90-F570A7AA2C6B"/>
++                    <com:Class Id="CAD463CF-32DE-4BD9-9500-D6C6546E9418"/>
+                 </com:ExeServer>
+                 <com:SurrogateServer DisplayName="WindowsTerminalShellExt">
+-                    <com:Class Id="9f156763-7844-4dc4-b2b1-901f640f5155" Path="WindowsTerminalShellExt.dll" ThreadingModel="STA"/>
++                    <com:Class Id="ACF8DCEF-D86B-435E-9750-D5D4E173FCA3" Path="WindowsTerminalShellExt.dll" ThreadingModel="STA"/>
+                 </com:SurrogateServer>
+             </com:ComServer>
+         </com:Extension>
+         <desktop4:Extension Category="windows.fileExplorerContextMenus">
+             <desktop4:FileExplorerContextMenus>
+                 <desktop5:ItemType Type="Directory">
+-                    <desktop5:Verb Id="OpenTerminalHere" Clsid="9f156763-7844-4dc4-b2b1-901f640f5155" />
++                    <desktop5:Verb Id="OpenTerminalHere" Clsid="ACF8DCEF-D86B-435E-9750-D5D4E173FCA3" />
+                 </desktop5:ItemType>
+                 <desktop5:ItemType Type="Directory\Background">
+-                  <desktop5:Verb Id="OpenTerminalHere" Clsid="9f156763-7844-4dc4-b2b1-901f640f5155" />
++                  <desktop5:Verb Id="OpenTerminalHere" Clsid="ACF8DCEF-D86B-435E-9750-D5D4E173FCA3" />
+                 </desktop5:ItemType>
+             </desktop4:FileExplorerContextMenus>
+         </desktop4:Extension>
+diff --git a/src/cascadia/CascadiaPackage/Resources/en-US/Resources.resw b/src/cascadia/CascadiaPackage/Resources/en-US/Resources.resw
+index 6d7fcea67..12bbc8684 100644
+--- a/src/cascadia/CascadiaPackage/Resources/en-US/Resources.resw
++++ b/src/cascadia/CascadiaPackage/Resources/en-US/Resources.resw
+@@ -118,11 +118,11 @@
+     <value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+   </resheader>
+   <data name="AppName" xml:space="preserve">
+-    <value>Terminal</value>
++    <value>Terminal (ghostty)</value>
+     <comment>{Locked=qps-ploc,qps-ploca,qps-plocm}</comment>
+   </data>
+   <data name="AppNameDev" xml:space="preserve">
+-    <value>Terminal (ghostty)</value>
++    <value>Terminal (ghostty) Dev</value>
+     <comment>{Locked} The dev build will never be seen in multiple languages</comment>
+   </data>
+   <data name="AppNameCan" xml:space="preserve">
+@@ -134,11 +134,11 @@
+     <comment>{Locked=qps-ploc,qps-ploca,qps-plocm}</comment>
+   </data>
+   <data name="AppStoreName" xml:space="preserve">
+-    <value>Windows Terminal</value>
++    <value>Windows Terminal (ghostty)</value>
+     <comment>{Locked=qps-ploc,qps-ploca,qps-plocm}</comment>
+   </data>
+   <data name="AppStoreNameDev" xml:space="preserve">
+-    <value>Windows Terminal (ghostty)</value>
++    <value>Windows Terminal (ghostty) Dev</value>
+     <comment>{Locked} The dev build will never be seen in multiple languages</comment>
+   </data>
+   <data name="AppStoreNameCan" xml:space="preserve">
+@@ -150,11 +150,11 @@
+     <comment>{Locked=qps-ploc,qps-ploca,qps-plocm}</comment>
+   </data>
+   <data name="AppShortName" xml:space="preserve">
+-    <value>Terminal</value>
++    <value>Terminal (ghostty)</value>
+     <comment>{Locked=qps-ploc,qps-ploca,qps-plocm}</comment>
+   </data>
+   <data name="AppShortNameDev" xml:space="preserve">
+-    <value>Terminal (ghostty)</value>
++    <value>Terminal (ghostty) Dev</value>
+     <comment>{Locked} The dev build will never be seen in multiple languages</comment>
+   </data>
+   <data name="AppShortNameCan" xml:space="preserve">
+@@ -166,10 +166,10 @@
+     <comment>{Locked=qps-ploc,qps-ploca,qps-plocm}</comment>
+   </data>
+   <data name="AppDescription" xml:space="preserve">
+-    <value>The New Windows Terminal</value>
++    <value>An unofficial Windows Terminal fork whose panes can render with ghostty's engine</value>
+   </data>
+   <data name="AppDescriptionDev" xml:space="preserve">
+-    <value>An unofficial Windows Terminal fork whose panes can render with ghostty's engine</value>
++    <value>An unofficial Windows Terminal fork whose panes can render with ghostty's engine (dev build)</value>
+     <comment>{Locked} The dev build will never be seen in multiple languages</comment>
+   </data>
+   <data name="AppDescriptionCan" xml:space="preserve">
+diff --git a/src/cascadia/ShellExtension/OpenTerminalHere.h b/src/cascadia/ShellExtension/OpenTerminalHere.h
+index af3546973..a1f157077 100644
+--- a/src/cascadia/ShellExtension/OpenTerminalHere.h
++++ b/src/cascadia/ShellExtension/OpenTerminalHere.h
+@@ -26,13 +26,13 @@ using namespace Microsoft::WRL;
+ 
+ struct
+ #if defined(WT_BRANDING_RELEASE)
+-    __declspec(uuid("9f156763-7844-4dc4-b2b1-901f640f5155"))
++    __declspec(uuid("ACF8DCEF-D86B-435E-9750-D5D4E173FCA3"))
+ #elif defined(WT_BRANDING_PREVIEW)
+     __declspec(uuid("02db545a-3e20-46de-83a5-1329b1e88b6b"))
+ #elif defined(WT_BRANDING_CANARY)
+     __declspec(uuid("6119575F-6918-4392-AF16-C2C627AF9416"))
+ #else // DEV
+-    __declspec(uuid("52065414-e077-47ec-a3ac-1cc5455e1b54"))
++    __declspec(uuid("6C25E032-CBE8-4AF7-B61F-4928AE3AE14E"))
+ #endif
+     OpenTerminalHere : public RuntimeClass<RuntimeClassFlags<ClassicCom | InhibitFtmBase>, IExplorerCommand, IObjectWithSite>
+ {
+diff --git a/src/cascadia/TerminalConnection/CTerminalHandoff.h b/src/cascadia/TerminalConnection/CTerminalHandoff.h
+index beb957b66..61c3a2611 100644
+--- a/src/cascadia/TerminalConnection/CTerminalHandoff.h
++++ b/src/cascadia/TerminalConnection/CTerminalHandoff.h
+@@ -19,13 +19,13 @@ Author(s):
+ #include "ITerminalHandoff.h"
+ 
+ #if defined(WT_BRANDING_RELEASE)
+-#define __CLSID_CTerminalHandoff "E12CFF52-A866-4C77-9A90-F570A7AA2C6B"
++#define __CLSID_CTerminalHandoff "CAD463CF-32DE-4BD9-9500-D6C6546E9418"
+ #elif defined(WT_BRANDING_PREVIEW)
+ #define __CLSID_CTerminalHandoff "86633F1F-6454-40EC-89CE-DA4EBA977EE2"
+ #elif defined(WT_BRANDING_CANARY)
+ #define __CLSID_CTerminalHandoff "1706609C-A4CE-4C0D-B7D2-C19BF66398A5"
+ #else
+-#define __CLSID_CTerminalHandoff "051F34EE-C1FD-4B19-AF75-9BA54648434C"
++#define __CLSID_CTerminalHandoff "FDA66AED-07EE-48FD-AA92-84CFCBAD2BA6"
+ #endif
+ 
+ using NewHandoffFunction = HRESULT (*)(HANDLE* in, HANDLE* out, HANDLE signal, HANDLE reference, HANDLE server, HANDLE client, const TERMINAL_STARTUP_INFO* startupInfo);
+diff --git a/src/cascadia/WinRTUtils/inc/WtExeUtils.h b/src/cascadia/WinRTUtils/inc/WtExeUtils.h
+index 6a8536380..e77a8db18 100644
+--- a/src/cascadia/WinRTUtils/inc/WtExeUtils.h
++++ b/src/cascadia/WinRTUtils/inc/WtExeUtils.h
+@@ -3,8 +3,8 @@
+ 
+ #pragma once
+ 
+-constexpr std::wstring_view WtExe{ L"wt.exe" };
+-constexpr std::wstring_view WtdExe{ L"wtg.exe" };
++constexpr std::wstring_view WtExe{ L"wtg.exe" };
++constexpr std::wstring_view WtdExe{ L"wtgd.exe" };
+ constexpr std::wstring_view WindowsTerminalExe{ L"WindowsTerminal.exe" };
+ constexpr std::wstring_view LocalAppDataAppsPath{ L"%LOCALAPPDATA%\\Microsoft\\WindowsApps\\" };
+ constexpr std::wstring_view ElevateShimExe{ L"elevate-shim.exe" };
+@@ -46,7 +46,7 @@ _TIL_INLINEPREFIX bool IsDevBuild()
+                 const auto package = winrt::Windows::ApplicationModel::Package::Current();
+                 const auto id = package.Id();
+                 const auto name = id.FullName();
+-                return til::starts_with(name, L"WintermGhostty");
++                return til::starts_with(name, L"WintermGhosttyDev");
+             }
+             CATCH_LOG();
+         }
+diff --git a/src/host/exe/CConsoleHandoff.h b/src/host/exe/CConsoleHandoff.h
+index 69d4676ff..91078378b 100644
+--- a/src/host/exe/CConsoleHandoff.h
++++ b/src/host/exe/CConsoleHandoff.h
+@@ -19,13 +19,13 @@ Author(s):
+ #include "IConsoleHandoff.h"
+ 
+ #if defined(WT_BRANDING_RELEASE)
+-#define __CLSID_CConsoleHandoff "2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69"
++#define __CLSID_CConsoleHandoff "5A9E0A31-1E92-4518-AD6A-DB71BBE3B62A"
+ #elif defined(WT_BRANDING_PREVIEW)
+ #define __CLSID_CConsoleHandoff "06EC847C-C0A5-46B8-92CB-7C92F6E35CD5"
+ #elif defined(WT_BRANDING_CANARY)
+ #define __CLSID_CConsoleHandoff "A854D02A-F2FE-44A5-BB24-D03F4CF830D4"
+ #else
+-#define __CLSID_CConsoleHandoff "1F9F2BF5-5BC3-4F17-B0E6-912413F1F451"
++#define __CLSID_CConsoleHandoff "92C4D240-B5D7-4947-8541-49288C449395"
+ #endif
+ 
+ using namespace Microsoft::WRL;
