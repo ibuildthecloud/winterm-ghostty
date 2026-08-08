@@ -19,8 +19,19 @@ is holding.
 
 **Status: Phase 6 of 9 complete; Phase 7 in progress.** Rendering, input, selection,
 clipboard, search, marks and IME all work, and a pane now drains its pty at roughly
-three quarters of cascadia's rate. Packaging and accessibility do not exist yet. See
-[Where it stands](#where-it-stands).
+three quarters of cascadia's rate. Accessibility does not exist yet — a ghostty pane
+cannot be read by a screen reader. See [Where it stands](#where-it-stands).
+
+## Install
+
+A signed, sideloadable x64 MSIX is published on the
+[releases page](https://github.com/ibuildthecloud/winterm-ghostty/releases/latest).
+It installs beside Windows Terminal rather than replacing it, and every profile keeps
+using the stock engine until you opt one in.
+
+**It is signed with a self-signed certificate**, so installing means deciding to trust
+that certificate — [docs/install.md](docs/install.md) explains exactly what that grants
+before it asks you to do it, along with the known defects worth knowing about first.
 
 ---
 

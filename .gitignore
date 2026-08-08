@@ -68,3 +68,9 @@ harness/pdbaddr/*.ilk
 
 # Harness run logs
 harness/*/*.err
+
+# Release artifacts. The .msix is 38 MB and is reproducible from the fork plus
+# scripts/package.ps1; it belongs on a GitHub release, not in git history.
+# The .cer is public, but it is regenerated with the package so it lives here too.
+/dist/
+*.pfx

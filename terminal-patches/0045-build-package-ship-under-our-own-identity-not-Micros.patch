@@ -1,0 +1,150 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Sat, 8 Aug 2026 10:43:03 -0700
+Subject: [PATCH] build(package): ship under our own identity, not Microsoft's
+
+Upstream's Dev manifest declares Name="WindowsTerminalDev" and
+Publisher="CN=Microsoft Corporation, ...". None of that can ship from a
+fork:
+
+  - An MSIX signature is only valid when the signing certificate's
+    subject matches Publisher exactly, so that string is unsignable by
+    anyone but Microsoft.
+  - The artifact would identify itself as Microsoft's.
+  - Name is what forms the package family, so installing it would
+    replace a real Windows Terminal Dev install rather than sit beside
+    one.
+
+So: Name=WintermGhostty, Publisher=CN=Darren Shepherd, Version 0.1.0.0,
+PublisherDisplayName and the four Dev branding strings renamed to say
+what this is - an unofficial fork whose panes can render with ghostty's
+engine.
+
+The execution alias becomes wtg.exe for the same reason in a different
+register: an alias is machine-global, and claiming wtd.exe would take it
+from a real Dev install. The Executable attribute stays wtd.exe because
+that names a file inside the package - src\cascadia\wt builds it under
+Dev branding - and the two need not match. MakeAppx enforces that: it
+rejects an Executable naming a file the package does not contain.
+
+WtExeUtils.h follows both halves. The alias file Windows creates is named
+after Alias, so WtdExe becomes wtg.exe, and IsDevBuild() matches on the
+new package name - otherwise the shell extension resolves a wt.exe path
+that does not exist and "Open in Terminal" silently breaks.
+---
+ .../CascadiaPackage/Package-Dev.appxmanifest  | 25 +++++++++++++++----
+ .../Resources/en-US/Resources.resw            |  8 +++---
+ src/cascadia/WinRTUtils/inc/WtExeUtils.h      |  4 +--
+ 3 files changed, 26 insertions(+), 11 deletions(-)
+
+diff --git a/src/cascadia/CascadiaPackage/Package-Dev.appxmanifest b/src/cascadia/CascadiaPackage/Package-Dev.appxmanifest
+index 4a3153076..add30f893 100644
+--- a/src/cascadia/CascadiaPackage/Package-Dev.appxmanifest
++++ b/src/cascadia/CascadiaPackage/Package-Dev.appxmanifest
+@@ -17,14 +17,21 @@
+   xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+   IgnorableNamespaces="uap mp rescap uap3 uap17 desktop6 virtualization">
+ 
++  <!-- This fork ships under its own identity, and it has to.
++       An MSIX signature is only valid if the certificate subject matches
++       Publisher exactly, so upstream's "CN=Microsoft Corporation" is
++       unsignable by anyone but Microsoft. Keeping it would also mean an
++       artifact that presents itself as Microsoft's, and installing it would
++       collide with a real Windows Terminal Dev install - same Name, same
++       package family, so one would replace the other. -->
+   <Identity
+-    Name="WindowsTerminalDev"
+-    Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
+-    Version="0.0.1.0" />
++    Name="WintermGhostty"
++    Publisher="CN=Darren Shepherd"
++    Version="0.1.0.0" />
+ 
+   <Properties>
+     <DisplayName>ms-resource:AppStoreNameDev</DisplayName>
+-    <PublisherDisplayName>A Lone Developer</PublisherDisplayName>
++    <PublisherDisplayName>Darren Shepherd</PublisherDisplayName>
+     <Logo>Images\StoreLogo.png</Logo>
+     <!-- Older versions of Windows 10 respect this -->
+     <desktop6:RegistryWriteVirtualization>disabled</desktop6:RegistryWriteVirtualization>
+@@ -69,9 +76,17 @@
+       </uap:VisualElements>
+ 
+       <Extensions>
++        <!-- Alias wtg, not wtd. An app execution alias is machine-global:
++             shipping "wtd.exe" would take the alias away from a real Windows
++             Terminal Dev install, and people running a Dev build are exactly
++             who would install this.
++             Executable stays wtd.exe - that names a file *inside* the package,
++             which is what src\cascadia\wt builds under Dev branding, and the
++             two do not have to match. The alias file Windows creates is named
++             after Alias, so WtExeUtils.h looks for wtg.exe. -->
+         <uap3:Extension Category="windows.appExecutionAlias" Executable="wtd.exe" EntryPoint="Windows.FullTrustApplication">
+           <uap3:AppExecutionAlias>
+-            <desktop:ExecutionAlias Alias="wtd.exe" />
++            <desktop:ExecutionAlias Alias="wtg.exe" />
+           </uap3:AppExecutionAlias>
+         </uap3:Extension>
+         <uap5:Extension Category="windows.startupTask">
+diff --git a/src/cascadia/CascadiaPackage/Resources/en-US/Resources.resw b/src/cascadia/CascadiaPackage/Resources/en-US/Resources.resw
+index 8b59650c1..6d7fcea67 100644
+--- a/src/cascadia/CascadiaPackage/Resources/en-US/Resources.resw
++++ b/src/cascadia/CascadiaPackage/Resources/en-US/Resources.resw
+@@ -122,7 +122,7 @@
+     <comment>{Locked=qps-ploc,qps-ploca,qps-plocm}</comment>
+   </data>
+   <data name="AppNameDev" xml:space="preserve">
+-    <value>Terminal Dev</value>
++    <value>Terminal (ghostty)</value>
+     <comment>{Locked} The dev build will never be seen in multiple languages</comment>
+   </data>
+   <data name="AppNameCan" xml:space="preserve">
+@@ -138,7 +138,7 @@
+     <comment>{Locked=qps-ploc,qps-ploca,qps-plocm}</comment>
+   </data>
+   <data name="AppStoreNameDev" xml:space="preserve">
+-    <value>Windows Terminal Dev</value>
++    <value>Windows Terminal (ghostty)</value>
+     <comment>{Locked} The dev build will never be seen in multiple languages</comment>
+   </data>
+   <data name="AppStoreNameCan" xml:space="preserve">
+@@ -154,7 +154,7 @@
+     <comment>{Locked=qps-ploc,qps-ploca,qps-plocm}</comment>
+   </data>
+   <data name="AppShortNameDev" xml:space="preserve">
+-    <value>Terminal Dev</value>
++    <value>Terminal (ghostty)</value>
+     <comment>{Locked} The dev build will never be seen in multiple languages</comment>
+   </data>
+   <data name="AppShortNameCan" xml:space="preserve">
+@@ -169,7 +169,7 @@
+     <value>The New Windows Terminal</value>
+   </data>
+   <data name="AppDescriptionDev" xml:space="preserve">
+-    <value>The Windows Terminal, but Unofficial</value>
++    <value>An unofficial Windows Terminal fork whose panes can render with ghostty's engine</value>
+     <comment>{Locked} The dev build will never be seen in multiple languages</comment>
+   </data>
+   <data name="AppDescriptionCan" xml:space="preserve">
+diff --git a/src/cascadia/WinRTUtils/inc/WtExeUtils.h b/src/cascadia/WinRTUtils/inc/WtExeUtils.h
+index 680177fdf..6a8536380 100644
+--- a/src/cascadia/WinRTUtils/inc/WtExeUtils.h
++++ b/src/cascadia/WinRTUtils/inc/WtExeUtils.h
+@@ -4,7 +4,7 @@
+ #pragma once
+ 
+ constexpr std::wstring_view WtExe{ L"wt.exe" };
+-constexpr std::wstring_view WtdExe{ L"wtd.exe" };
++constexpr std::wstring_view WtdExe{ L"wtg.exe" };
+ constexpr std::wstring_view WindowsTerminalExe{ L"WindowsTerminal.exe" };
+ constexpr std::wstring_view LocalAppDataAppsPath{ L"%LOCALAPPDATA%\\Microsoft\\WindowsApps\\" };
+ constexpr std::wstring_view ElevateShimExe{ L"elevate-shim.exe" };
+@@ -46,7 +46,7 @@ _TIL_INLINEPREFIX bool IsDevBuild()
+                 const auto package = winrt::Windows::ApplicationModel::Package::Current();
+                 const auto id = package.Id();
+                 const auto name = id.FullName();
+-                return til::starts_with(name, L"WindowsTerminalDev");
++                return til::starts_with(name, L"WintermGhostty");
+             }
+             CATCH_LOG();
+         }
