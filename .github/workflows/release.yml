@@ -130,7 +130,7 @@ jobs:
           # Release branding selects Package.appxmanifest and defines
           # WT_BRANDING_RELEASE, which picks the matching CLSID triple in C++.
           # Without it the build silently produces the Dev channel instead.
-          ./scripts/build-terminal.ps1 -Project package -Configuration Release /p:WindowsTerminalBranding=Release
+          ./scripts/build-terminal.ps1 -Project package -Configuration Release -Branding Release
 
       - name: Import the signing certificate
         if: env.HAVE_CERT == 'true'

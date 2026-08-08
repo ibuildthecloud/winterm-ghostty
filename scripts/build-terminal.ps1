@@ -48,6 +48,21 @@ param(
     [ValidateSet('x64', 'x86', 'ARM64')]
     [string] $Platform = 'x64',
 
+    # Which channel to build. This selects the appxmanifest AND the
+    # WT_BRANDING_* preprocessor token that picks the matching CLSID triple in
+    # C++, so it decides package identity, execution alias and COM
+    # registrations all at once - getting it wrong produces a package that
+    # looks right until it installs as the wrong channel.
+    #
+    # It is a real parameter rather than something passed through -Rest because
+    # PowerShell binds loose arguments to declared positional parameters first:
+    # a trailing "/p:WindowsTerminalBranding=Release" lands on -Platform and
+    # fails ValidateSet, which is exactly how the first CI run died.
+    #
+    # Empty means upstream's default, which is Dev.
+    [ValidateSet('', 'Dev', 'Release', 'Preview', 'Canary')]
+    [string] $Branding = '',
+
     [switch] $RestoreOnly,
 
     # Skip the NuGet restore (it is idempotent but not free).
@@ -152,6 +167,7 @@ $msbuildArgs = @(
     "/m:$MaxCpuCount"
     '/p:CL_MPCount=2'
 )
+if ($Branding) { $msbuildArgs += "/p:WindowsTerminalBranding=$Branding" }
 if ($Rest) { $msbuildArgs += $Rest }
 
 Write-Host "msbuild $projectPath ($Configuration|$Platform, /m:$MaxCpuCount)" -ForegroundColor Cyan
