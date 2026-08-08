@@ -41,7 +41,50 @@ selected by a temporary per-profile `"engine": "cascadia"`.
 **The criterion is not met: 51.0 against 41.4, about 10 ms and roughly 24%
 worse.** The gap at the best case is larger — 39.5 against 23.9.
 
-## Where the gap plausibly lives
+## Results — 2026-08-07, after capping the frame queue
+
+DXGI queues up to **three** frames ahead by default. Capping that at one is the
+single thing cascadia does for latency that we did not.
+
+| config | latency median | throughput median |
+|---|---|---|
+| baseline: 2 buffers, default queue | 51.0 ms | 30.9 MB/s |
+| 3 buffers + queue depth 1 | 46.1 ms | 26.5 MB/s |
+| **2 buffers + queue depth 1 (shipped)** | **45.9 ms** | **28.6 MB/s** |
+| cascadia | 41.4 ms | ~35 MB/s |
+
+**Latency 51.0 → 45.9 ms**, and the tail tightened more than the median moved
+(max 68.1 → 56.3). The gap to cascadia halves, 9.6 ms → 4.5 ms. Still not met.
+
+Two changes went in together at first — buffer count and queue depth — which is
+exactly the conflation this project keeps getting caught by, so they were
+separated. **The third buffer cost throughput and bought no latency**, which
+makes sense: with a queue depth of one it can never be in flight. Reverted.
+
+The throughput cost is 30.9 → 28.6 median, but those runs spread 27.9–31.6
+against a previous 30.9/30.9/30.9, so some of it is noise. It is not claimed as
+a clean 7% regression, and it is the trade to re-examine if throughput becomes
+the binding criterion.
+
+### The route cascadia uses is closed to us
+
+`AtlasEngine` caps the queue through the swap chain's frame-latency waitable
+object. On our creation path DXGI **records the flag and refuses the
+functionality**:
+
+- `GetDesc1` answers `Flags = 0x800` — the flag is on the swap chain.
+- `GetFrameLatencyWaitableObject` returns **null**.
+- `IDXGISwapChain2::SetMaximumFrameLatency` answers `DXGI_ERROR_INVALID_CALL`.
+
+`CreateSwapChainForHwnd` refuses it as well, so the standalone harness cannot
+reproduce any of this — the only place it appears is a packaged Windows
+Terminal, which has neither stdout nor stderr. That is why the device logs this
+through `OutputDebugString`.
+
+`IDXGIDevice1::SetMaximumFrameLatency(1)` governs the same queue, is accepted
+(`hr=0`), and is what ships.
+
+## Where the rest of the gap plausibly lives
 
 Not yet investigated, so this is a candidate rather than a finding — but a
 pointed one. Ten milliseconds is a little over half a frame at 60 Hz, and the

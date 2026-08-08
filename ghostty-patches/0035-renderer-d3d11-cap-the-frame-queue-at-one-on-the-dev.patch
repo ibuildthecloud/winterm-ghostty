@@ -1,0 +1,355 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Fri, 7 Aug 2026 18:29:27 -0700
+Subject: [PATCH] renderer/d3d11: cap the frame queue at one, on the device
+
+DXGI queues up to three frames ahead by default, which is up to three
+frames of input-to-photon latency. Cascadia caps it at one via the swap
+chain's frame-latency waitable object.
+
+That route is not available to us. DXGI *records* the waitable flag on a
+composition-surface-handle swap chain - GetDesc1 answers 0x800 - and then
+refuses the functionality: GetFrameLatencyWaitableObject returns null and
+IDXGISwapChain2::SetMaximumFrameLatency answers DXGI_ERROR_INVALID_CALL
+(0x887A0001). CreateSwapChainForHwnd refuses it too, so the harness cannot
+see this at all. Windows Terminal is the composition path, so this only
+shows up in a packaged app - hence the OutputDebugString diagnostic, which
+is the only channel a packaged app has.
+
+IDXGIDevice1::SetMaximumFrameLatency(1) governs the same queue and *is*
+accepted (hr=0). Measured, 20 rounds each, keystroke-to-pixel:
+
+    baseline (2 buffers, default queue)   median 51.0 ms   throughput 30.9
+    3 buffers + queue depth 1             median 46.1 ms   throughput 26.5
+    2 buffers + queue depth 1  (shipped)  median 45.9 ms   throughput 28.6
+
+Two changes went in together at first, which is the conflation this session
+has been avoiding, so they were separated: the third buffer cost throughput
+and bought no latency - it can never be in flight with a queue depth of one
+- and is reverted. Cascadia's latency median is 41.4 ms, so the gap halves
+from 9.6 ms to 4.5 ms.
+
+The throughput cost is 30.9 -> 28.6 median, but the runs spread 27.9-31.6
+against a previous 30.9/30.9/30.9, so part of that is noise and it is not
+claimed as a clean 7%.
+
+waitForFrame is kept and marked inert: one null check, and it turns itself
+on if DXGI ever supports the object here.
+
+zig build test passes.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/renderer/directx11/device.zig | 142 +++++++++++++++++++++++++++++-
+ src/renderer/directx11/dxgi.zig   |  45 +++++++++-
+ 2 files changed, 182 insertions(+), 5 deletions(-)
+
+diff --git a/src/renderer/directx11/device.zig b/src/renderer/directx11/device.zig
+index d04ff3354..0e9213c70 100644
+--- a/src/renderer/directx11/device.zig
++++ b/src/renderer/directx11/device.zig
+@@ -77,6 +77,8 @@ const swap_chain_format: dxgi.DXGI_FORMAT = .B8G8R8A8_UNORM;
+ 
+ const RECT = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
+ 
++extern "kernel32" fn OutputDebugStringA(lpOutputString: [*:0]const u8) callconv(.winapi) void;
++
+ extern "user32" fn GetClientRect(hWnd: *anyopaque, lpRect: *RECT) callconv(.winapi) i32;
+ 
+ pub const Device = struct {
+@@ -100,6 +102,16 @@ pub const Device = struct {
+     /// because the replacement swap chain needs a fresh handle.
+     surface_handle: ?std.os.windows.HANDLE,
+ 
++    /// Signalled when the swap chain will accept another frame. Waiting on it
++    /// before rendering is what keeps DXGI's queue one frame deep instead of
++    /// three. See waitForFrame.
++    frame_latency_handle: ?std.os.windows.HANDLE = null,
++
++    /// The waitable object is an *auto-reset* event: waiting on it twice
++    /// without a Present in between blocks until the timeout. So a wait is only
++    /// owed after a present, and this says whether one is.
++    frame_wait_owed: bool = false,
++
+     driver: DriverKind,
+     feature_level: d3d11.D3D_FEATURE_LEVEL,
+     width: u32,
+@@ -192,7 +204,22 @@ pub const Device = struct {
+                 .hwnd => .IGNORE,
+                 .composition => .PREMULTIPLIED,
+             },
+-            .Flags = 0,
++            // The waitable flag is what makes SetMaximumFrameLatency and
++            // GetFrameLatencyWaitableObject mean anything. Without it DXGI
++            // queues up to *three* frames ahead - three frames of
++            // input-to-photon latency - and there is no way to ask it not to.
++            //
++            // Composition only. CreateSwapChainForHwnd accepts the flag at
++            // creation and then answers DXGI_ERROR_INVALID_CALL (0x887A0001)
++            // to SetMaximumFrameLatency and null to
++            // GetFrameLatencyWaitableObject, so an hwnd swap chain silently
++            // keeps the default queue. Windows Terminal is composition; the
++            // standalone harness is hwnd and therefore unpaced, which is worth
++            // knowing before measuring latency in it.
++            .Flags = switch (target) {
++                .composition => dxgi.DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
++                .hwnd => 0,
++            },
+         };
+ 
+         var swap_chain: ?*dxgi.IDXGISwapChain1 = null;
+@@ -257,6 +284,7 @@ pub const Device = struct {
+             .height = height,
+         };
+         try self.createRenderTarget();
++        self.initFrameLatency();
+ 
+         log.info("D3D11 device ready: driver={t} feature_level={t} size={d}x{d}", .{
+             chosen, level, width, height,
+@@ -264,6 +292,105 @@ pub const Device = struct {
+         return self;
+     }
+ 
++    /// Device-init diagnostics that must survive a packaged app, which has no
++    /// stdout and no stderr. Once per device, so the cost is irrelevant.
++    fn dbg(comptime fmt: []const u8, args: anytype) void {
++        var buf: [200]u8 = undefined;
++        const line = std.fmt.bufPrintZ(&buf, "[ghostty-d3d11] " ++ fmt ++ "\n", args) catch return;
++        OutputDebugStringA(line.ptr);
++    }
++
++    /// Ask for a one-frame queue and take the waitable object.
++    ///
++    /// Non-fatal if either fails: the swap chain still presents, just with
++    /// DXGI's default queue depth, which is what we had before.
++    fn initFrameLatency(self: *Device) void {
++        switch (self.target) {
++            .composition => {},
++            // Unsupported here; see the Flags comment in init.
++            .hwnd => return,
++        }
++
++        // Both calls live on IDXGISwapChain2, which we hold as an
++        // IDXGISwapChain1 - the same QI applyCompositionScale does.
++        var sc2: ?*dxgi.IDXGISwapChain2 = null;
++        const hr = self.swap_chain.vtable.QueryInterface(
++            self.swap_chain,
++            &dxgi.IDXGISwapChain2.IID,
++            @ptrCast(&sc2),
++        );
++        if (com.FAILED(hr) or sc2 == null) {
++            log.warn("IDXGISwapChain2 unavailable; frames will not be paced", .{});
++            return;
++        }
++        defer _ = sc2.?.Release();
++
++        // Device-level first: on the composition-surface-handle path the
++        // swap-chain control is refused, but this one governs the same queue.
++        var dev_lat_hr: HRESULT = 0;
++        {
++            var dxgi_dev: ?*anyopaque = null;
++            if (com.SUCCEEDED(self.device.QueryInterface(&dxgi.IDXGIDevice.IID, &dxgi_dev)) and
++                dxgi_dev != null)
++            {
++                const dd: *dxgi.IDXGIDevice = @ptrCast(@alignCast(dxgi_dev.?));
++                defer _ = dd.Release();
++                dev_lat_hr = dd.SetMaximumFrameLatency(1);
++            }
++        }
++
++        const lat_hr = sc2.?.SetMaximumFrameLatency(1);
++        if (com.FAILED(lat_hr)) {
++            log.warn("SetMaximumFrameLatency(1) failed: hr=0x{x}; keeping the default queue", .{
++                @as(u32, @bitCast(lat_hr)),
++            });
++        }
++        self.frame_latency_handle = sc2.?.GetFrameLatencyWaitableObject();
++        if (self.frame_latency_handle == null) {
++            log.warn("no frame latency waitable object; frames will not be paced", .{});
++        }
++        var actual: dxgi.DXGI_SWAP_CHAIN_DESC1 = undefined;
++        const desc_flags: u32 = if (com.SUCCEEDED(sc2.?.GetDesc1(&actual))) actual.Flags else 0xFFFFFFFF;
++        dbg("frame latency: device_hr=0x{x} swapchain_hr=0x{x} waitable={s} desc.Flags=0x{x}", .{
++            @as(u32, @bitCast(dev_lat_hr)),
++            @as(u32, @bitCast(lat_hr)),
++            if (self.frame_latency_handle != null) "yes" else "NO",
++            desc_flags,
++        });
++        // Nothing has been presented yet, so nothing is owed.
++        self.frame_wait_owed = false;
++    }
++
++    /// Block until the swap chain will accept another frame.
++    ///
++    /// **Currently inert**, and deliberately kept. DXGI records the waitable
++    /// flag on a composition-surface-handle swap chain (GetDesc1 answers
++    /// 0x800) but refuses the functionality: GetFrameLatencyWaitableObject
++    /// returns null and IDXGISwapChain2::SetMaximumFrameLatency answers
++    /// DXGI_ERROR_INVALID_CALL. So `frame_latency_handle` is null on every path
++    /// we use and this returns immediately. The queue depth is set on the
++    /// *device* instead, which is accepted - see initFrameLatency.
++    ///
++    /// It stays because it costs one null check and turns itself on the day
++    /// DXGI supports the object here. Cascadia does the same wait in
++    /// AtlasEngine::_waitUntilCanRender, on an hwnd/composition swap chain
++    /// where it works.
++    ///
++    /// The object is an auto-reset event, so waiting twice without a present in
++    /// between blocks for the full timeout - hence frame_wait_owed. The timeout
++    /// is a safety net, not a cadence; hitting it means something is wrong and
++    /// says so rather than stalling the render thread indefinitely.
++    pub fn waitForFrame(self: *Device) void {
++        const handle = self.frame_latency_handle orelse return;
++        if (!self.frame_wait_owed) return;
++        self.frame_wait_owed = false;
++
++        const r = std.os.windows.kernel32.WaitForSingleObject(handle, 100);
++        if (r == std.os.windows.WAIT_TIMEOUT) {
++            log.warn("frame latency wait timed out", .{});
++        }
++    }
++
+     pub fn deinit(self: *Device) void {
+         self.releaseRenderTarget();
+         _ = self.swap_chain.Release();
+@@ -271,6 +398,7 @@ pub const Device = struct {
+         _ = self.device.Release();
+         // Close after the swap chain, which holds its own reference to the
+         // composition surface.
++        if (self.frame_latency_handle) |h| std.os.windows.CloseHandle(h);
+         if (self.surface_handle) |h| std.os.windows.CloseHandle(h);
+         self.* = undefined;
+     }
+@@ -413,12 +541,17 @@ pub const Device = struct {
+ 
+         self.releaseRenderTarget();
+ 
++        // The flags must match creation: passing 0 here would drop the
++        // waitable object and silently restore DXGI's 3-frame queue.
+         const hr = self.swap_chain.ResizeBuffers(
+             buffer_count,
+             width,
+             height,
+             swap_chain_format,
+-            0,
++            switch (self.target) {
++                .composition => dxgi.DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
++                .hwnd => 0,
++            },
+         );
+         if (com.FAILED(hr)) {
+             log.err("ResizeBuffers failed: hr=0x{x}", .{@as(u32, @bitCast(hr))});
+@@ -537,6 +670,11 @@ pub const Device = struct {
+     /// Present the back buffer. Returns true if the device was lost, which the
+     /// caller must handle by rebuilding (step 3 of ADR 0002's ladder).
+     pub fn present(self: *Device, vsync: bool) bool {
++        // A wait is owed from here until the next frame starts. See
++        // waitForFrame: the waitable object is auto-reset, so waiting without
++        // an intervening present blocks for the whole timeout.
++        self.frame_wait_owed = true;
++
+         const hr = self.swap_chain.Present(if (vsync) 1 else 0, 0);
+         if (hr == com.DXGI_ERROR_DEVICE_REMOVED or
+             hr == DXGI_ERROR_DEVICE_RESET)
+diff --git a/src/renderer/directx11/dxgi.zig b/src/renderer/directx11/dxgi.zig
+index bd8cb6365..87b855ac5 100644
+--- a/src/renderer/directx11/dxgi.zig
++++ b/src/renderer/directx11/dxgi.zig
+@@ -6,6 +6,7 @@
+ //! CreateSwapChainForComposition. CreateSwapChainForHwnd (and its
+ //! DXGI_SWAP_CHAIN_FULLSCREEN_DESC) are added here for the standalone harness
+ //! path, along with the sRGB and single-channel DXGI_FORMAT values.
++const std = @import("std");
+ const com = @import("com.zig");
+ const GUID = com.GUID;
+ const HRESULT = com.HRESULT;
+@@ -47,6 +48,11 @@ pub const DXGI_ALPHA_MODE = enum(u32) {
+ };
+ 
+ pub const DXGI_USAGE = u32;
++/// Lets the swap chain hand out a frame-latency waitable object, and makes
++/// IDXGISwapChain2::SetMaximumFrameLatency meaningful. Without it DXGI queues
++/// up to three frames ahead.
++pub const DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT: u32 = 0x0800;
++
+ pub const DXGI_USAGE_RENDER_TARGET_OUTPUT: DXGI_USAGE = 0x00000020;
+ 
+ // --- Structs ---
+@@ -291,7 +297,7 @@ pub const IDXGISwapChain2 = extern struct {
+         GetFrameStatistics: Reserved,
+         GetLastPresentCount: Reserved,
+         // IDXGISwapChain1 (slots 18-28)
+-        GetDesc1: Reserved,
++        GetDesc1: *const fn (*IDXGISwapChain2, *DXGI_SWAP_CHAIN_DESC1) callconv(.winapi) HRESULT,
+         GetFullscreenDesc: Reserved,
+         GetHwnd: Reserved,
+         GetCoreWindow: Reserved,
+@@ -305,9 +311,9 @@ pub const IDXGISwapChain2 = extern struct {
+         // IDXGISwapChain2 (slots 29-35)
+         SetSourceSize: Reserved,
+         GetSourceSize: Reserved,
+-        SetMaximumFrameLatency: Reserved,
++        SetMaximumFrameLatency: *const fn (*IDXGISwapChain2, u32) callconv(.winapi) HRESULT,
+         GetMaximumFrameLatency: Reserved,
+-        GetFrameLatencyWaitableObject: Reserved,
++        GetFrameLatencyWaitableObject: *const fn (*IDXGISwapChain2) callconv(.winapi) ?std.os.windows.HANDLE,
+         SetMatrixTransform: *const fn (*IDXGISwapChain2, *const DXGI_MATRIX_3X2_F) callconv(.winapi) HRESULT,
+         GetMatrixTransform: Reserved,
+     };
+@@ -320,10 +326,30 @@ pub const IDXGISwapChain2 = extern struct {
+         return self.vtable.GetBuffer(self, buffer, riid, surface);
+     }
+ 
++    /// What the swap chain actually was created with - DXGI can drop flags it
++    /// does not support on a given creation path rather than failing.
++    pub inline fn GetDesc1(self: *IDXGISwapChain2, out: *DXGI_SWAP_CHAIN_DESC1) HRESULT {
++        return self.vtable.GetDesc1(self, out);
++    }
++
+     pub inline fn SetMatrixTransform(self: *IDXGISwapChain2, matrix: *const DXGI_MATRIX_3X2_F) HRESULT {
+         return self.vtable.SetMatrixTransform(self, matrix);
+     }
+ 
++    /// How many frames DXGI may queue ahead. The default is 3, which is up to
++    /// three frames of input-to-photon latency; 1 renders just in time.
++    /// Only meaningful on a swap chain created with the waitable flag.
++    pub inline fn SetMaximumFrameLatency(self: *IDXGISwapChain2, max: u32) HRESULT {
++        return self.vtable.SetMaximumFrameLatency(self, max);
++    }
++
++    /// An auto-reset event signalled when the swap chain is ready for another
++    /// frame. Waiting on it before rendering is what keeps the queue shallow.
++    /// The caller owns the handle and must CloseHandle it.
++    pub inline fn GetFrameLatencyWaitableObject(self: *IDXGISwapChain2) ?std.os.windows.HANDLE {
++        return self.vtable.GetFrameLatencyWaitableObject(self);
++    }
++
+     pub inline fn Release(self: *IDXGISwapChain2) u32 {
+         return self.vtable.Release(self);
+     }
+@@ -358,12 +384,25 @@ pub const IDXGIDevice = extern struct {
+         CreateSurface: Reserved,
+         QueryResourceResidency: Reserved,
+         SetGPUThreadPriority: Reserved,
++        GetGPUThreadPriority: Reserved,
++        // IDXGIDevice1 (slots 12-13). Reachable through this vtable because
++        // ID3D11Device's DXGI interface really is an IDXGIDevice1 or better on
++        // every version we support; QI for the 1.0 IID still yields it.
++        SetMaximumFrameLatency: *const fn (*IDXGIDevice, u32) callconv(.winapi) HRESULT,
++        GetMaximumFrameLatency: Reserved,
+     };
+ 
+     pub inline fn GetAdapter(self: *IDXGIDevice, adapter: *?*IDXGIAdapter) HRESULT {
+         return self.vtable.GetAdapter(self, adapter);
+     }
+ 
++    /// Device-wide frame queue depth. The swap-chain-level control belongs to
++    /// IDXGISwapChain2 and is refused on a composition-surface-handle swap
++    /// chain; this one is not, and it governs the same queue.
++    pub inline fn SetMaximumFrameLatency(self: *IDXGIDevice, max: u32) HRESULT {
++        return self.vtable.SetMaximumFrameLatency(self, max);
++    }
++
+     pub inline fn Release(self: *IDXGIDevice) u32 {
+         return self.vtable.Release(self);
+     }
