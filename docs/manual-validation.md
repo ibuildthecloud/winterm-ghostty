@@ -69,6 +69,32 @@ to receive it, and it is what disguised this as a rendering quirk.
 Worth doing after any change to connection startup, surface sizing, or the
 `resize_pty` path.
 
+## 1c. Which rasterizer the pane got, and WARP
+
+Phase 7's third criterion is "usable over RDP (WARP) with no fallback dialogs",
+and until 2026-08-07 it had only ever been checked in `harness/hwnd-host` — a
+different presentation path from a pane, on a machine with a working GPU.
+
+The device now reports itself through `OutputDebugString`, which is the only
+channel a packaged app has. Capture it with a DebugView-style listener (there is
+a minimal one in the session scratchpad, `dbwin.ps1`) while opening a pane:
+
+```
+[ghostty-d3d11] device: driver=hardware feature_level=11_1 size=800x600
+```
+
+1. Open a ghostty pane. **Pass:** a `device:` line naming a driver.
+2. Relaunch with `GHOSTTY_D3D11_DRIVER=warp` in the launching shell's
+   environment. **Pass:** `driver=warp`, the pane renders identically — check
+   something non-trivial, colours and CJK and an image — and **no dialog
+   appears**.
+3. Over RDP, repeat 1. **Pass:** whichever driver it picks, the pane renders.
+
+**Status:** step 1 verified in a pane (`driver=hardware feature_level=11_1`).
+Steps 2 and 3 are **not** done — the session disconnected, and nothing that
+needs a window works on a detached session. Phase 3 verified forced WARP in the
+harness only, so the pane half of this criterion is still open.
+
 ## 2. Non-ASCII output
 
 Covered automatically for the harness (see below), but not for Windows

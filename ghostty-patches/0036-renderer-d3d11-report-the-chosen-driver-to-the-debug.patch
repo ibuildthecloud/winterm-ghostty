@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Fri, 7 Aug 2026 19:07:19 -0700
+Subject: [PATCH] renderer/d3d11: report the chosen driver to the debugger
+ channel too
+
+"Which rasterizer is this pane on" is a Phase 7 exit criterion (usable over
+RDP, on WARP, with no fallback dialogs) and it had only ever been checked in
+the standalone harness. A packaged Windows Terminal has no stdout and no
+stderr, so the existing log.info line is invisible exactly where the question
+matters.
+
+Confirmed in a pane: driver=hardware feature_level=11_1.
+
+zig build test passes.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/renderer/directx11/device.zig | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/renderer/directx11/device.zig b/src/renderer/directx11/device.zig
+index 0e9213c70..ed7224b33 100644
+--- a/src/renderer/directx11/device.zig
++++ b/src/renderer/directx11/device.zig
+@@ -289,6 +289,13 @@ pub const Device = struct {
+         log.info("D3D11 device ready: driver={t} feature_level={t} size={d}x{d}", .{
+             chosen, level, width, height,
+         });
++        // Also to the debugger channel: in a packaged Windows Terminal there is
++        // no stdout and no stderr, and "which rasterizer is this pane on" is a
++        // Phase 7 exit criterion that has only ever been checked in the
++        // standalone harness.
++        dbg("device: driver={t} feature_level={t} size={d}x{d}", .{
++            chosen, level, width, height,
++        });
+         return self;
+     }
+ 
