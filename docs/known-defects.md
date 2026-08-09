@@ -551,3 +551,102 @@ wrong move from reading `GhosttySettingsTranslator` alone.
 #### Workaround today
 
 Use a font without a `--` ligature. Consolas is confirmed clear.
+
+---
+
+### KD-07 — zooming in crashes the terminal (stack overflow in libghostty)
+
+**Reported** 2026-08-08 by the user, against the published v0.2.0 portable
+build: press `ctrl+=` to increase the font size and the window freezes, then
+dies. **This shipped.** It is the reason v0.2.0 was withdrawn.
+
+Windows Error Reporting names it exactly, and it is the same record every time:
+
+```
+Faulting module : ghostty-internal.dll
+Exception code  : 0xC00000FD      <- STATUS_STACK_OVERFLOW
+Fault offset    : 0x830077        <- constant across runs, for a given binary
+```
+
+Not a null dereference. A stack overflow is either unbounded recursion or one
+frame too large for the thread it runs on, and the constant offset means a
+specific function.
+
+#### It depends on the CPU the binary was compiled for
+
+The most useful measurement, and the one that redirected the whole
+investigation. Same layout, same Windows Terminal binaries, same settings; only
+`ghostty-internal.dll` swapped:
+
+| build | CPU target | result |
+|---|---|---|
+| CI ReleaseFast | native (GitHub runner) | **crash** |
+| local ReleaseFast | native (this machine) | survives 25 presses |
+| local ReleaseFast | **baseline** | **crash** |
+| local ReleaseSafe | native | survives |
+| local ReleaseSafe | baseline | survives 25 presses |
+
+The first row looked like "CI produces a bad binary". The third row killed that
+theory: a local build crashes too, as soon as it stops being compiled for *this
+machine's* CPU.
+
+**Cause of the divergence, and it is ours.** ghostty's build calls
+`b.standardTargetOptions()` (`src/build/Config.zig:77`) and we never passed
+`-Dtarget`/`-Dcpu`, so Zig resolved the **build machine's native CPU** every
+time — upstream's own comment beside it notes this returns a specific model
+rather than a generic one. Every artifact was tuned to whatever hardware
+produced it. The developer's machine happened to generate code that survives;
+everyone else's did not.
+
+Fixed in `scripts/build-ghostty.ps1`: `-Dtarget=x86_64-windows-msvc
+-Dcpu=baseline`. That does **not** fix the defect — it makes it reproducible on
+demand, and it stops the shipped artifact depending on who built it.
+
+#### What it is, and what it is not
+
+**Not unbounded recursion.** Recursion does not care about optimisation level,
+and ReleaseSafe never crashes while ReleaseFast does. That points at a frame too
+large rather than too many frames — ReleaseFast inlines far more aggressively,
+and inlining is how a modest function acquires an enormous frame.
+
+**It scales with glyph size.** The crash arrives at a zoom depth, not on a
+particular keystroke: 11 presses under one pane size, 2 under another, never
+under 12 in a third. Consistent with a stack allocation proportional to the
+rasterised glyph.
+
+#### Not yet known
+
+- **Which function.** ReleaseFast emits no PDB, so the offset cannot be
+  resolved, and the configurations that *do* have symbols (ReleaseSafe) are the
+  ones that do not crash. Building ReleaseFast with debug info retained, or
+  capturing a dump and walking the stack, would name it. That is the next step.
+- **Which thread, and its stack reserve.** If it is a libghostty-created thread
+  with a default reserve, raising it is a legitimate mitigation on its own.
+- **Whether upstream ghostty has this.** The build config is ours; the code with
+  the large frame is probably not.
+
+#### Mitigations, in order of preference
+
+1. Find the frame and move the buffer to the heap. Needs the function name.
+2. Raise the stack reserve of the offending thread. Needs the thread.
+3. **Ship ReleaseSafe.** Measured stable at baseline across every run here. Costs
+   performance, and Phase 7's throughput numbers were taken on ReleaseFast, so
+   they would need re-measuring. Available today if a release is needed before
+   the real fix.
+
+#### The process failure worth recording
+
+The pre-publish check was "does the artifact launch". It launched. The user hit
+this on their first real interaction with it.
+
+`scripts/smoke-release.ps1` now drives a built artifact the way a person does —
+type, zoom in 20, zoom out 20, split a pane — and fails on exit code. It caught
+this build on the 11th zoom. Two things about writing it are worth keeping:
+
+- A first version set only `engine: ghostty` and therefore came up on Windows
+  Terminal's default font and profile. It **passed** against a binary that had
+  crashed minutes earlier. A smoke test that exercises the safe path is worse
+  than no smoke test, because it certifies.
+- A first version zoomed 12 times, which survived a binary that dies on the
+  11th under a slightly different pane size. Depth had to go past where the
+  defect lives, not up to it.

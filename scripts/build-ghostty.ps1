@@ -17,8 +17,29 @@ param(
     [ValidateSet('Debug', 'ReleaseSafe', 'ReleaseFast', 'ReleaseSmall')]
     [string] $Optimize = 'Debug',
 
-    # Zig target triple; empty means the host.
-    [string] $Target = '',
+    # Zig target triple. Pinned, NOT the host, and that is the point.
+    #
+    # ghostty's build.zig calls b.standardTargetOptions(), so with no -Dtarget
+    # Zig resolves the *build machine's* native CPU - upstream's own comment
+    # beside it notes it returns something specific like `apple_a15` rather than
+    # a generic model. Every build was therefore tuned to whatever hardware
+    # produced it, which makes the artifact unreproducible across machines and
+    # can emit instructions a downloader's CPU does not have.
+    #
+    # It stopped being theoretical in v0.2.0: the CI-built libghostty crashed
+    # with STATUS_STACK_OVERFLOW on a font-size change, while a local build of
+    # the identical commit did not. Same source, same flags, different machine
+    # (KD-07).
+    [string] $Target = 'x86_64-windows-msvc',
+
+    # CPU feature baseline. `baseline` is the conservative x86_64 floor - it
+    # runs anywhere, which is what a public download has to do.
+    #
+    # Raising this to x86_64_v2/v3 would buy codegen at the cost of excluding
+    # older machines. Do not raise it without re-running the Phase 7 throughput
+    # measurements: those numbers were taken on native-CPU builds and do not
+    # transfer.
+    [string] $Cpu = 'baseline',
 
     # Run `zig build test` instead of building the library.
     [switch] $Test,
@@ -43,6 +64,7 @@ $zigArgs = @('build') + @(if ($Test) { 'test' })
 $zigArgs += "-Doptimize=$Optimize"
 if (-not $Test) { $zigArgs += '-Dapp-runtime=none' }
 if ($Target)    { $zigArgs += "-Dtarget=$Target" }
+if ($Cpu)       { $zigArgs += "-Dcpu=$Cpu" }
 if ($Rest)      { $zigArgs += $Rest }
 
 Push-Location $GhosttyRoot
