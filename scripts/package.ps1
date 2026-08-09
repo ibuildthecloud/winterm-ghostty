@@ -174,9 +174,13 @@ if ($dep) { Write-Host "  framework dependency available at $($dep.FullName) (no
 
 # --- Checksums ----------------------------------------------------------------
 $sums = Join-Path $DistDir 'SHA256SUMS.txt'
-Get-ChildItem $DistDir -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } |
-    ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name } |
-    Set-Content -Path $sums -Encoding ascii
+# LF, not CRLF. Set-Content writes CRLF, and `sha256sum -c` then treats the
+# trailing  as part of the filename and reports "could not be read" for a file
+# that is present and correct - a checksum that cries wolf is worse than none,
+# because the reflex it teaches is to ignore it.
+$lines = Get-ChildItem $DistDir -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } |
+    ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name }
+[IO.File]::WriteAllText($sums, ($lines -join "`n") + "`n", (New-Object Text.UTF8Encoding $false))
 
 Write-Host ''
 Write-Host "dist/" -ForegroundColor Green

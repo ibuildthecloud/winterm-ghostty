@@ -120,6 +120,10 @@ public static class Smoke {
                                  a[0].ki.dwFlags=UNICODE_FLAG|KEYUP; SendInput(1,a,Marshal.SizeOf(typeof(INPUT))); }
   public static void Enter(){ K(0x0D,0x1C,0); K(0x0D,0x1C,KEYUP); }
   public static void CtrlKey(ushort vk, ushort sc){ K(0x11,0x1D,0); K(vk,sc,0); K(vk,sc,KEYUP); K(0x11,0x1D,KEYUP); }
+  // A synthetic ALT tap releases Windows' foreground lock, which otherwise
+  // refuses SetForegroundWindow while someone is using the machine. Without it
+  // this gate can only run on an idle desktop.
+  public static void AltTap(){ K(0x12,0x38,0); K(0x12,0x38,KEYUP); }
   public static void ZoomIn(){ CtrlKey(0xBB,0x0D); }   // ctrl + '='
   public static void ZoomOut(){ CtrlKey(0xBD,0x0C); }  // ctrl + '-'
   // ctrl+shift+d : split pane
@@ -235,15 +239,33 @@ if ($dbwin.Started) {
     Write-Host ("  ok  engine is ghostty ({0} trace lines from pid {1})" -f $mine.Count, $p.Id) -ForegroundColor DarkGray
 }
 
-$hwnd = (Get-Process -Id $p.Id).MainWindowHandle
+# Wait for a window to exist before trying to focus it. MainWindowHandle is 0
+# until the window is created, and reading it once - immediately - yields 0 on a
+# cold layout, after which every focus attempt compares against 0 and "fails"
+# for a reason that has nothing to do with the build.
+$hwnd = [IntPtr]::Zero
+for ($i = 0; $i -lt 40; $i++) {
+    $proc = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
+    if (-not $proc) { break }
+    $proc.Refresh()
+    if ($proc.MainWindowHandle -ne [IntPtr]::Zero) { $hwnd = $proc.MainWindowHandle; break }
+    Start-Sleep -Milliseconds 500
+}
+if ($hwnd -eq [IntPtr]::Zero) {
+    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+    throw 'SMOKE FAILED: the process never created a main window'
+}
 [void][Smoke]::ShowWindow($hwnd, 9)
-for ($i = 0; $i -lt 12 -and [Smoke]::GetForegroundWindow() -ne $hwnd; $i++) {
+# Patient on purpose: taking the foreground competes with whoever is using
+# the machine, and losing that race is not a product failure. 30 x 500ms.
+for ($i = 0; $i -lt 30 -and [Smoke]::GetForegroundWindow() -ne $hwnd; $i++) {
     $o = [uint32]0
     $ft = [Smoke]::GetWindowThreadProcessId([Smoke]::GetForegroundWindow(), [ref]$o)
     [void][Smoke]::AttachThreadInput($ft, [Smoke]::GetCurrentThreadId(), $true)
+    [Smoke]::AltTap()
     [void][Smoke]::BringWindowToTop($hwnd); [void][Smoke]::SetForegroundWindow($hwnd)
     [void][Smoke]::AttachThreadInput($ft, [Smoke]::GetCurrentThreadId(), $false)
-    Start-Sleep -Milliseconds 300
+    Start-Sleep -Milliseconds 500
 }
 if ([Smoke]::GetForegroundWindow() -ne $hwnd) { Stop-Process -Id $p.Id -Force; throw 'SMOKE FAILED: could not focus the window' }
 Start-Sleep -Milliseconds 800

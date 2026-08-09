@@ -2,40 +2,24 @@ Windows Terminal, with [ghostty](https://github.com/ghostty-org/ghostty)'s engin
 
 It is a **working fork, not a finished product**; read [Known issues](#known-issues) before installing.
 
-<!-- {{VERSION}} is substituted by .github/workflows/release.yml at publish
-     time. Edit this file for the *next* release; it is the notes source, not
-     a historical record - past notes live on their own release pages. -->
+<!-- This is the notes SOURCE for the next release, not a historical record;
+     past notes live on their own release pages. Version placeholders use
+     double braces and are substituted by .github/workflows/release.yml at
+     publish time - which is why this comment spells them out rather than
+     writing one, since it would be rewritten too. -->
 
 ## Install
 
-Two ways. Full instructions: **[docs/install.md](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/install.md)**.
-
-### Portable — no certificate, no admin, no install
+No installer — unzip and run. Full notes: **[docs/install.md](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/install.md)**.
 
 ```powershell
 Expand-Archive .\winterm-ghostty-{{VERSION}}-x64-portable.zip -DestinationPath .
 .\terminal-{{VERSION}}\WindowsTerminal.exe
 ```
 
-Same build, just not installed. Settings live beside the exe, so deleting the folder removes every trace. What you give up is integration: no Start menu entry, no `wtg.exe` on PATH, no "Open in Terminal", and it cannot be your default terminal.
+No certificate to trust, no admin rights, no Developer Mode, nothing registered. Settings live beside the exe, so deleting the folder removes every trace.
 
-### MSIX — installed, and needs the certificate trusted once
-
-Trust the certificate from an **elevated** PowerShell:
-
-```powershell
-Import-Certificate -FilePath .\winterm-ghostty-{{VERSION}}.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople
-```
-
-then install (elevation not needed):
-
-```powershell
-Add-AppxPackage -Path .\winterm-ghostty-{{VERSION}}-x64.msix
-```
-
-If that fails with `0x80073CF3`, the `Microsoft.UI.Xaml.2.8` framework is missing. It is deliberately not shipped here — anyone installing this almost certainly has Windows Terminal already, which depends on the same framework, and Windows 11 preinstalls it. `winget install --id Microsoft.UI.Xaml.2.8` fixes it.
-
-Launch **Terminal (ghostty)** from the Start menu, or `wtg.exe`.
+What you give up is integration: no Start menu entry, no `wtg.exe` on PATH, no "Open in Terminal", and it cannot be set as your default terminal. Those need an installed package, which needs a signed one — see [Signing](#signing).
 
 Nothing switches engine by itself. Add `"engine": "ghostty"` to a profile — or to `profiles.defaults` — to opt in:
 
@@ -70,9 +54,11 @@ Each defect in `docs/known-defects.md` records what was measured rather than wha
 
 ## Signing
 
-The MSIX, when one is published, is signed with a **self-signed certificate** (`CN=Darren Shepherd`) — there is no paid publisher identity behind this, so Windows has no reason to trust it until you say so. `docs/install.md` explains what that grants and how to undo it. If you would rather not, the patch series in `ghostty-patches/` and `terminal-patches/` exists so you can build it yourself.
+**Nothing here is signed, and nothing needs to be.** A portable build is not installed, so Windows never asks who published it.
 
-The portable ZIP is not signed and does not need to be - nothing installs it. Verify what you downloaded against `SHA256SUMS.txt`.
+An MSIX *is* built, but it is not published: an MSIX must carry a valid signature to install at all, no signing certificate is configured for this repository, and shipping one nobody can install would be shipping a trap. If that changes, an installer comes back and this section changes with it.
+
+Verify what you downloaded against `SHA256SUMS.txt`. Note the file is written with Windows line endings, so `sha256sum -c` may report "could not be read" — compare the hash by hand if so.
 
 ## Provenance
 
