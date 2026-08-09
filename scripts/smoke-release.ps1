@@ -53,6 +53,16 @@ if (-not $Layout) {
 $exe = Join-Path $Layout 'WindowsTerminal.exe'
 if (-not (Test-Path $exe)) { throw "WindowsTerminal.exe not found in $Layout" }
 
+# A disconnected session has no interactive desktop. SetForegroundWindow cannot
+# succeed there, and DWM stops compositing so captures come back blank - but the
+# symptom is "could not focus the window", which reads as a product failure and
+# has sent this investigation the wrong way twice. Check first and say so.
+$current = @(qwinsta 2>$null | Where-Object { $_ -match '^\s*>' })
+if ($current.Count -gt 0 -and $current[0] -notmatch 'Active') {
+    throw ("SMOKE SKIPPED: this session is not connected - '{0}'. " -f $current[0].Trim()) +
+          'The gate drives a real window, so it needs an interactive desktop. Reconnect and re-run; nothing is wrong with the build.'
+}
+
 # Downloaded artifacts carry Mark-of-the-Web, which puts a security prompt in
 # front of every launch and would hang an unattended run.
 Get-ChildItem $Layout -Recurse -File | Unblock-File
