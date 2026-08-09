@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Sat, 8 Aug 2026 18:46:53 -0700
+Subject: [PATCH] fix(build): reserve 16 MB of stack; KD-07
+
+v0.2.0 shipped a build that died with STATUS_STACK_OVERFLOW inside
+libghostty on a font-size change. Its release is withdrawn.
+
+WindowsTerminal.exe linked with MSVC's default 1 MB reserve. Zig-built
+code assumes Zig's 16 MiB, and a DLL has no stack of its own - its PE
+SizeOfStackReserve is ignored - so a synchronous call from a WT-owned
+thread into libghostty runs on that thread's stack.
+
+The fourth instance of PLAN.md's 2026-08-04 note, after ghostty_init,
+the first WT launch, and ghostty_surface_preedit. Those three were each
+fixed by wrapping the one call in RunWithEngineStack. That is opt-in, and
+forgetting it crashes on someone else's machine, so this replaces the
+rule with a property of the binary.
+
+Measured, holding everything else constant:
+
+  1 MB  + stock              crash at zoom 11
+  1 MB  + set_size wrapped   crash at zoom 12-13
+  16 MB + wrapped            passes
+  16 MB + stock              passes
+
+The second line is why this is a linker setting and not another wrapper:
+wrapping the most plausible call site did not fix it, and the path that
+actually overflows is still unidentified. The last line shows the wrapper
+is redundant once the reserve is raised, so it was reverted rather than
+kept for luck.
+
+Cost: this does not upstream. microsoft/terminal has no reason to raise
+its stack for our engine.
+---
+ .../WindowsTerminal/WindowsTerminal.vcxproj   | 26 +++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/src/cascadia/WindowsTerminal/WindowsTerminal.vcxproj b/src/cascadia/WindowsTerminal/WindowsTerminal.vcxproj
+index 5135d643f..6f6de9a0e 100644
+--- a/src/cascadia/WindowsTerminal/WindowsTerminal.vcxproj
++++ b/src/cascadia/WindowsTerminal/WindowsTerminal.vcxproj
+@@ -132,6 +132,32 @@
+   <ItemDefinitionGroup>
+     <Link>
+       <GenerateWindowsMetadata>false</GenerateWindowsMetadata>
++      <!-- 16 MB stack reserve, because this fork loads libghostty.
++           Zig-built code assumes Zig's 16 MiB default; MSVC's 1 MB is the
++           outlier, and any synchronous call from a WT-owned thread into
++           libghostty runs on the caller's stack - a DLL has no stack of its
++           own, and its PE header's SizeOfStackReserve is ignored.
++
++           Reserve is address space, not commit: SizeOfStackCommit stays 4 KB
++           and pages are committed on demand, so this costs essentially no
++           memory. Measured at ~70 threads in a running pane, 70 x 16 MB is
++           reserved VA against x64's 128 TB.
++
++           This replaces a rule with a fact. GhosttyEngine::RunWithEngineStack
++           hops onto a big-stack thread per call, which works but is opt-in, and
++           forgetting it produces a crash that only appears on some machines -
++           four times now: ghostty_init (Phase 0), the first WT launch
++           (Phase 5), ghostty_surface_preedit (Phase 6), and KD-07, which
++           shipped in v0.2.0 and crashed on a font-size change.
++
++           KD-07 is also why this is here rather than another wrapper: wrapping
++           the most plausible call site (ghostty_surface_set_size) was measured
++           NOT to fix it, while this does - verified with the gate in
++           scripts\smoke-release.ps1 against the exact build that crashed.
++
++           The cost is upstreamability: microsoft/terminal has no reason to
++           raise its stack for our engine, so this patch does not travel. -->
++      <StackReserveSize>16777216</StackReserveSize>
+     </Link>
+   </ItemDefinitionGroup>
+ 

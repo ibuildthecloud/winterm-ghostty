@@ -554,99 +554,88 @@ Use a font without a `--` ligature. Consolas is confirmed clear.
 
 ---
 
-### KD-07 — zooming in crashes the terminal (stack overflow in libghostty)
+### KD-07 — zooming in crashes the terminal — **fixed 2026-08-08**
 
-**Reported** 2026-08-08 by the user, against the published v0.2.0 portable
-build: press `ctrl+=` to increase the font size and the window freezes, then
-dies. **This shipped.** It is the reason v0.2.0 was withdrawn.
-
-Windows Error Reporting names it exactly, and it is the same record every time:
+**Reported** by the user against the published v0.2.0 portable build: press
+`ctrl+=` and the window freezes, then dies. **This shipped.** v0.2.0's release
+was withdrawn (the tag is kept).
 
 ```
 Faulting module : ghostty-internal.dll
 Exception code  : 0xC00000FD      <- STATUS_STACK_OVERFLOW
-Fault offset    : 0x830077        <- constant across runs, for a given binary
 ```
 
-Not a null dereference. A stack overflow is either unbounded recursion or one
-frame too large for the thread it runs on, and the constant offset means a
-specific function.
+#### Cause
 
-#### It depends on the CPU the binary was compiled for
+`WindowsTerminal.exe` linked with MSVC's default **1 MB** stack reserve.
+Zig-built code assumes Zig's **16 MiB**, and a DLL has no stack of its own - its
+PE `SizeOfStackReserve` is ignored, so a synchronous call from a WT-owned thread
+into libghostty runs on *that thread's* stack.
 
-The most useful measurement, and the one that redirected the whole
-investigation. Same layout, same Windows Terminal binaries, same settings; only
-`ghostty-internal.dll` swapped:
+**Fixed** by reserving 16 MB in `WindowsTerminal.vcxproj`. Reserve is address
+space; commit stays 4 KB and grows on demand, so it costs essentially no memory.
 
-| build | CPU target | result |
+This is the **fourth** instance of PLAN.md's 2026-08-04 note - after
+`ghostty_init`, the first WT launch, and `ghostty_surface_preedit`. The first
+three were each fixed by wrapping that one call in
+`GhosttyEngine::RunWithEngineStack`. That approach is opt-in, and the failure
+mode of forgetting is a crash on someone else's machine, so the fix this time
+replaces the rule with a property of the binary.
+
+#### What the measurements actually showed
+
+| exe stack | control DLL | result |
 |---|---|---|
-| CI ReleaseFast | native (GitHub runner) | **crash** |
-| local ReleaseFast | native (this machine) | survives 25 presses |
-| local ReleaseFast | **baseline** | **crash** |
-| local ReleaseSafe | native | survives |
-| local ReleaseSafe | baseline | survives 25 presses |
+| 1 MB | stock | crash, zoom 11 |
+| 1 MB | `ghostty_surface_set_size` wrapped in `RunWithEngineStack` | crash, zoom 12-13 |
+| **16 MB** | wrapped | **passes** (20 zoom in, 20 out, split) |
+| **16 MB** | **stock** | **passes** |
 
-The first row looked like "CI produces a bad binary". The third row killed that
-theory: a local build crashes too, as soon as it stops being compiled for *this
-machine's* CPU.
+The second row is the useful one: **wrapping the most plausible call site did
+not fix it.** The crash moved two presses later and stayed. The overflowing path
+was never identified, and that is precisely the argument against hunting call
+sites - the audit found `_pushSize`, the audit was wrong, and the real path is
+still unknown. The last two rows show the wrapper is redundant once the reserve
+is raised, so it was reverted.
 
-**Cause of the divergence, and it is ours.** ghostty's build calls
-`b.standardTargetOptions()` (`src/build/Config.zig:77`) and we never passed
-`-Dtarget`/`-Dcpu`, so Zig resolved the **build machine's native CPU** every
-time — upstream's own comment beside it notes this returns a specific model
-rather than a generic one. Every artifact was tuned to whatever hardware
-produced it. The developer's machine happened to generate code that survives;
-everyone else's did not.
+#### Cost
 
-Fixed in `scripts/build-ghostty.ps1`: `-Dtarget=x86_64-windows-msvc
--Dcpu=baseline`. That does **not** fix the defect — it makes it reproducible on
-demand, and it stops the shipped artifact depending on who built it.
+Upstreamability. `microsoft/terminal` has no reason to raise its exe's stack for
+this engine, so this patch does not travel. Staying at 1 MB would mean finding
+and wrapping every deep call - the attempt above is evidence of how that goes.
 
-#### What it is, and what it is not
+#### Wrong turns worth keeping
 
-**Not unbounded recursion.** Recursion does not care about optimisation level,
-and ReleaseSafe never crashes while ReleaseFast does. That points at a frame too
-large rather than too many frames — ReleaseFast inlines far more aggressively,
-and inlining is how a modest function acquires an enormous frame.
+**A CPU-target theory that was well-supported and wrong.** The CI build crashed
+where a local build of the same commit did not, and a local build pinned to
+`-Dcpu=baseline` crashed too - which looked like proof that codegen decided it.
+It did not: those "surviving" runs were **cascadia panes**, so they proved
+nothing. The CPU pin (`-Dtarget=x86_64-windows-msvc -Dcpu=baseline`, now in
+`build-ghostty.ps1`) is still right - an artifact should not depend on who built
+it - but it is **not** the fix for this, and was briefly recorded as if it were.
 
-**It scales with glyph size.** The crash arrives at a zoom depth, not on a
-particular keystroke: 11 presses under one pane size, 2 under another, never
-under 12 in a third. Consistent with a stack allocation proportional to the
-rasterised glyph.
+**A smoke gate that certified the wrong engine.** Three consecutive "passes"
+were cascadia:
 
-#### Not yet known
+- Setting only `profiles.defaults.engine` did **not** produce a ghostty pane;
+  the gate now writes an explicit profile and points `defaultProfile` at it.
+- `GhosttyControlCore::AdjustFontSize` is a **no-op**, so a visibly zooming pane
+  is *evidence of cascadia* - and the screenshots showed exactly that, unread.
+- The first engine assertion listened on DBWIN but discarded the PID in the
+  first four bytes of the buffer. DBWIN is machine-global, so it was proving the
+  engine using traces from the developer's *other* terminal.
 
-- **Which function.** ReleaseFast emits no PDB, so the offset cannot be
-  resolved, and the configurations that *do* have symbols (ReleaseSafe) are the
-  ones that do not crash. Building ReleaseFast with debug info retained, or
-  capturing a dump and walking the stack, would name it. That is the next step.
-- **Which thread, and its stack reserve.** If it is a libghostty-created thread
-  with a default reserve, raising it is a legitimate mitigation on its own.
-- **Whether upstream ghostty has this.** The build config is ours; the code with
-  the large frame is probably not.
+`scripts/smoke-release.ps1` now asserts a `[ghostty]` trace **from the process
+under test**, always, and fails otherwise. The user called this one before the
+evidence did.
 
-#### Mitigations, in order of preference
+#### Still unknown
 
-1. Find the frame and move the buffer to the heap. Needs the function name.
-2. Raise the stack reserve of the offending thread. Needs the thread.
-3. **Ship ReleaseSafe.** Measured stable at baseline across every run here. Costs
-   performance, and Phase 7's throughput numbers were taken on ReleaseFast, so
-   they would need re-measuring. Available today if a release is needed before
-   the real fix.
-
-#### The process failure worth recording
-
-The pre-publish check was "does the artifact launch". It launched. The user hit
-this on their first real interaction with it.
-
-`scripts/smoke-release.ps1` now drives a built artifact the way a person does —
-type, zoom in 20, zoom out 20, split a pane — and fails on exit code. It caught
-this build on the 11th zoom. Two things about writing it are worth keeping:
-
-- A first version set only `engine: ghostty` and therefore came up on Windows
-  Terminal's default font and profile. It **passed** against a binary that had
-  crashed minutes earlier. A smoke test that exercises the safe path is worse
-  than no smoke test, because it certifies.
-- A first version zoomed 12 times, which survived a binary that dies on the
-  11th under a slightly different pane size. Depth had to go past where the
-  defect lives, not up to it.
+- **Which call overflows.** Raising the reserve fixed it without identifying it,
+  and `ghostty_surface_set_size` is ruled out. A debugger-quality stack would
+  settle it; ReleaseFast emits no PDB, and the builds that carry symbols do not
+  crash.
+- **Whether `ctrl+=` does anything at all on a ghostty pane.** `AdjustFontSize`
+  is empty, and the engine traced no `cellSize` change across a zoom. The pane
+  no longer dies; that is not the same as the feature working, and it is not
+  claimed anywhere that it does.
