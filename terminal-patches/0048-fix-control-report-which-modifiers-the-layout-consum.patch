@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Sat, 8 Aug 2026 21:33:53 -0700
+Subject: [PATCH] fix(control): report which modifiers the layout consumed
+
+Typing `?` into an application that enables the kitty keyboard protocol
+produced `/`. Reported from use; every other application was fine, which
+is what made it look like the application's bug.
+
+consumed_mods was hardcoded to GHOSTTY_MODS_NONE. ghostty computes
+effectiveMods() = mods.unset(consumed_mods) and, on the kitty path, only
+sends the text directly when that comes out empty:
+
+    // Send plain-text non-modified text directly to the terminal.
+    if (event.utf8.len > 0 and binding_mods.empty() and ...
+
+Shift is genuinely consumed by the layout when producing `?` - the
+character already accounts for it. Claiming otherwise made `?` look like
+shift+<something>, so that branch was skipped and the key was encoded as
+CSI 47;2u: the UNSHIFTED codepoint 47, which is `/`, plus a shift
+modifier. An application that reads the base key prints `/`.
+
+Legacy applications never saw it because that path writes the UTF-8
+as-is. Only a client that turns the protocol on reaches the encoder that
+consults consumed_mods, which is why this presented as one misbehaving
+application rather than a defect here.
+
+The fix asks the layout instead of assuming a US keyboard: if removing a
+modifier changes the text the key produces, that modifier was consumed.
+Shift covers `?`; ctrl+alt covers AltGr, which on a German layout is what
+turns `q` into `@`.
+
+Confirmed fixed by the reporter against the application that showed it.
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 46 ++++++++++++++++++-
+ 1 file changed, 45 insertions(+), 1 deletion(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 16b7edaaf..0718be156 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -742,7 +742,8 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         if (modifiers.IsCtrlPressed()) { mods = static_cast<ghostty_input_mods_e>(mods | GHOSTTY_MODS_CTRL); }
+         if (modifiers.IsAltPressed()) { mods = static_cast<ghostty_input_mods_e>(mods | GHOSTTY_MODS_ALT); }
+         ev.mods = mods;
+-        ev.consumed_mods = GHOSTTY_MODS_NONE;
++        // consumed_mods is set below, once the text is known - it cannot be
++        // decided before we have seen what the layout produced.
+ 
+         // The text has to travel with the key. TermControl treats a handled
+         // key as "the terminal translated it" and suppresses the
+@@ -761,6 +762,49 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             // binding written against `c`.
+             unshifted = GhosttyKeyTextFor(0, vkey, scanCode);
+         }
++        // Which modifiers were *consumed* to produce that text, which is not
++        // the same question as which were held. Shift held while typing `?` is
++        // consumed by the layout: the character already accounts for it.
++        //
++        // This was hardcoded to NONE, and only the kitty keyboard protocol
++        // noticed. ghostty computes effectiveMods() = mods.unset(consumed_mods)
++        // and sends text directly only when the result is empty
++        // (key_encode.zig, "Send plain-text non-modified text directly"). With
++        // nothing marked consumed, `?` looked like shift+<something>, so the
++        // branch was skipped and it encoded CSI 47;2u instead - the *unshifted*
++        // codepoint 47 (`/`) plus a shift modifier. An application reading the
++        // base key printed `/` for a typed `?`.
++        //
++        // Legacy apps never saw it because that path writes the UTF-8 as-is,
++        // which is why this looked like a single misbehaving application rather
++        // than a defect here.
++        //
++        // Determined by asking the layout, not by assuming a US keyboard: if
++        // removing a modifier changes the text it produces, that modifier was
++        // consumed.
++        auto consumed = GHOSTTY_MODS_NONE;
++        if (keyDown && !text.empty())
++        {
++            const auto raw = modifiers.Value();
++            if (modifiers.IsShiftPressed() &&
++                GhosttyKeyTextFor(raw & ~SHIFT_PRESSED, vkey, scanCode) != text)
++            {
++                consumed = static_cast<ghostty_input_mods_e>(consumed | GHOSTTY_MODS_SHIFT);
++            }
++
++            // AltGr arrives as ctrl+alt on Windows and is consumed the same
++            // way - on a German layout it is what turns `q` into `@`.
++            constexpr uint32_t ctrlAlt = LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED |
++                                         LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED;
++            if ((modifiers.IsCtrlPressed() || modifiers.IsAltPressed()) &&
++                GhosttyKeyTextFor(raw & ~ctrlAlt, vkey, scanCode) != text)
++            {
++                if (modifiers.IsCtrlPressed()) { consumed = static_cast<ghostty_input_mods_e>(consumed | GHOSTTY_MODS_CTRL); }
++                if (modifiers.IsAltPressed()) { consumed = static_cast<ghostty_input_mods_e>(consumed | GHOSTTY_MODS_ALT); }
++            }
++        }
++        ev.consumed_mods = consumed;
++
+         ev.text = text.empty() ? nullptr : text.c_str();
+         ev.unshifted_codepoint = (!unshifted.empty() && gsl::narrow_cast<unsigned char>(unshifted[0]) < 0x80) ?
+                                      gsl::narrow_cast<uint32_t>(gsl::narrow_cast<unsigned char>(unshifted[0])) :

@@ -635,7 +635,72 @@ evidence did.
   and `ghostty_surface_set_size` is ruled out. A debugger-quality stack would
   settle it; ReleaseFast emits no PDB, and the builds that carry symbols do not
   crash.
-- **Whether `ctrl+=` does anything at all on a ghostty pane.** `AdjustFontSize`
-  is empty, and the engine traced no `cellSize` change across a zoom. The pane
-  no longer dies; that is not the same as the feature working, and it is not
-  claimed anywhere that it does.
+- ~~Whether `ctrl+=` does anything on a ghostty pane.~~ **Answered by the user:
+  zoom works.** It does not go through `GhosttyControlCore::AdjustFontSize`,
+  which is empty - ghostty handles the binding itself, so the key reaches
+  `ghostty_surface_key` and the font reload happens inside that call. That call
+  runs on WT's UI thread, which is almost certainly the path that was
+  overflowing, and fits what the evidence never explained: why wrapping
+  `ghostty_surface_set_size` changed nothing.
+
+---
+
+### KD-08 — `?` arrives as `/` in applications using the kitty keyboard protocol — **fixed 2026-08-08**
+
+**Reported** by the user, from use: typing `?` into a full-screen application
+produced `/`. Every other application was fine, which is exactly what made it
+look like that application's bug.
+
+#### Cause
+
+`GhosttyControlCore.cpp` hardcoded `ev.consumed_mods = GHOSTTY_MODS_NONE`.
+
+ghostty computes `effectiveMods() = mods.unset(consumed_mods)` and, on the kitty
+path, sends the text directly only when the result is empty
+(`key_encode.zig`):
+
+```zig
+// Send plain-text non-modified text directly to the terminal.
+if (event.utf8.len > 0 and binding_mods.empty() and ...
+```
+
+Shift **is** consumed by the layout when producing `?` — the character already
+accounts for it. Reporting nothing as consumed made `?` look like
+`shift+<something>`, so that branch was skipped and the key was encoded as
+`CSI 47;2u`: the **unshifted** codepoint 47, which is `/`, plus a shift
+modifier. An application that reads the base key prints `/`.
+
+**Fixed** by asking the layout rather than assuming a US keyboard: if removing a
+modifier changes the text the key produces, that modifier was consumed. Shift
+covers `?`; ctrl+alt covers AltGr, which on a German layout is what turns `q`
+into `@`.
+
+#### Why it looked like one application misbehaving
+
+The legacy encoding path writes the UTF-8 as-is and never consults
+`consumed_mods`. Only a client that turns the kitty protocol on reaches the
+encoder that does. So "it works everywhere except this one program" was a
+property of *which encoder ran*, not of the program.
+
+That framing nearly sent this the wrong way. The first hypothesis was that the
+key was being **dropped** in kitty mode; the clarification that `?` came out as
+`/` — a key arriving with its shift lost, not a key going missing — is what
+pointed at modifier accounting.
+
+#### The measurement that nearly lied
+
+A probe captured `?` under kitty flags `13` and recorded zero bytes, which read
+as "the key is dropped". The **control run with the protocol off captured zero
+bytes too**, proving the harness was at fault rather than the terminal: the keys
+were synthetic virtual-key events that never reached the pty, and a file-based
+capture needs its reader to exit cleanly to flush.
+
+What settled it was the user running the probe by hand and reading the bytes off
+the screen. Two lessons worth keeping: **run the control**, and for a key-encoding
+question prefer printing live (`cat -v -u`) over capturing to a file, since
+anything arriving late lands at the shell prompt where readline eats the `ESC`
+and leaves mangled fragments.
+
+Also note the probe's flags were unrepresentative: `13` includes *report all keys
+as escape codes*, which no ordinary application requests. Testing a mode nobody
+uses answers a question nobody asked.
