@@ -406,7 +406,7 @@ continue. Reaching zero needs the timer gated upstream as well.
 
 ---
 
-### KD-06 — A ligature's second half blinks with the cursor
+### KD-06 — A ligature's second half blinks with the cursor — **fixed 2026-08-09**
 
 **Reported** by the user, from use: type `--` at a shell prompt, move the cursor
 back onto the **first** dash, and the **second** dash blinks in antiphase with
@@ -547,6 +547,43 @@ again afterwards, which is what confirms the revert rather than a file hash.
 setting would only hand users a switch that makes this worse. That is worth
 saying explicitly because "expose the setting we don't forward" is the obvious
 wrong move from reading `GhosttySettingsTranslator` alone.
+
+#### Fixed
+
+`renderer/generic.zig` now remembers the cursor's last viewport position and
+marks the rows it left and arrived on dirty — **only when it actually moves**.
+Dirtying unconditionally would re-shape the cursor's row every frame, including
+the ~1.7 frames per second the blink timer already costs an idle pane, trading a
+rendering defect for a performance one.
+
+Measured, cursor parked on the first dash of `--`, per blink:
+
+| | changed region |
+|---|---|
+| before | **365 px across two cells** — the neighbour's ink rows included |
+| after | **338 px** — one 13x26 cell, the cursor block and nothing else |
+
+#### Upstream, on the evidence
+
+Both halves are upstream code: the dirty gate is present verbatim at the pin,
+and **no** cursor movement marks a row dirty — `Screen.cursorLeft`,
+`cursorRight`, `cursorUp`, `cursorDown` and `cursorAbsolute` all mark nothing.
+So the stale-shaping path is reachable upstream exactly as it was here.
+
+**That is inference, not a measurement.** No native ghostty build was run. Two
+things could differ on another platform and would need ruling out before
+anything is filed upstream: a full rebuild (`state.dirty == .full`) happening
+more often there, which hides it; or *our* port dirtying less than native does,
+since we drive the pty externally.
+
+It would also be easy to miss rather than absent. It needs a specific order —
+the row shaped while the cursor is elsewhere, *then* the cursor moved onto a
+ligature — it is cosmetic, it self-corrects the moment anything is typed, and
+one dash flickering next to a blinking block cursor reads as "the cursor
+blinking".
+
+The fix was verified against the D3D11 renderer only; `generic.zig` is shared
+with the Metal and OpenGL backends.
 
 #### Workaround today
 

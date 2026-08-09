@@ -32,6 +32,11 @@ Nothing switches engine by itself. Add `"engine": "ghostty"` to a profile — or
 
 To confirm a pane is really using it, open the search box (`Ctrl+Shift+F`): on a ghostty pane the regex and case toggles are greyed out.
 
+## Fixed since 0.2.1
+
+- **`?` reached applications as `/`.** Only applications using the kitty keyboard protocol were affected; the modifiers a layout consumes to produce a character were not being reported, so `?` was encoded as its base key `/` plus a shift modifier ([KD-08](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/known-defects.md)).
+- **A ligature's second half blinked with the cursor.** With a ligating font, parking a block cursor on the first character of a ligature such as `--` made the other half flicker in antiphase. Moving the cursor now re-shapes the rows it leaves and enters ([KD-06](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/known-defects.md)).
+
 ## What works
 
 Rendering, keyboard input (including IME), mouse, selection and clipboard, search, scrollback and marks, all six cursor shapes, Kitty graphics, and the terminal-size reports that image clients rely on. A pane drains its pty at roughly three quarters of cascadia's rate.
@@ -46,7 +51,6 @@ Its own package identity (`WintermGhostty`), its own execution alias (`wtg.exe`)
 
 - **No accessibility.** There is no UIA text provider on a ghostty pane, so **Narrator and NVDA cannot read one**. If you rely on a screen reader, keep those profiles on `"engine": "cascadia"`.
 - **x64 only.** Zig 0.16.0 cannot target `aarch64-windows-msvc` at all, so there is no ARM64 build to ship.
-- **[KD-06](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/known-defects.md)** — with a ligating font, parking a block cursor on the first character of a ligature such as `--` makes the second half blink along with the cursor. Workaround: a font without that ligature, e.g. Consolas.
 - **KD-04** — a pane in a background *window* keeps drawing a focused-looking blinking cursor, and keeps presenting frames to do it.
 - **KD-05** — the Windows cursor-blink settings are ignored, including turning blinking off.
 

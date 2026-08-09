@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Sun, 9 Aug 2026 00:21:42 -0700
+Subject: [PATCH] renderer: moving the cursor invalidates the rows it leaves
+ and enters
+
+A ligature under the cursor kept the shaping it was given while the
+cursor was somewhere else, so the cell beside the cursor blinked with it.
+
+Shaping runs are broken at the cursor (font/shaper/run.zig) so a ligature
+under it is split into its components. That break is only applied when a
+row is re-shaped, and a row is only re-shaped when it is dirty - which
+cursor movement alone never makes it: Screen.cursorLeft/Right/Up/Down and
+cursorAbsolute mark nothing.
+
+So with the cursor moved onto the first dash of `--`, the row kept the
+ligature it had been shaped with earlier: one glyph, owned by the first
+cell, whose ink spans two. Drawing the block cursor over that cell took
+the second dash with it, and the dash appeared to blink in antiphase with
+the cursor.
+
+Measured, cursor parked on the first dash of `--`, per blink:
+
+  before   365 px across two cells (the neighbour's ink rows included)
+  after    338 px - one 13x26 cell, the cursor block and nothing else
+
+Only on an actual move. Dirtying unconditionally would re-shape the
+cursor's row every frame, including the ~1.7 frames per second the blink
+timer already costs an idle pane - trading a rendering bug for a
+performance one.
+
+This is upstream code and upstream has no cursor-move invalidation
+either, so the defect should reproduce there; that is inference, not a
+measurement, and is recorded as such in KD-06. Verified here against the
+D3D11 renderer only, though generic.zig is shared with Metal and OpenGL.
+---
+ src/renderer/generic.zig | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
+index ae5272f87..69b0e5cc8 100644
+--- a/src/renderer/generic.zig
++++ b/src/renderer/generic.zig
+@@ -154,6 +154,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+         /// cells for the draw call.
+         cells_rebuilt: bool = false,
+ 
++        /// Where the cursor was when we last rebuilt cells, so that moving it
++        /// can invalidate the rows it left and arrived on. See rebuildCells.
++        last_cursor_vp: ?terminal.RenderState.Cursor.Viewport = null,
++
+         /// The current GPU uniform values.
+         uniforms: shaderpkg.Uniforms,
+ 
+@@ -2395,6 +2399,38 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 };
+             } else null;
+ 
++            // Moving the cursor has to re-shape the rows it left and arrived
++            // on, even though no cell contents changed.
++            //
++            // Shaping runs are broken at the cursor (font/shaper/run.zig) so a
++            // ligature under it is split into its components. That break is
++            // only applied when a row is re-shaped, and a row is only re-shaped
++            // when it is dirty - which cursor movement alone never makes it.
++            // The row therefore keeps whatever shaping it had when the cursor
++            // was somewhere else.
++            //
++            // The visible cost was KD-06: with the cursor moved onto the first
++            // dash of a `--` ligature, the row kept the ligature it was shaped
++            // with earlier - one glyph, owned by the first cell, whose ink
++            // spans two - so drawing the block cursor over that cell took the
++            // second dash with it, and the dash appeared to blink in antiphase
++            // with the cursor.
++            //
++            // Only on an actual move. Dirtying unconditionally would re-shape
++            // the cursor's row on every frame, including the ~1.7 frames per
++            // second the blink timer already costs an idle pane.
++            cursor_dirty: {
++                const vp = state.cursor.viewport;
++                if (std.meta.eql(self.last_cursor_vp, vp)) break :cursor_dirty;
++                if (self.last_cursor_vp) |prev| {
++                    if (prev.y < row_len) row_dirty[prev.y] = true;
++                }
++                if (vp) |now| {
++                    if (now.y < row_len) row_dirty[now.y] = true;
++                }
++                self.last_cursor_vp = vp;
++            }
++
+             for (
+                 0..,
+                 row_raws[0..row_len],
