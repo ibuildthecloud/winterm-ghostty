@@ -131,17 +131,37 @@ This was assumed to be covered by the gate's "marks are prompt-level only"
 decision and is not — that decision is about `SemanticPrompt`, and this is
 unrelated. *Read.*
 
-### GD-07 — Mouse reporting to the application is not wired
+### GD-07 — Mouse reporting to the application — **implemented 2026-08-09**
 
-`IsVtMouseModeEnabled` returns false and `SendMouseEvent` returns "not handled",
-so WT never routes mouse input down its VT path for a ghostty pane. Applications
-that ask for mouse reporting may still see *some* events, because the pointer
-positions the selection path sends reach ghostty and ghostty reports them itself
-— but the wheel and the non-left buttons never arrive, and WT keeps treating
-drags as selection while the application believes it has the mouse.
+Was: `IsVtMouseModeEnabled` returned false and `SendMouseEvent` returned "not
+handled", so WT never routed mouse input down its VT path for a ghostty pane.
 
-Neither half of that has been exercised. Worth measuring before designing: what
-ghostty reports today may already be most of it. *Read.*
+The entry predicted the symptom exactly — "applications that ask for mouse
+reporting may still see *some* events, because the pointer positions the
+selection path sends reach ghostty and ghostty reports them itself — but the
+wheel and the non-left buttons never arrive" — and that is what a user
+eventually measured with a raw crossterm probe: one physical click producing two
+`Down` and one `Up`, and zero right-button events in a long session.
+
+**Now implemented.** `IsVtMouseModeEnabled` answers from
+`ghostty_surface_mouse_captured`, the same question ghostty asks itself when
+deciding whether to report, so the two sides cannot disagree about the mode.
+`SendMouseEvent` moves the pointer with modifiers, then dispatches press and
+release for left, right and middle, and scroll on both axes.
+
+The arbitration is not ours and did not need writing:
+`ControlInteractivity::_canSendVTMouseInput` already chooses this path over
+selection, and already implements the convention that holding shift suppresses
+reporting so a user can always select. Both engines obey one rule because it is
+the same code.
+
+Worth keeping from the diagnosis: **the report's leading hypothesis was wrong in
+an instructive way.** It reasoned from the bytes on the wire — crossterm enables
+both urxvt (1015) and SGR (1006), so a terminal answering in both would double
+every event — which is a good theory that fits the evidence, including why only
+presses doubled. The actual cause was upstream of encoding entirely: the same
+button was pressed twice at the ghostty layer, by two different call sites in
+the selection path. Evidence that fits a hypothesis is not evidence for it.
 
 ### GD-08 — Bracketed paste is always off
 

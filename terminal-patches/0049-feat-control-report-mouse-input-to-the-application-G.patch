@@ -1,0 +1,221 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Sun, 9 Aug 2026 23:02:57 -0700
+Subject: [PATCH] feat(control): report mouse input to the application (GD-07)
+
+SendMouseEvent returned false and IsVtMouseModeEnabled returned false, so
+Windows Terminal never routed pointer input down its VT path for a
+ghostty pane. Applications that asked for the mouse still saw events -
+the selection path drives ghostty's mouse and ghostty reports what it
+receives - but they were reading the selection machinery rather than
+their input:
+
+  - presses arrived twice: SetSelectionAnchor presses, and
+    LeftClickOnTerminal replays one press per click of a multi-click,
+    against a single release site
+  - a plain single click sent no press at all; that path only clears the
+    selection, deliberately, because pressing on WT's rounded click
+    position latched ghostty's anchor a character late
+  - right, middle and the wheel never arrived, because the selection path
+    only ever passes GHOSTTY_MOUSE_LEFT
+
+Reported from use with a raw crossterm probe: one physical click produced
+two Down and one Up, sharing a timestamp to the millisecond, and zero
+BUTTON2 events across a long session. The report's leading hypothesis was
+that we answer in both urxvt (1015) and SGR (1006) encodings; that is not
+it - the duplication happens before encoding.
+
+IsVtMouseModeEnabled now answers from ghostty_surface_mouse_captured,
+which is the same question ghostty asks itself when deciding whether to
+report, so the two sides cannot disagree about the mode. SendMouseEvent
+moves the pointer with modifiers, then dispatches press/release for left,
+right and middle, and scroll on both axes.
+
+Scroll is divided by WHEEL_DELTA and not negated: ghostty documents
+"negative is down, left; positive is up, right" and non-precision offsets
+are wheel ticks, which is Windows' convention on both signs.
+
+No arbitration code here. ControlInteractivity::_canSendVTMouseInput
+already chooses this path over selection and already implements holding
+shift to suppress reporting so a user can always select - shared with
+cascadia, so both engines obey one rule.
+
+Confirmed working by the reporter against the probe that found it.
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 126 ++++++++++++++++--
+ .../TerminalControl/GhosttyControlCore.h      |   2 +-
+ 2 files changed, 116 insertions(+), 12 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 0718be156..88e1ccc85 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -859,16 +859,109 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         }
+     }
+ 
+-    bool GhosttyControlCore::SendMouseEvent(const Core::Point /*viewportPosCore*/,
+-                                            const uint32_t /*uiButton*/,
+-                                            const ControlKeyStates /*states*/,
+-                                            const int16_t /*wheelDelta*/,
++    // Mouse reporting: the path an application takes when it has asked for the
++    // mouse with DECSET 1000/1002/1003/1006 and friends.
++    //
++    // Returning false here used to mean "not handled", which routed every
++    // pointer event down WT's *selection* path instead. Applications still saw
++    // events, because the selection path drives ghostty's mouse to make
++    // selections and ghostty reports whatever mouse input it receives - but
++    // what they saw was the shape of the selection machinery rather than their
++    // input: presses arrived twice (SetSelectionAnchor presses, and
++    // LeftClickOnTerminal replays one press per click of a multi-click), a
++    // plain single click sent no press at all, and the right button, the
++    // middle button and the wheel never arrived because the selection path only
++    // ever sends GHOSTTY_MOUSE_LEFT. See GD-07 and docs/MOUSE-DUPLICATE-REPORTS.md.
++    //
++    // The arbitration between "this is a selection" and "the application owns
++    // the mouse" is not ours: ControlInteractivity::_canSendVTMouseInput picks
++    // this path over the selection path, and it also implements the convention
++    // that holding shift suppresses reporting so a user can always select. All
++    // this has to do is answer honestly and do what it is told.
++    bool GhosttyControlCore::SendMouseEvent(const Core::Point viewportPosCore,
++                                            const uint32_t uiButton,
++                                            const ControlKeyStates states,
++                                            const int16_t wheelDelta,
+                                             const Control::MouseButtonState /*state*/)
+     {
+-        // Mouse reporting is Phase 6 (selection and interaction parity). The
+-        // pane is fully usable from the keyboard before then; returning false
+-        // means "not handled", which is honest rather than silently swallowing.
+-        return false;
++        if (!_surface || !ghostty_surface_mouse_captured(_surface))
++        {
++            return false;
++        }
++
++        auto mods = GHOSTTY_MODS_NONE;
++        if (states.IsShiftPressed()) { mods = static_cast<ghostty_input_mods_e>(mods | GHOSTTY_MODS_SHIFT); }
++        if (states.IsCtrlPressed()) { mods = static_cast<ghostty_input_mods_e>(mods | GHOSTTY_MODS_CTRL); }
++        if (states.IsAltPressed()) { mods = static_cast<ghostty_input_mods_e>(mods | GHOSTTY_MODS_ALT); }
++
++        // Every report carries a position, so the pointer moves first whatever
++        // the event is. ghostty derives the reported cell from this.
++        _mouseTo(viewportPosCore, mods);
++
++        const auto button = [&]() {
++            switch (uiButton)
++            {
++            case WM_LBUTTONDOWN:
++            case WM_LBUTTONUP:
++                return GHOSTTY_MOUSE_LEFT;
++            case WM_RBUTTONDOWN:
++            case WM_RBUTTONUP:
++                return GHOSTTY_MOUSE_RIGHT;
++            case WM_MBUTTONDOWN:
++            case WM_MBUTTONUP:
++                return GHOSTTY_MOUSE_MIDDLE;
++            default:
++                return GHOSTTY_MOUSE_UNKNOWN;
++            }
++        }();
++
++        switch (uiButton)
++        {
++        case WM_LBUTTONDOWN:
++        case WM_RBUTTONDOWN:
++        case WM_MBUTTONDOWN:
++            ghostty_surface_mouse_button(_surface, GHOSTTY_MOUSE_PRESS, button, mods);
++            // The selection path synthesises a release before it starts or ends
++            // a selection, keyed off this flag. A press sent from here must set
++            // it too, or leaving mouse mode mid-drag leaves ghostty believing a
++            // button is still down.
++            _mouseDown = true;
++            break;
++
++        case WM_LBUTTONUP:
++        case WM_RBUTTONUP:
++        case WM_MBUTTONUP:
++            ghostty_surface_mouse_button(_surface, GHOSTTY_MOUSE_RELEASE, button, mods);
++            _mouseDown = false;
++            break;
++
++        case WM_MOUSEWHEEL:
++        case WM_MOUSEHWHEEL:
++        {
++            // ghostty documents its own convention on scrollCallback: "negative
++            // is down, left; positive is up, right", and in a non-precision
++            // event the offset is in wheel *ticks*. Windows agrees on both
++            // signs, so this is a division by WHEEL_DELTA and not a negation -
++            // getting that wrong inverts scrolling, which is easy to ship and
++            // annoying to live with.
++            const auto ticks = static_cast<double>(wheelDelta) / WHEEL_DELTA;
++            const auto x = uiButton == WM_MOUSEHWHEEL ? ticks : 0.0;
++            const auto y = uiButton == WM_MOUSEHWHEEL ? 0.0 : ticks;
++            // Scroll mods are precision/momentum, which a Windows wheel has
++            // neither of; a mouse wheel is exactly the non-precision case.
++            ghostty_surface_mouse_scroll(_surface, x, y, 0);
++            break;
++        }
++
++        default:
++            // WM_MOUSEMOVE and anything else: the position above is the whole
++            // event. ghostty decides whether motion is worth reporting from the
++            // modes the application set (1002 wants drags, 1003 wants all
++            // motion), which is not a decision to duplicate here.
++            break;
++        }
++
++        return true;
+     }
+ 
+     // The scrollbar's thumb, dragged. WT gives an absolute buffer row for the
+@@ -939,7 +1032,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     // and for ghostty truncating to whole pixels. The cell *centre*, which this
+     // used to send, also lands below 60% - the far end of a drag was never the
+     // bug - but 0.1 of a cell is not a margin worth relying on.
+-    void GhosttyControlCore::_mouseTo(const Core::Point cell) const
++    void GhosttyControlCore::_mouseTo(const Core::Point cell, const ghostty_input_mods_e mods) const
+     {
+         if (!_surface)
+         {
+@@ -963,7 +1056,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         const auto cellHeight = _cellSize.Height / _compositionScale;
+         const auto x = (static_cast<double>(cell.X) + 0.25) * cellWidth;
+         const auto y = (static_cast<double>(cell.Y) + 0.5) * cellHeight;
+-        ghostty_surface_mouse_pos(_surface, x, y, GHOSTTY_MODS_NONE);
++        ghostty_surface_mouse_pos(_surface, x, y, mods);
+     }
+ 
+     // Windows Terminal never tells the core that the button came up: only VT
+@@ -1424,7 +1517,18 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     winrt::hstring GhosttyControlCore::HoveredUriText() const { return {}; }
+     IReference<Core::Point> GhosttyControlCore::HoveredCell() const { return nullptr; }
+ 
+-    bool GhosttyControlCore::IsVtMouseModeEnabled() const { return false; }
++    // Whether the application has asked for the mouse. This is the switch that
++    // makes ControlInteractivity route pointer events to SendMouseEvent instead
++    // of the selection path, so answering false - as this did - is what left
++    // applications reading the selection machinery's leftovers (GD-07).
++    //
++    // ghostty_surface_mouse_captured is the same question ghostty asks itself
++    // when deciding whether to report, so the two sides cannot disagree about
++    // which mode the terminal is in.
++    bool GhosttyControlCore::IsVtMouseModeEnabled() const
++    {
++        return _surface && ghostty_surface_mouse_captured(_surface);
++    }
+     bool GhosttyControlCore::ShouldSendAlternateScroll(const uint32_t /*uiButton*/, const int32_t /*delta*/) const { return false; }
+     // Where the cursor is, in cells, for the IME candidate window.
+     //
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.h b/src/cascadia/TerminalControl/GhosttyControlCore.h
+index e92454467..bce44549d 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.h
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.h
+@@ -266,7 +266,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         // Selection is driven through ghostty's mouse handling, because that
+         // is the only thing that both sets the selection *and* draws it.
+-        void _mouseTo(Core::Point cell) const;
++        void _mouseTo(Core::Point cell, ghostty_input_mods_e mods = GHOSTTY_MODS_NONE) const;
+         void _releaseMouseIfHeld() const;
+ 
+         // Output has to draw itself; libghostty's wakeup coalesces. Same

@@ -32,7 +32,11 @@ Nothing switches engine by itself. Add `"engine": "ghostty"` to a profile — or
 
 To confirm a pane is really using it, open the search box (`Ctrl+Shift+F`): on a ghostty pane the regex and case toggles are greyed out.
 
-## Fixed since 0.2.1
+## Fixed since 0.2.2
+
+- **Mouse input now reaches applications properly.** Mouse reporting was never implemented, so a full-screen application saw the selection machinery's side effects instead of its input: every press arrived twice, a single click sent no press at all, and the right button, middle button and wheel never arrived. Buttons, wheel and modifiers are now reported, and holding shift still selects text ([GD-07](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/documented-diffs.md)).
+
+## Fixed in 0.2.2
 
 - **`?` reached applications as `/`.** Only applications using the kitty keyboard protocol were affected; the modifiers a layout consumes to produce a character were not being reported, so `?` was encoded as its base key `/` plus a shift modifier ([KD-08](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/known-defects.md)).
 - **A ligature's second half blinked with the cursor.** With a ligating font, parking a block cursor on the first character of a ligature such as `--` made the other half flicker in antiphase. Moving the cursor now re-shapes the rows it leaves and enters ([KD-06](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/known-defects.md)).
