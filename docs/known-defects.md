@@ -6,8 +6,10 @@ distinction is the point: a diff is a decision with a cost attached, a defect is
 a bug nobody chose.
 
 **Each entry has a stable ID** (`KD-nn`), for the same reason the diffs do —
-there is no issue tracker wired to this repository, so the ID is what an issue
-would be filed against.
+open entries now carry a GitHub issue link beside the
+heading. The ID remains the durable name: it survives issue renumbering, appears
+in commit messages and code comments, and is what this file and the diffs
+cross-reference. The issue tracks the work; this file holds the evidence.
 
 Each entry says how it was found, what is actually known versus suspected, and
 **the measurement that would tell the hypotheses apart**. That last part matters
@@ -318,7 +320,7 @@ square, which is nearly all of them.
 
 ---
 
-### KD-04 — A background pane keeps blinking and keeps presenting
+### KD-04 — A background pane keeps blinking and keeps presenting  ([#1](https://github.com/ibuildthecloud/winterm-ghostty/issues/1))
 
 **Found** 2026-08-07 by measurement, while asking whether the idle present rate
 drops to zero when a pane is not focused. It does not.
@@ -375,7 +377,7 @@ too. Deferred deliberately, not overlooked.
 
 ---
 
-### KD-05 — The system's cursor-blink settings are ignored
+### KD-05 — The system's cursor-blink settings are ignored  ([#2](https://github.com/ibuildthecloud/winterm-ghostty/issues/2))
 
 Cascadia reads them (`TerminalCore/terminalrenderdata.cpp:41-52`):
 

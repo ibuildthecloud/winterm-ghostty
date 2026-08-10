@@ -24,7 +24,7 @@ known from the code and has not been exercised.
 These four were decided at the gate (2026-08-05) and are deferred by decision, not
 by omission.
 
-### GD-01 — Hyperlinks are not detected, hovered or clickable
+### GD-01 — Hyperlinks are not detected, hovered or clickable  ([#3](https://github.com/ibuildthecloud/winterm-ghostty/issues/3))
 
 `GetHyperlink`, `HoveredUriText`, `HoveredCell` and `SetHoveredCell` all return
 empty. A URL in output is plain text in a ghostty pane: no underline on hover, no
@@ -35,7 +35,7 @@ double-click, but nothing in the C API reads a link back out or reports one unde
 the pointer. Closing this needs a new libghostty entry point, which is exactly
 what the gate ruled out of Phase 6. *Read.*
 
-### GD-02 — `SelectCommand` / `SelectOutput` do nothing, and the context menu hides them
+### GD-02 — `SelectCommand` / `SelectOutput` do nothing, and the context menu hides them  ([#4](https://github.com/ibuildthecloud/winterm-ghostty/issues/4))
 
 WT can select the command or the output of the prompt under the cursor. ghostty's
 `SemanticPrompt` is a `u2` — `none` / `prompt` / `prompt_continuation` — so it
@@ -46,14 +46,14 @@ do not appear, rather than appearing and doing nothing.
 Widening `SemanticPrompt` touches row packing in ghostty and wants its own ADR.
 *Read.*
 
-### GD-03 — No scrollbar error pips, and no marks except prompts
+### GD-03 — No scrollbar error pips, and no marks except prompts  ([#5](https://github.com/ibuildthecloud/winterm-ghostty/issues/5))
 
 `ScrollMarks()` is empty and `AddMark`/`ClearMark`/`ClearAllMarks` do nothing.
 `ScrollToMark` works — it maps to `jump_to_prompt` — so navigation between prompts
 is there, but the scrollbar shows no mark pips and cannot show *error* pips at
 all: exit codes have nowhere to live in a `u2`. Same ADR as GD-02. *Read.*
 
-### GD-04 — Search: no regex, no case sensitivity, and no scrollbar pips for matches
+### GD-04 — Search: no regex, no case sensitivity, and no scrollbar pips for matches  ([#6](https://github.com/ibuildthecloud/winterm-ghostty/issues/6))
 
 ghostty's needle is a plain `[]const u8`. The regex and case toggles are
 **disabled and unchecked** in the search box on a ghostty pane rather than left
@@ -95,7 +95,7 @@ tracked against, and because two things it cost are worth keeping: there were
 build crashed on the first keystroke because `ghostty_surface_preedit` needs the
 16 MB `RunWithEngineStack` thread, not WT's 1 MB UI thread.
 
-### GD-13 — Double-clicking past the end of a line selects nothing
+### GD-13 — Double-clicking past the end of a line selects nothing  ([#13](https://github.com/ibuildthecloud/winterm-ghostty/issues/13))
 
 Double-click in the empty region to the right of a prompt or a line of output:
 cascadia highlights the whitespace out to the edge of the pane, ghostty selects
@@ -120,7 +120,7 @@ that do not exist; what it costs is either changing ghostty's double-click for
 everyone against an explicit design decision (so, not upstreamable) or a third
 config option and its plumbing. *Measured.*
 
-### GD-06 — Keyboard selection: no mark mode, no quick-edit
+### GD-06 — Keyboard selection: no mark mode, no quick-edit  ([#7](https://github.com/ibuildthecloud/winterm-ghostty/issues/7))
 
 `ToggleMarkMode`, `SwitchSelectionEndpoint`, `ExpandSelectionToWord`,
 `TryMarkModeKeybinding` and `SelectionMode` are all stubs, so shift+arrow
@@ -163,14 +163,14 @@ presses doubled. The actual cause was upstream of encoding entirely: the same
 button was pressed twice at the ghostty layer, by two different call sites in
 the selection path. Evidence that fits a hypothesis is not evidence for it.
 
-### GD-08 — Bracketed paste is always off
+### GD-08 — Bracketed paste is always off  ([#8](https://github.com/ibuildthecloud/winterm-ghostty/issues/8))
 
 `BracketedPasteEnabled` returns false, so WT does not wrap a paste in
 `ESC[200~`/`ESC[201~` and does not warn about multi-line pastes on the strength
 of the terminal's own mode. ghostty tracks the mode internally and honours it for
 its own paste path; the state is not exposed to an embedder. *Read.*
 
-### GD-09 — Appearance beyond font and colours is not applied
+### GD-09 — Appearance beyond font and colours is not applied  ([#9](https://github.com/ibuildthecloud/winterm-ghostty/issues/9))
 
 `Opacity` is 1.0, `UseAcrylic` false, `AdjustOpacity` and `ToggleShaderEffects`
 do nothing, and `ApplyAppearance`/`SetHighContrastMode`/the colour-scheme preview
@@ -180,7 +180,7 @@ background image and custom shaders, and does not change appearance on focus.
 Phase 7 owns presentation. Listed here because a user reading their profile
 cannot tell which of its settings a ghostty pane honours. *Read.*
 
-### GD-10 — Command history, quick fixes, completions and session persistence
+### GD-10 — Command history, quick fixes, completions and session persistence  ([#10](https://github.com/ibuildthecloud/winterm-ghostty/issues/10))
 
 `CommandHistory` returns null, `QuickFixesAvailable` false,
 `UpdateQuickFixes`/`ClearQuickFix`/`PreviewInput`/`OpenCWD` do nothing, and
@@ -188,12 +188,12 @@ cannot tell which of its settings a ghostty pane honours. *Read.*
 a saved session. All of these read WT's own semantic-prompt bookkeeping, which
 GD-02's `u2` cannot supply. *Read.*
 
-### GD-11 — `ColorSelection` does nothing
+### GD-11 — `ColorSelection` does nothing  ([#11](https://github.com/ibuildthecloud/winterm-ghostty/issues/11))
 
 WT can tint a selection (used by "mark all matches"). ghostty has no equivalent
 entry point. *Read.*
 
-### GD-12 — `ClearBuffer` does nothing
+### GD-12 — `ClearBuffer` does nothing  ([#12](https://github.com/ibuildthecloud/winterm-ghostty/issues/12))
 
 Clear-buffer actions (clear viewport / scrollback / all) do nothing on a ghostty
 pane. `clear_screen` exists as a binding action and covers screen+scrollback;
@@ -204,7 +204,7 @@ left rather than half-wired. *Read.*
 
 ## Permanent, by upstream decision
 
-### GD-14 — Sixel graphics are not supported and never will be
+### GD-14 — Sixel graphics are not supported and never will be  ([#14](https://github.com/ibuildthecloud/winterm-ghostty/issues/14))
 
 A cascadia pane renders sixel images; a ghostty pane ignores the sequence
 entirely. This is not a gap waiting on an upstream release, and advancing the
