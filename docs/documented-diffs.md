@@ -243,9 +243,9 @@ pane. `clear_screen` exists as a binding action and covers screen+scrollback;
 WT's three-way distinction does not map onto it exactly, which is why this was
 left rather than half-wired. *Read.*
 
-### GD-15 — `sendInput` cannot send an escape sequence  ([#15](https://github.com/ibuildthecloud/winterm-ghostty/issues/15))
+### GD-15 — `sendInput` cannot send an escape sequence — **implemented 2026-08-11**  ([#15](https://github.com/ibuildthecloud/winterm-ghostty/issues/15))
 
-`GhosttyControlCore::SendInput` calls `ghostty_surface_text`, which is
+Was: `GhosttyControlCore::SendInput` called `ghostty_surface_text`, which is
 libghostty's **paste** entry point. That is right for `PasteText` and wrong for
 everything else that reaches it, because `input/paste.zig` deliberately does two
 things to pasted data — xterm's behaviour, and correct for a paste:
@@ -275,13 +275,41 @@ This is **not** GD-08 and does not depend on it — the ESC stripping happens
 whether or not mode 2004 is on. It was found by the probe run that verified
 GD-08, having been there since `SendInput` was first written.
 
-**Closing it** means not routing non-paste writes through the paste encoder.
-`WriteToConnection` — the hook libghostty's external termio backend already
-calls to reach WT's conpty — is a literal byte path and is right there;
-`PasteText` keeps using `ghostty_surface_text`. The open question is what else
-`ghostty_surface_text` does for input that a direct write would skip, most
-obviously ghostty's scroll-to-bottom-on-input. Worth answering before writing
-the patch rather than after.
+**Now implemented.** `SendInput` and `SendCharEvent` write through
+`WriteToConnection` — the literal byte path libghostty's external termio backend
+already calls to reach WT's conpty. `PasteText` keeps `ghostty_surface_text` and
+is now its only caller, which is what that entry point was always for.
+
+**The open question is answered, and the answer was in cascadia rather than in
+libghostty.** Past the encoder itself, `completeClipboardPaste` does exactly one
+thing a direct write would skip: a scroll-to-bottom. That is the paste's
+behaviour, not this path's — cascadia does not snap the viewport for `SendInput`
+either, because `TrySnapOnInput` sits on the key and paste paths only
+(`ControlCore::PasteText`, `Terminal::SendKeyEvent`). So not scrolling here is
+the parity behaviour, not an omission, and both paths now match cascadia.
+
+Measured in a real ghostty pane against `harness/rawin`, a probe that prints the
+bytes the child receives, with mode 2004 on:
+
+| Fired | Received |
+|---|---|
+| `sendInput` `<ESC>[31mREDTEXT<ESC>[0m` | `<ESC>[31mREDTEXT<ESC>[0m` |
+| `sendInput` `AA<0x03>BB` | `AA<0x03>BB` |
+| ctrl+v, unbound — so a char event | `<0x16>` |
+| typing `xy` | `x`, `y` |
+| paste of `HELLO` | `<ESC>[200~HELLO<ESC>[201~` |
+
+The first row is the bug. The last is the regression check: a real paste is
+still filtered and still framed, so GD-08 is untouched. The third is the
+accidental one — with `ctrl+v` unbound in the profile under test the keystroke
+reaches the child as a character event, and 0x16 arriving as itself rather than
+as a space is the `SendCharEvent` half of the same fix.
+
+**`harness/rawin` is the durable part.** Both GD-08 and GD-15 were found and
+settled by watching the byte stream at the child, and neither is visible in a
+screenshot — the pane looks identical whether the ESC survived or not. The probe
+turns DEC 2004 on for itself, puts the console in raw VT-input mode, and names
+every byte it reads.
 
 ---
 

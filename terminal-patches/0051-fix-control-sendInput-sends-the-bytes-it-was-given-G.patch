@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 11 Aug 2026 16:50:47 -0700
+Subject: [PATCH] fix(control): sendInput sends the bytes it was given (GD-15)
+
+GhosttyControlCore::SendInput called ghostty_surface_text, which is
+libghostty's paste entry point - its own doc comment says it is "treated
+like a paste so this isn't useful for sending escape sequences". It was
+not. input/paste.zig replaces every ESC, DEL, NUL, BS and control
+character with a space and frames the result in ESC[200~/ESC[201~ when
+mode 2004 is on, which is right for a paste and wrong for everything
+else that reached it: the sendInput action, broadcast input
+(RawWriteString), and any character falling through to SendCharEvent.
+
+So a sendInput action could send literal text and nothing else, which is
+almost never what one is for.
+
+SendInput and SendCharEvent now use WriteToConnection - the literal byte
+path libghostty's external termio backend already calls to reach WT's
+conpty. PasteText keeps ghostty_surface_text and is now its only caller,
+which is what that entry point was always for.
+
+The open question the issue recorded was what ghostty_surface_text does
+for input that a direct write would skip. Answered from the source: past
+the paste encoder itself, completeClipboardPaste does one thing, a
+scroll-to-bottom, and skipping it is correct here rather than a
+shortcut. Cascadia does not snap the viewport for SendInput either -
+TrySnapOnInput sits on the key and paste paths only - so this now
+matches it on both paths.
+
+Measured in a real ghostty pane against harness/rawin, which prints the
+bytes the child receives, with mode 2004 on:
+
+  sendInput <ESC>[31mREDTEXT<ESC>[0m -> <ESC>[31mREDTEXT<ESC>[0m
+  sendInput AA<0x03>BB               -> AA<0x03>BB
+  ctrl+v (unbound, so a char event)  -> <0x16>
+  typing xy                          -> x, y
+  paste HELLO                        -> <ESC>[200~HELLO<ESC>[201~
+
+The first line is the bug: it used to arrive as
+<ESC>[200~ [31mREDTEXT [0m<ESC>[201~. The last line is the regression
+check - a real paste is still filtered and still framed, so GD-08 is
+untouched.
+
+Closes #15.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 41 +++++++++++++++----
+ 1 file changed, 34 insertions(+), 7 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 6b6f1f3a5..063a7c13d 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -813,6 +813,13 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         return ghostty_surface_key(_surface, ev);
+     }
+ 
++    // A character the key path did not consume, written literally.
++    //
++    // Not ghostty_surface_text: that is libghostty's *paste* entry point, and
++    // input/paste.zig replaces every control character with a space. A char
++    // event is the user typing, so the bytes go through as they are - which is
++    // what cascadia does too, encoding the character and writing it to the
++    // connection rather than pasting it. See GD-15.
+     bool GhosttyControlCore::SendCharEvent(const wchar_t ch, const WORD /*scanCode*/, const ControlKeyStates /*modifiers*/)
+     {
+         if (!_surface || _readOnly)
+@@ -821,27 +828,46 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         }
+ 
+         const wchar_t buf[2]{ ch, L'\0' };
+-        const auto utf8 = til::u16u8(std::wstring_view{ buf, 1 });
+-        ghostty_surface_text(_surface, utf8.data(), utf8.size());
++        WriteToConnection(til::u16u8(std::wstring_view{ buf, 1 }));
+         return true;
+     }
+ 
++    // Bytes the user deliberately asked to send: the `sendInput` action and
++    // broadcast input (RawWriteString). Literal - unfiltered and unframed.
++    //
++    // This used to call ghostty_surface_text, whose own doc comment says it is
++    // "treated like a paste so this isn't useful for sending escape
++    // sequences". It was not: every ESC in a sendInput action arrived as a
++    // space, wrapped in a ESC[200~/ESC[201~ pair the action never asked for
++    // (GD-15). Only PasteText wants that encoder, and only PasteText calls it.
++    //
++    // What a direct write skips is libghostty's scroll-to-bottom, which
++    // completeClipboardPaste does on the way through. That is the paste's
++    // behaviour, not this path's: cascadia does not snap the viewport for
++    // SendInput either - TrySnapOnInput sits on the key and paste paths only -
++    // so not scrolling here is the parity behaviour rather than an omission.
+     void GhosttyControlCore::SendInput(std::wstring_view wstr)
+     {
+-        if (!_surface || _readOnly || wstr.empty())
++        if (_readOnly || wstr.empty())
+         {
+             return;
+         }
+-        const auto utf8 = til::u16u8(wstr);
+-        ghostty_surface_text(_surface, utf8.data(), utf8.size());
++        WriteToConnection(til::u16u8(wstr));
+     }
+ 
+     void GhosttyControlCore::PasteText(const winrt::hstring& hstr)
+     {
++        if (!_surface || _readOnly)
++        {
++            return;
++        }
++
+         // Non-empty text needs nothing from us: ghostty_surface_text is
+         // libghostty's paste entry point, so it already fenceposts the data
+         // when mode 2004 is on and strips the bytes xterm strips. Adding our
+-        // own ESC[200~ here would send two of them.
++        // own ESC[200~ here would send two of them. This is the one caller
++        // that wants that encoder - SendInput stopped routing through it in
++        // GD-15.
+         //
+         // Empty text is the exception, and it is not a no-op. An empty
+         // bracketed paste is how an application learns a paste happened with
+@@ -862,7 +888,8 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             return;
+         }
+ 
+-        SendInput(hstr);
++        const auto utf8 = til::u16u8(std::wstring_view{ hstr });
++        ghostty_surface_text(_surface, utf8.data(), utf8.size());
+     }
+ 
+     void GhosttyControlCore::GotFocus()
