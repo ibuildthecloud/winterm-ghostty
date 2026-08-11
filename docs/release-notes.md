@@ -34,6 +34,7 @@ To confirm a pane is really using it, open the search box (`Ctrl+Shift+F`): on a
 
 ## Fixed since 0.2.2
 
+- **Pastes are no longer treated as if every application were paste-blind.** The engine had always framed a paste in `ESC[200~`/`ESC[201~` correctly, but WT itself did not know the application had asked for it — so it trimmed pasted text that should have been left alone, dropped an empty paste that shells use to detect a paste at all, and raised the multi-line paste warning even for applications that can tell a paste from typing ([GD-08](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/documented-diffs.md)).
 - **Mouse input now reaches applications properly.** Mouse reporting was never implemented, so a full-screen application saw the selection machinery's side effects instead of its input: every press arrived twice, a single click sent no press at all, and the right button, middle button and wheel never arrived. Buttons, wheel and modifiers are now reported, and holding shift still selects text ([GD-07](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/documented-diffs.md)).
 
 ## Fixed in 0.2.2
@@ -57,6 +58,7 @@ Its own package identity (`WintermGhostty`), its own execution alias (`wtg.exe`)
 - **x64 only.** Zig 0.16.0 cannot target `aarch64-windows-msvc` at all, so there is no ARM64 build to ship.
 - **KD-04** — a pane in a background *window* keeps drawing a focused-looking blinking cursor, and keeps presenting frames to do it.
 - **KD-05** — the Windows cursor-blink settings are ignored, including turning blinking off.
+- **GD-15** — a `sendInput` action can only send literal text into a ghostty pane. Its escape sequences and control characters arrive as spaces, because the write goes through the engine's paste encoder. Broadcast input is affected the same way.
 
 Each defect in `docs/known-defects.md` records what was measured rather than what was assumed, and what would tell the remaining hypotheses apart.
 

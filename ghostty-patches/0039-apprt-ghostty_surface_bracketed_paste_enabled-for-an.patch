@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 11 Aug 2026 14:16:02 -0700
+Subject: [PATCH] apprt: ghostty_surface_bracketed_paste_enabled for an
+ embedder's paste UI
+
+ghostty_surface_text is documented as "treated like a paste", and it is:
+it reaches completeClipboardPaste, which frames the data in ESC[200~ /
+ESC[201~ whenever DEC mode 2004 is on. An embedder therefore pastes
+correctly without knowing anything about the mode.
+
+What it cannot do is answer the questions that surround a paste, because
+those are the embedder's own UI and libghostty never sees them. Windows
+Terminal has three: whether trimming the pasted text is safe, whether an
+empty clipboard should still send bare fenceposts, and whether to raise
+the multi-line paste warning - which is only worth raising when the
+application cannot tell a paste from typing.
+
+Read under the renderer lock, the same way mouseCaptured answers the
+same shape of question, so the embedder and ghostty cannot disagree
+about which mode the terminal is in.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ include/ghostty.h      |  1 +
+ src/Surface.zig        | 13 +++++++++++++
+ src/apprt/embedded.zig | 11 +++++++++++
+ 3 files changed, 25 insertions(+)
+
+diff --git a/include/ghostty.h b/include/ghostty.h
+index b316451ae..2759b8924 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -1256,6 +1256,7 @@ GHOSTTY_API bool ghostty_surface_key_is_binding(ghostty_surface_t,
+ GHOSTTY_API void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
+ GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
+ GHOSTTY_API bool ghostty_surface_mouse_captured(ghostty_surface_t);
++GHOSTTY_API bool ghostty_surface_bracketed_paste_enabled(ghostty_surface_t);
+ GHOSTTY_API bool ghostty_surface_mouse_button(ghostty_surface_t,
+                                                  ghostty_input_mouse_state_e,
+                                                  ghostty_input_mouse_button_e,
+diff --git a/src/Surface.zig b/src/Surface.zig
+index ebd313104..11bf06988 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -3845,6 +3845,19 @@ pub fn mouseCaptured(self: *Surface) bool {
+     return self.io.terminal.flags.mouse_event != .none;
+ }
+ 
++/// Returns true if bracketed paste mode (DEC mode 2004) is enabled.
++///
++/// A paste made through this surface is already framed for the caller;
++/// this only answers the question, for an apprt that has paste-adjacent
++/// UI of its own to decide (a multi-line paste warning, say, which is
++/// only worth showing when the application cannot tell paste from
++/// typing).
++pub fn bracketedPasteEnabled(self: *Surface) bool {
++    self.renderer_state.mutex.lockUncancelable(global.io());
++    defer self.renderer_state.mutex.unlock(global.io());
++    return self.io.terminal.modes.get(.bracketed_paste);
++}
++
+ /// Called for mouse button press/release events. This will return true
+ /// if the mouse event was consumed in some way (i.e. the program is capturing
+ /// mouse events). If the event was not consumed, then false is returned.
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index ac4c943cf..b50584704 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -2104,6 +2104,17 @@ pub const CAPI = struct {
+         return surface.core_surface.mouseCaptured();
+     }
+ 
++    /// Returns true if the surface currently has bracketed paste mode
++    /// (DEC mode 2004) enabled.
++    ///
++    /// ghostty_surface_text already frames a paste when this is on, so an
++    /// embedder does not need this to paste correctly. It is here for the
++    /// paste-adjacent UI an embedder may own: whether to warn about a
++    /// multi-line paste, whether trimming the pasted text is safe.
++    export fn ghostty_surface_bracketed_paste_enabled(surface: *Surface) bool {
++        return surface.core_surface.bracketedPasteEnabled();
++    }
++
+     /// Tell the surface that it needs to schedule a render
+     export fn ghostty_surface_mouse_button(
+         surface: *Surface,

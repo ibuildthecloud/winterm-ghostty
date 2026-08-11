@@ -163,12 +163,55 @@ presses doubled. The actual cause was upstream of encoding entirely: the same
 button was pressed twice at the ghostty layer, by two different call sites in
 the selection path. Evidence that fits a hypothesis is not evidence for it.
 
-### GD-08 — Bracketed paste is always off  ([#8](https://github.com/ibuildthecloud/winterm-ghostty/issues/8))
+### GD-08 — Bracketed paste is always off — **implemented 2026-08-11**  ([#8](https://github.com/ibuildthecloud/winterm-ghostty/issues/8))
 
-`BracketedPasteEnabled` returns false, so WT does not wrap a paste in
-`ESC[200~`/`ESC[201~` and does not warn about multi-line pastes on the strength
-of the terminal's own mode. ghostty tracks the mode internally and honours it for
-its own paste path; the state is not exposed to an embedder. *Read.*
+Was: `BracketedPasteEnabled` returned a hardcoded false.
+
+**The entry's mechanism was wrong, and that is the interesting part.** It said
+WT "does not wrap a paste in `ESC[200~`/`ESC[201~`". WT does not, but libghostty
+always has. `ghostty_surface_text` — the call `SendInput` has used since the
+first ghostty pane — is documented as *"treated like a paste"*, and it is: it
+reaches `completeClipboardPaste`, which frames the data whenever mode 2004 is
+on. Pastes were never unframed. A wrap added on the WT side would have been the
+*second* pair.
+
+What false actually cost is everything WT decides *around* a paste. Three call
+sites read this one property, all above the core, and all of them were deciding
+as though every application were paste-blind:
+
+| Reader | With the mode wrongly false |
+|---|---|
+| `TrimPaste` | trimmed trailing whitespace the application wanted kept |
+| empty clipboard | sent nothing, where WT's own core calls the bare fencepost pair load-bearing |
+| `warning.multiLinePaste: automatic` | warned on every multi-line paste, including into applications that had said they can tell a paste from typing |
+
+**Now implemented.** `BracketedPasteEnabled` answers from
+`ghostty_surface_bracketed_paste_enabled`, read under the renderer lock — the
+same shape as `mouse_captured` in GD-07, so the embedder and ghostty cannot
+disagree about the mode.
+
+The empty-clipboard branch needed writing, and only became *reachable* now:
+`TerminalPage` discards an empty paste outright when it believes the mode is
+off, so the load-bearing empty paste never got as far as the core before.
+libghostty returns early on zero-length input before its encoder runs, so
+`PasteText` writes the bare pair straight to the connection.
+
+Measured in a real ghostty pane with a raw-input probe, mode 2004 on and
+`warning.multiLinePaste` set to `automatic`:
+
+| Pasted | Received |
+|---|---|
+| `HELLO` | `<ESC>[200~HELLO<ESC>[201~` |
+| `AAA\r\nBBB` | `<ESC>[200~AAA<CR><LF>BBB<ESC>[201~`, no warning dialog |
+| *(empty clipboard)* | `<ESC>[200~<ESC>[201~` |
+
+The multi-line paste arriving unattended is itself the evidence: under
+`automatic` the dialog is raised exactly when the flag reads false, so nothing
+blocking the paste means the flag is being read.
+
+The same probe run turned up
+[GD-15](#gd-15--sendinput-cannot-send-an-escape-sequence--15), which is not this
+bug and predates it.
 
 ### GD-09 — Appearance beyond font and colours is not applied  ([#9](https://github.com/ibuildthecloud/winterm-ghostty/issues/9))
 
@@ -199,6 +242,46 @@ Clear-buffer actions (clear viewport / scrollback / all) do nothing on a ghostty
 pane. `clear_screen` exists as a binding action and covers screen+scrollback;
 WT's three-way distinction does not map onto it exactly, which is why this was
 left rather than half-wired. *Read.*
+
+### GD-15 — `sendInput` cannot send an escape sequence  ([#15](https://github.com/ibuildthecloud/winterm-ghostty/issues/15))
+
+`GhosttyControlCore::SendInput` calls `ghostty_surface_text`, which is
+libghostty's **paste** entry point. That is right for `PasteText` and wrong for
+everything else that reaches it, because `input/paste.zig` deliberately does two
+things to pasted data — xterm's behaviour, and correct for a paste:
+
+- every ESC, DEL, NUL, BS and the terminal's own control characters
+  (Ctrl+C, Ctrl+Z, Ctrl+S, …) is **replaced with a space**, so that pasted text
+  cannot inject commands;
+- the data is **framed in `ESC[200~`/`ESC[201~`** when mode 2004 is on.
+
+A paste wants both. A `sendInput` action wants neither: it is the user
+deliberately sending bytes, and its whole purpose is usually the escape
+sequence. Broadcast input (`RawWriteString`) and any character that falls
+through to `SendCharEvent` take the same path.
+
+Measured, with a `sendInput` action carrying `\e[31mREDTEXT\e[0m` into a
+ghostty pane running a raw-input probe with mode 2004 on:
+
+| | |
+|---|---|
+| sent | `<ESC>[31mREDTEXT<ESC>[0m` |
+| received | `<ESC>[200~ [31mREDTEXT [0m<ESC>[201~` |
+
+Both ESCs gone to spaces, and the action framed as a paste it never was. So on
+a ghostty pane a `sendInput` action can send literal text and nothing else.
+
+This is **not** GD-08 and does not depend on it — the ESC stripping happens
+whether or not mode 2004 is on. It was found by the probe run that verified
+GD-08, having been there since `SendInput` was first written.
+
+**Closing it** means not routing non-paste writes through the paste encoder.
+`WriteToConnection` — the hook libghostty's external termio backend already
+calls to reach WT's conpty — is a literal byte path and is right there;
+`PasteText` keeps using `ghostty_surface_text`. The open question is what else
+`ghostty_surface_text` does for input that a direct write would skip, most
+obviously ghostty's scroll-to-bottom-on-input. Worth answering before writing
+the patch rather than after.
 
 ---
 

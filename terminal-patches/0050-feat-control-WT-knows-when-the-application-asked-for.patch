@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 11 Aug 2026 14:47:19 -0700
+Subject: [PATCH] feat(control): WT knows when the application asked for
+ bracketed paste (GD-08)
+
+Patch 50. BracketedPasteEnabled returned a hardcoded false.
+
+The issue text said this meant WT never wraps a paste in ESC[200~ /
+ESC[201~. That part was wrong, and worth recording. ghostty_surface_text
+is documented as "treated like a paste" and it is - it lands in
+completeClipboardPaste, which frames the data whenever mode 2004 is on.
+Pastes have been correctly fenceposted since the first ghostty pane. A
+wrap added here would have been the second one.
+
+What false actually cost is everything WT decides *around* the paste,
+all of it above the core and all of it reading this one property:
+TrimPaste trimmed text it should have left alone, an empty clipboard
+sent nothing where it should send bare fenceposts, and the multi-line
+warning fired on every multi-line paste - including into applications
+that had said, in as many words, that they can tell a paste from typing.
+
+The empty-clipboard case needs the extra branch in PasteText. It only
+became reachable now: TerminalPage discards an empty paste outright when
+it believes the mode is off, so the load-bearing empty paste never got
+that far before. libghostty returns early on zero-length input before
+its encoder runs, so the bare pair is written straight to the
+connection.
+
+Measured in a real ghostty pane with a raw-input probe, mode 2004 on:
+
+  HELLO          -> <ESC>[200~HELLO<ESC>[201~
+  AAA\r\nBBB     -> <ESC>[200~AAA<CR><LF>BBB<ESC>[201~, no warning dialog
+  (empty)        -> <ESC>[200~<ESC>[201~
+
+with warning.multiLinePaste set to automatic, so the multi-line paste
+arriving unattended is itself the evidence the flag is read.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 39 ++++++++++++++++++-
+ 1 file changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 88e1ccc85..6b6f1f3a5 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -838,6 +838,30 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+     void GhosttyControlCore::PasteText(const winrt::hstring& hstr)
+     {
++        // Non-empty text needs nothing from us: ghostty_surface_text is
++        // libghostty's paste entry point, so it already fenceposts the data
++        // when mode 2004 is on and strips the bytes xterm strips. Adding our
++        // own ESC[200~ here would send two of them.
++        //
++        // Empty text is the exception, and it is not a no-op. An empty
++        // bracketed paste is how an application learns a paste happened with
++        // nothing on the clipboard - WT's own core calls that load-bearing and
++        // GNOME Terminal does the same. libghostty returns early on
++        // zero-length input before the encoder ever sees it, so the bare pair
++        // has to come from here.
++        //
++        // Reachable only since BracketedPasteEnabled started telling the
++        // truth: TerminalPage discards an empty paste outright when it thinks
++        // the mode is off, which it always did before.
++        if (hstr.empty())
++        {
++            if (BracketedPasteEnabled())
++            {
++                WriteToConnection("\x1b[200~\x1b[201~");
++            }
++            return;
++        }
++
+         SendInput(hstr);
+     }
+ 
+@@ -1598,7 +1622,20 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     bool GhosttyControlCore::ForceCursorVisible() const noexcept { return false; }
+     void GhosttyControlCore::ForceCursorVisible(bool /*force*/) {}
+ 
+-    bool GhosttyControlCore::BracketedPasteEnabled() const noexcept { return false; }
++    // Whether the application has turned on DEC mode 2004.
++    //
++    // This is not what frames a paste. ghostty_surface_text is documented as
++    // "treated like a paste", so libghostty has been wrapping our pastes in
++    // ESC[200~/ESC[201~ correctly since the first ghostty pane - PasteText
++    // must not add a second pair. What was missing is WT *knowing*, and three
++    // things above the core read it: whether to trim the pasted text
++    // (TrimPaste), whether an empty clipboard still sends bare fenceposts, and
++    // whether to raise the multi-line paste warning. All three were deciding
++    // as though every application were paste-blind.
++    bool GhosttyControlCore::BracketedPasteEnabled() const noexcept
++    {
++        return _surface && ghostty_surface_bracketed_paste_enabled(_surface);
++    }
+     void GhosttyControlCore::ClearBuffer(Control::ClearBufferType /*clearType*/) {}
+     // The whole screen, scrollback included. GHOSTTY_POINT_SCREEN counts from
+     // the start of the scrollback rather than the viewport, and the TOP_LEFT /
