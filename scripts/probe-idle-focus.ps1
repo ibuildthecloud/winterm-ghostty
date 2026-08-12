@@ -57,7 +57,17 @@ param(
 
     # Blink reports per second above which the run is reported as KD-04. A
     # 600 ms blink reports 1.67/sec; a pane that is not blinking reports ~0.
-    [double] $FailRatePerSecond = 0.5
+    [double] $FailRatePerSecond = 0.5,
+
+    # Hold another window in front while the terminal starts, so the window
+    # under test is never activated.
+    #
+    # This is the case KD-04 was actually about, and without this switch you
+    # cannot ask for it: a launch normally wins the foreground, and only loses
+    # it when a person happens to be typing elsewhere at that moment. Left to
+    # chance, the run measures the ordinary focused pane instead and a blinking
+    # cursor looks like a failure when it is correct.
+    [switch] $HoldForeground
 )
 
 $ErrorActionPreference = 'Stop'
@@ -127,6 +137,21 @@ public class IdleDbwin : IDisposable {
 }
 '@
 
+# SetForegroundWindow is refused unless this thread shares an input queue with
+# whoever owns the foreground - and it loses outright to a person typing, which
+# is reported rather than papered over.
+function Set-Foreground([IntPtr]$hwnd) {
+    $fg = [Probe.Win]::GetForegroundWindow()
+    $fgPid = [uint32]0
+    $other = [Probe.Win]::GetWindowThreadProcessId($fg, [ref]$fgPid)
+    $me = [Probe.Win]::GetCurrentThreadId()
+    [void][Probe.Win]::AttachThreadInput($me, $other, $true)
+    [void][Probe.Win]::SetForegroundWindow($hwnd)
+    [void][Probe.Win]::AttachThreadInput($me, $other, $false)
+    Start-Sleep -Milliseconds 250
+    return ([Probe.Win]::GetForegroundWindow() -eq $hwnd)
+}
+
 function Get-MainHwnd([int]$procId) {
     $p = Get-Process -Id $procId
     for ($i = 0; $i -lt 40; $i++) {
@@ -153,9 +178,28 @@ $dbwin = New-Object IdleDbwin
 if (-not $dbwin.Started) { throw 'could not open the DBWIN channel; nothing can be measured' }
 
 $env:GHOSTTY_RENDER_DIAG = '1'
+$holder = $null
 try {
+    if ($HoldForeground) {
+        # Occupy the foreground before the terminal exists, and keep taking it
+        # back for the terminal's first seconds. mspaint deliberately: a
+        # packaged app's top-level window does not belong to the launched pid,
+        # which makes it useless to hold on to.
+        $holder = Start-Process mspaint.exe -PassThru
+        $holderHwnd = Get-MainHwnd $holder.Id
+        [void](Set-Foreground $holderHwnd)
+    }
+
     $before = @(Get-Process WindowsTerminal -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
     Start-Process wtgd.exe -ArgumentList @('-w', '-1', '-p', "`"$ProfileName`"")
+
+    if ($HoldForeground) {
+        $hold = [Diagnostics.Stopwatch]::StartNew()
+        while ($hold.Elapsed.TotalSeconds -lt 6) {
+            if ([Probe.Win]::GetForegroundWindow() -ne $holderHwnd) { [void](Set-Foreground $holderHwnd) }
+            Start-Sleep -Milliseconds 100
+        }
+    }
 
     $newPid = $null
     for ($i = 0; $i -lt 80; $i++) {
@@ -185,18 +229,12 @@ try {
         # It was activated, so measure the deactivation half: put it behind
         # another window. mspaint deliberately - a packaged app's top-level
         # window does not belong to the launched pid.
-        $paint = Start-Process mspaint.exe -PassThru
-        $paintHwnd = Get-MainHwnd $paint.Id
-        $fg = [Probe.Win]::GetForegroundWindow()
-        $fgPid = [uint32]0
-        $other = [Probe.Win]::GetWindowThreadProcessId($fg, [ref]$fgPid)
-        [void][Probe.Win]::AttachThreadInput([Probe.Win]::GetCurrentThreadId(), $other, $true)
-        [void][Probe.Win]::SetForegroundWindow($paintHwnd)
-        [void][Probe.Win]::AttachThreadInput([Probe.Win]::GetCurrentThreadId(), $other, $false)
+        $paint = if ($holder) { $holder } else { Start-Process mspaint.exe -PassThru }
+        [void](Set-Foreground (Get-MainHwnd $paint.Id))
         Start-Sleep -Milliseconds 500
         $phase = 'activated, then put behind another window'
     } else {
-        $paint = $null
+        $paint = $holder
         $phase = 'never activated (the foreground never came here)'
     }
 
@@ -208,14 +246,12 @@ try {
     Start-Sleep -Seconds $IdleSeconds
     $tIdleEnd = [DateTime]::UtcNow.Ticks
 
-    # Bring it back: the counters ride home on the first blink report after
-    # re-activation, which is the only way to read a period that was silent.
-    $fg = [Probe.Win]::GetForegroundWindow()
-    $fgPid = [uint32]0
-    $other = [Probe.Win]::GetWindowThreadProcessId($fg, [ref]$fgPid)
-    [void][Probe.Win]::AttachThreadInput([Probe.Win]::GetCurrentThreadId(), $other, $true)
-    [void][Probe.Win]::SetForegroundWindow($hwnd)
-    [void][Probe.Win]::AttachThreadInput([Probe.Win]::GetCurrentThreadId(), $other, $false)
+    # Bring it back. This does two jobs: the counters ride home on the first
+    # blink report after re-activation, which is the only way to read a period
+    # that was silent - and blink reports starting *here* prove the diagnostic
+    # was working all along, which is what makes the silence above mean
+    # something.
+    $backInFront = Set-Foreground $hwnd
     $tEnd = [DateTime]::UtcNow.Ticks
     Start-Sleep -Seconds 3
 
@@ -233,6 +269,11 @@ try {
     }
     Write-Host "engine proven ghostty ($($traces.Count) trace lines from pid $newPid)" -ForegroundColor DarkGray
     Write-Host "phase: $phase"
+    if ($HoldForeground -and $everForeground) {
+        Write-Host '  note: -HoldForeground did not manage to keep the terminal out of the' -ForegroundColor Yellow
+        Write-Host '  foreground, so this measured the deactivation case, not the never-' -ForegroundColor Yellow
+        Write-Host '  activated one.' -ForegroundColor Yellow
+    }
 
     # The verdict comes from the reports that arrived *while the window was in
     # the background*, not from a before/after difference in the totals. Each
@@ -273,11 +314,55 @@ try {
     # says so rather than certifying. (A fixed build in a window the foreground
     # never reached blinks at no point in the run, so this is a real outcome, not
     # a corner case: it happens whenever a person is using the machine.)
+    # A held-back window that never blinks is the result we want, and it is also
+    # what a diagnostic that never ran looks like. Bringing the window back
+    # would tell them apart, but that loses to a person at the keyboard - so
+    # when it has to, this runs a control instead: a second window launched with
+    # nothing holding it back, which should take the foreground and blink. If it
+    # does, the silence above was the pane being unfocused, not the instrument
+    # being dead.
+    if ($HoldForeground -and $before.Count -eq 0 -and $after.Count -eq 0) {
+        Write-Host 'control: launching a second window with nothing holding it back...'
+        $ctlBefore = @(Get-Process WindowsTerminal -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+        Start-Process wtgd.exe -ArgumentList @('-w', '-1', '-p', "`"$ProfileName`"")
+        $ctlPid = $null
+        for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Milliseconds 250
+            $now = @(Get-Process WindowsTerminal -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+            $d = $now | Where-Object { $ctlBefore -notcontains $_ }
+            if ($d) { $ctlPid = $d[0]; break }
+        }
+        $ctlStart = [DateTime]::UtcNow.Ticks
+        Start-Sleep -Seconds 8
+        $ctlLines = @($dbwin.Lines.ToArray() | Where-Object {
+            $_.Item2 -eq $ctlPid -and $_.Item3 -match '\[ghostty-diag\]' -and $_.Item1 -ge $ctlStart })
+        if ($ctlPid) {
+            $ctlHwnd = try { Get-MainHwnd $ctlPid } catch { [IntPtr]::Zero }
+            if ($ctlHwnd -ne [IntPtr]::Zero) {
+                [IntPtr]$r2 = 0
+                [void][Probe.Win]::SendMessageTimeoutW($ctlHwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero, 0x0002, 3000, [ref]$r2)
+            }
+        }
+        Write-Host ("  control window: {0} blink reports in 8s" -f $ctlLines.Count)
+        if ($ctlLines.Count -ge 3) {
+            Write-Host ''
+            Write-Host ("ok: a window held out of the foreground never blinked ({0} reports in {1:N1}s), " -f $during.Count, $idleSpan) -ForegroundColor Green
+            Write-Host ("    while a control window that took the foreground reported {0} times in 8s." -f $ctlLines.Count) -ForegroundColor Green
+            exit 0
+        }
+        Write-Host '  the control did not blink either, so it did not take the foreground' -ForegroundColor Yellow
+        Write-Host '  (or the diagnostic never ran) - nothing is proven.' -ForegroundColor Yellow
+    }
+
     if ($before.Count -eq 0 -and $after.Count -eq 0) {
         Write-Host 'INCONCLUSIVE: the pane never blinked at any point in this run, so a silent' -ForegroundColor Yellow
         Write-Host 'background period cannot be distinguished from a diagnostic that never ran.' -ForegroundColor Yellow
-        Write-Host 'The window has to be in front at some point. Re-run with nobody at the' -ForegroundColor Yellow
-        Write-Host 'keyboard, or click the window yourself and use item 8 of docs\manual-validation.md.' -ForegroundColor Yellow
+        Write-Host 'Proving it needs the window in front at some point, and taking the' -ForegroundColor Yellow
+        Write-Host 'foreground loses to a person at the keyboard.' -ForegroundColor Yellow
+        Write-Host '' -ForegroundColor Yellow
+        Write-Host 'Either re-run with nobody typing, or check it by eye: the terminal that' -ForegroundColor Yellow
+        Write-Host 'came up behind Paint should show NO cursor, and take one the moment you' -ForegroundColor Yellow
+        Write-Host 'click it. That is item 8 of docs\manual-validation.md.' -ForegroundColor Yellow
         exit 2
     }
     Write-Host ("ok: a background pane is idle - {0} blink reports in {1:N1}s, against {2} while in front." -f

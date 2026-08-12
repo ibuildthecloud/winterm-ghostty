@@ -220,10 +220,27 @@ because a focus gate that is too aggressive fails in the *other* direction:
    go on unfocus* the same way - the gate is in `TermControl`, which both
    engines share, so this is the regression check for the shared half. Its
    cursor may well not blink where the ghostty one does; see above.
-5. Launch a window from a script while working in another app
-   (`wtgd.exe -w -1 -p "<ghostty profile>"` from a terminal you keep focused).
-   **That pane must come up with no cursor**, and take one the moment you click
-   it. This is the case the defect was actually about.
+5. The case the defect was actually about: a window that is never brought to the
+   front. **Do not test this by launching a terminal and not clicking it** - a
+   launch normally wins the foreground, so the pane is focused, and a blinking
+   cursor there is correct. That version of this step wasted a round of
+   validation.
+
+   Let the script arrange it and watch the screen:
+
+   ```powershell
+   .\scripts\probe-idle-focus.ps1 -HoldForeground
+   ```
+
+   It puts Paint in front first and keeps taking the foreground back for the
+   terminal's first seconds, so the terminal really does come up behind it.
+   **Look at that terminal window: it must show no cursor at all**, and take one
+   the moment you click it.
+
+   The script's own verdict for this case needs the window in front at some
+   point, which loses to a person at the keyboard - it says INCONCLUSIVE rather
+   than passing when that happens. The eyes are the check here; the counters are
+   the check in the deactivation case above.
 
 ---
 
