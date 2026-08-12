@@ -32,7 +32,7 @@ Nothing switches engine by itself. Add `"engine": "ghostty"` to a profile — or
 
 To confirm a pane is really using it, open the search box (`Ctrl+Shift+F`): on a ghostty pane the regex and case toggles are greyed out.
 
-## Fixed since 0.2.2
+## Fixed in 0.2.3
 
 - **A pane's diagnostics can no longer hold up the window.** The engine traces to the debugger channel, and that channel is machine-wide: if anything on the machine has attached to it and stopped draining — a debugger that was killed, a tool that exited badly — every write to it blocks for ten seconds. A pane traced about forty lines while it started, on the UI thread, so a terminal could take minutes to appear. The traces now go out on their own thread ([KD-09](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/known-defects.md)).
 - **A terminal in the background no longer looks focused.** A window that came up behind another one — one launched from a script while you work elsewhere — gave its pane a blinking, focused-looking cursor that never went away, told the application it had focus, and woke the GPU renderer twice a second for the rest of the window's life. A pane is now focused only when its window is genuinely in front ([KD-04](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/known-defects.md)).
@@ -60,6 +60,7 @@ Its own package identity (`WintermGhostty`), its own execution alias (`wtg.exe`)
 - **No accessibility.** There is no UIA text provider on a ghostty pane, so **Narrator and NVDA cannot read one**. If you rely on a screen reader, keep those profiles on `"engine": "cascadia"`.
 - **x64 only.** Zig 0.16.0 cannot target `aarch64-windows-msvc` at all, so there is no ARM64 build to ship.
 - **KD-05** — the Windows cursor-blink settings are ignored, including turning blinking off. A focused ghostty pane blinks at a fixed 600 ms and presents a frame for each blink, where a cascadia pane obeys the system setting.
+- **KD-10** — a focused pane presents twice a second for its cursor blink, but the drawn cursor barely toggles: measured at ten blink wakes with the pixels unchanged. The blink is not reaching the screen, which also means those presents are buying nothing.
 
 Each defect in `docs/known-defects.md` records what was measured rather than what was assumed, and what would tell the remaining hypotheses apart.
 
