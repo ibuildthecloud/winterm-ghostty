@@ -206,13 +206,20 @@ What still needs eyes, because nothing here can see a pixel WT draws, and
 because a focus gate that is too aggressive fails in the *other* direction:
 
 1. Open a window on a ghostty profile and click into the pane. **The cursor is
-   drawn and blinks; typing works.**
+   drawn; typing works.**
+
+   Whether it *blinks* is not the check, and expecting it to blink will mislead
+   you: a cascadia pane obeys the Windows "show blinking cursor" setting
+   (`SM_CARETBLINKINGENABLED`, off on this machine, which is why its cursor sits
+   steady) while a ghostty pane ignores it and blinks regardless. That
+   difference is KD-05, not this. What matters here is drawn versus absent.
 2. Click another application. **The cursor goes** (`cursor-style-unfocused`) and
    the pane does not blink.
 3. Click back. **The cursor returns.**
-4. Do 1-3 again with a **cascadia** pane beside it. Its cursor must behave the
-   same way - the gate is in `TermControl`, which both engines share, so this
-   is the regression check for the shared half.
+4. Do 1-3 again with a **cascadia** pane beside it. It must *appear on focus and
+   go on unfocus* the same way - the gate is in `TermControl`, which both
+   engines share, so this is the regression check for the shared half. Its
+   cursor may well not blink where the ghostty one does; see above.
 5. Launch a window from a script while working in another app
    (`wtgd.exe -w -1 -p "<ghostty profile>"` from a terminal you keep focused).
    **That pane must come up with no cursor**, and take one the moment you click
