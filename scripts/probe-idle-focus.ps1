@@ -72,6 +72,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Both Add-Type blocks are guarded, because a type cannot be redefined in a
+# PowerShell session and this script is meant to be run more than once in the
+# same shell - the second run used to die on "the type name 'IdleDbwin' already
+# exists" before it measured anything.
+if (-not ('Probe.Win' -as [type])) {
 Add-Type -Namespace Probe -Name Win -MemberDefinition @'
 [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
 [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
@@ -81,11 +86,14 @@ Add-Type -Namespace Probe -Name Win -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
 [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
 [DllImport("user32.dll")] public static extern IntPtr SendMessageTimeoutW(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr res);
+[DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
 '@
+}
 
 # The DBWIN channel. Same shape as scripts\smoke-release.ps1 - the pid is not
 # optional, because DBWIN is machine-global and every other Windows Terminal on
 # the box writes to it too.
+if (-not ('IdleDbwin' -as [type])) {
 Add-Type @'
 using System;using System.Threading;using System.Runtime.InteropServices;
 using System.IO.MemoryMappedFiles;
@@ -136,11 +144,16 @@ public class IdleDbwin : IDisposable {
   }
 }
 '@
+}
 
 # SetForegroundWindow is refused unless this thread shares an input queue with
-# whoever owns the foreground - and it loses outright to a person typing, which
-# is reported rather than papered over.
+# whoever owns the foreground, and Windows' foreground lock refuses it outright
+# while someone is using the machine. A synthetic ALT tap releases that lock -
+# the trick scripts\smoke-release.ps1 already relies on for the same reason.
+# Without it, this can only measure an idle desktop.
 function Set-Foreground([IntPtr]$hwnd) {
+    [Probe.Win]::keybd_event(0x12, 0x38, 0, [UIntPtr]::Zero)          # ALT down
+    [Probe.Win]::keybd_event(0x12, 0x38, 2, [UIntPtr]::Zero)          # ALT up
     $fg = [Probe.Win]::GetForegroundWindow()
     $fgPid = [uint32]0
     $other = [Probe.Win]::GetWindowThreadProcessId($fg, [ref]$fgPid)

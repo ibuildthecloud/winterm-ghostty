@@ -108,6 +108,9 @@ if (-not $NoGhostty) {
     $cfg | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $sdir 'settings.json') -Encoding utf8
 }
 
+# Guarded: a type cannot be redefined in a PowerShell session, and this gate
+# gets run more than once in the same shell.
+if (-not ('Smoke' -as [type])) {
 Add-Type @'
 using System;using System.Runtime.InteropServices;
 [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
@@ -140,6 +143,7 @@ public static class Smoke {
   public static void SplitPane(){ K(0x11,0x1D,0); K(0x10,0x2A,0); K(0x44,0x20,0); K(0x44,0x20,KEYUP); K(0x10,0x2A,KEYUP); K(0x11,0x1D,KEYUP); }
 }
 '@
+}
 
 function Assert-Alive([System.Diagnostics.Process] $p, [string] $stage) {
     $q = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
@@ -175,6 +179,9 @@ function Assert-Alive([System.Diagnostics.Process] $p, [string] $stage) {
 # GhosttyControlCore::_trace writes "[ghostty] ..." through OutputDebugString
 # unconditionally, in every configuration. Listening on the DBWIN channel turns
 # "is this the engine I think it is" into a fact.
+# Guarded: a type cannot be redefined in a PowerShell session, and this gate
+# gets run more than once in the same shell.
+if (-not ('Dbwin' -as [type])) {
 Add-Type @'
 using System;using System.Threading;using System.Runtime.InteropServices;
 using System.IO.MemoryMappedFiles;
@@ -228,6 +235,7 @@ public class Dbwin : IDisposable {
   }
 }
 '@
+}
 $dbwin = New-Object Dbwin
 $script:dbwin = $dbwin
 if (-not $dbwin.Started) { Write-Host '  WARNING: could not open the DBWIN channel; engine cannot be proven' -ForegroundColor Yellow }

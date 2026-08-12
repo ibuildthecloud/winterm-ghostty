@@ -233,14 +233,21 @@ because a focus gate that is too aggressive fails in the *other* direction:
    ```
 
    It puts Paint in front first and keeps taking the foreground back for the
-   terminal's first seconds, so the terminal really does come up behind it.
-   **Look at that terminal window: it must show no cursor at all**, and take one
-   the moment you click it.
+   terminal's first seconds, so the terminal really does come up behind it, and
+   then reclaims the foreground at the end so the silence can be told apart from
+   a diagnostic that never ran. A pass reads:
 
-   The script's own verdict for this case needs the window in front at some
-   point, which loses to a person at the keyboard - it says INCONCLUSIVE rather
-   than passing when that happens. The eyes are the check here; the counters are
-   the check in the deactivation case above.
+   ```
+   phase: never activated (the foreground never came here)
+     blink reports:  0 before  |  0 during 12.0s in the background (0.00/sec)  |  3 after coming back
+   ```
+
+   Silent while it was never in front, blinking the moment it was - same window,
+   same run.
+
+   **While it runs, look at that terminal window: it must show no cursor at
+   all**, and take one when the script brings it forward at the end. That part
+   is still eyes only; nothing here can see a pixel WT draws.
 
 ---
 
