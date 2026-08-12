@@ -59,6 +59,12 @@ param(
     # 600 ms blink reports 1.67/sec; a pane that is not blinking reports ~0.
     [double] $FailRatePerSecond = 0.5,
 
+    # Leave the terminal open at the end instead of closing it. The counters are
+    # decided by then; this is for the half only eyes can check - whether a
+    # cursor is drawn - which three seconds before the window vanishes is not
+    # long enough for.
+    [switch] $KeepOpen,
+
     # Hold another window in front while the terminal starts, so the window
     # under test is never activated.
     #
@@ -289,8 +295,13 @@ try {
     $traces = @($lines | Where-Object { $_.Item2 -eq $newPid -and $_.Item3 -match '\[ghostty\]' })
 
     if ($paint) { Stop-Process -Id $paint.Id -Force -ErrorAction SilentlyContinue }
-    [IntPtr]$res = 0
-    [void]$W::SendMessageTimeoutW($hwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero, 0x0002, 3000, [ref]$res)
+    if ($KeepOpen) {
+        Write-Host ("the terminal (pid {0}) is left open, in front, for you to look at: a " -f $newPid) -ForegroundColor Cyan
+        Write-Host '  focused pane draws a cursor. Close it yourself when done.' -ForegroundColor Cyan
+    } else {
+        [IntPtr]$res = 0
+        [void]$W::SendMessageTimeoutW($hwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero, 0x0002, 3000, [ref]$res)
+    }
 
     Write-Host ''
     if ($traces.Count -eq 0) {

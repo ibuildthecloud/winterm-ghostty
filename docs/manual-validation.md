@@ -229,8 +229,11 @@ because a focus gate that is too aggressive fails in the *other* direction:
    Let the script arrange it and watch the screen:
 
    ```powershell
-   .\scripts\probe-idle-focus.ps1 -HoldForeground
+   .\scripts\probe-idle-focus.ps1 -HoldForeground -KeepOpen
    ```
+
+   `-KeepOpen` leaves the terminal up at the end rather than closing it three
+   seconds later, which is not long enough to decide whether a cursor is there.
 
    It puts Paint in front first and keeps taking the foreground back for the
    terminal's first seconds, so the terminal really does come up behind it, and
