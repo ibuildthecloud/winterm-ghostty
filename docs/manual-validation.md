@@ -183,6 +183,43 @@ reaching the app.
 
 ---
 
+## 8. A background window's pane is not focused (KD-04)
+
+A terminal that is not in front must not look focused or cost anything. The
+mechanism this guards is subtle enough that it was diagnosed wrongly twice:
+XAML's routed `GotFocus` fires for a control in a window that has *never* been
+brought to the front, and `WM_ACTIVATE` says "active" for that window too, so
+the only truthful signal is the foreground window itself.
+
+Most of this is scriptable, and `scripts\probe-idle-focus.ps1` does it: it
+proves the engine from the process under test, then counts libghostty's blink
+reports while the window sits behind another one. Run that first.
+
+```powershell
+.\scripts\probe-idle-focus.ps1                 # a profile with "engine": "ghostty"
+```
+
+**Pass:** ~0 blink reports per second in the background, against ~1.7/sec while
+in front. The script prints both, and fails if the background rate is above 0.5.
+
+What still needs eyes, because nothing here can see a pixel WT draws, and
+because a focus gate that is too aggressive fails in the *other* direction:
+
+1. Open a window on a ghostty profile and click into the pane. **The cursor is
+   drawn and blinks; typing works.**
+2. Click another application. **The cursor goes** (`cursor-style-unfocused`) and
+   the pane does not blink.
+3. Click back. **The cursor returns.**
+4. Do 1-3 again with a **cascadia** pane beside it. Its cursor must behave the
+   same way - the gate is in `TermControl`, which both engines share, so this
+   is the regression check for the shared half.
+5. Launch a window from a script while working in another app
+   (`wtgd.exe -w -1 -p "<ghostty profile>"` from a terminal you keep focused).
+   **That pane must come up with no cursor**, and take one the moment you click
+   it. This is the case the defect was actually about.
+
+---
+
 ## What is covered automatically
 
 Do not re-test these by hand unless one of them is what you are changing.

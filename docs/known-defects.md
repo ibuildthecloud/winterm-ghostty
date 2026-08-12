@@ -320,7 +320,7 @@ square, which is nearly all of them.
 
 ---
 
-### KD-04 — A background pane keeps blinking and keeps presenting  ([#1](https://github.com/ibuildthecloud/winterm-ghostty/issues/1))
+### KD-04 — A background pane keeps blinking and keeps presenting — **fixed 2026-08-11**
 
 **Found** 2026-08-07 by measurement, while asking whether the idle present rate
 drops to zero when a pane is not focused. It does not.
@@ -336,44 +336,84 @@ notify=5 wakeup=53 update=53 present=54
 
 No gap. The pane presented at the blink rate for the whole unfocused period.
 
-#### Both ends are correct; the wire between them is missing
+#### The first explanation was wrong, and its own numbers said so
 
-- ghostty cancels the blink timer on focus loss, properly
-  (`renderer/Thread.zig:402-446` — `.focus` mailbox handler).
-- `GhosttyControlCore::LostFocus` calls `ghostty_surface_set_focus(surface,
-  false)` faithfully.
-- **`LostFocus` is never raised.** It comes from XAML's routed
-  `GotFocus`/`LostFocus` on the *control*, which do not fire when a different
-  top-level window takes the foreground — the control keeps logical focus
-  inside its own app.
+This entry used to claim that `LostFocus` is never raised, because XAML's routed
+focus events do not fire when another top-level window takes the foreground.
+**They do.** Traced on 2026-08-11, with `GhosttyControlCore` printing every focus
+call: another window taking the foreground produced `LostFocus` within
+milliseconds, the blink timer stopped, and the diagnostic — which reports *from*
+the blink timer — went silent for the whole background period. Over 12 s in the
+background the totals moved by +7 presents, where a running blink adds ~24.
 
-So the Phase 6 unfocused-cursor work (patch 30, `cursor-style-unfocused`), which
-a human did verify, was exercising **pane-to-pane** focus inside one window.
-Window-level deactivation is a case nobody tried.
+The tell was in the numbers above the whole time: **`notify` never moves.** A
+focus change queues a render, so a run that begins focused and ends focused
+without `notify` changing is a run in which the surface was never told anything
+about focus in either direction — not one in which a `LostFocus` went missing.
 
-#### What it costs
+#### What was actually happening
 
-- A background terminal draws a **blinking, focused-looking cursor**. Visually
-  wrong: a background terminal should not look focused.
-- Its render thread keeps waking ~1.7 times a second per pane, rebuilding the
-  whole grid and presenting the whole surface each time.
-- It is the second lever on Phase 7's idle criterion, and unlike cursor-blink
-  configuration this one is a bug rather than a knob.
+XAML's routed focus is **app-internal**. A control in a window that has never
+been brought to the front still receives `GotFocus`, because logical focus lives
+inside the app's own tree. So:
 
-#### Unknown, and worth measuring before fixing
+- A window that comes up behind another one — a terminal launched from a script,
+  or by another app, while the user works elsewhere — gives its pane `GotFocus`.
+- No deactivation ever follows, because the window was never activated.
+- The pane believes it is focused **for as long as it lives**: focused-looking
+  blinking cursor, focus reported to the application, and a full rebuild plus a
+  full-surface present every 600 ms.
 
-**Does a cascadia pane do the same?** If it does, this is a shared Windows
-Terminal gap rather than ours, and the fix belongs somewhere both engines see.
-If it does not, cascadia has a signal we are not using. Cheap to check: two
-screenshots of an inactive pane 300 ms apart, diffed over the cursor cell.
+Reproduced deterministically by holding another window in front while the
+terminal starts: `[ghostty-diag]` climbing +2/sec, unbroken, for the life of the
+window, with the foreground never once ours.
 
-#### Why it is not fixed here
+**And `WM_ACTIVATE` does not answer the question either.** WT's activation signal
+(`IslandWindow` → `AppHost::_WindowActivated` → `TerminalPage`) reports the active
+window of the *thread's input queue*, not the foreground. Measured:
+`TerminalPage::WindowActivated(1)` arriving while `GetForegroundWindow()` was
+another application's window. A first version of the fix gated on that flag and
+changed nothing at all.
 
-`IControlCore::WindowVisibilityChanged` exists but is minimise/restore, not
-activation — the wrong signal. Doing it properly means hooking window activation
-in `TermControl` and driving focus from it, which changes behaviour on a path
-**cascadia also runs through**, so it needs a cascadia-side regression check
-too. Deferred deliberately, not overlooked.
+#### The fix
+
+`TermControl::_pushCoreFocus` (terminal patch 52) sends the core routed focus
+**and** the window really being in front — `GetForegroundWindow() ==
+OwningHwnd()` — and only when the pair changes, since `GotFocus`/`LostFocus`
+enable and disable the UIA engine and send the focus-reporting escapes.
+Activation is kept as a *trigger* to re-evaluate (`TermControl::WindowActivated`,
+fanned out from `TerminalPage::WindowActivated` exactly like
+`WindowVisibilityChanged`, plus the initial state in `_SetupControl`), never as
+the answer. XAML's `GotFocus` is a second trigger, and it arrives after the
+foreground has changed, so a genuine activation is evaluated at least once with
+the foreground already correct — measured, both triggers agreeing.
+
+`GhosttyControlCore::_createSurface` also pushes the initial state, because a
+libghostty surface is born believing it is focused ("it is up to the apprt to set
+the correct value" — `renderer/Thread.zig`) and we are the apprt.
+
+Measured after, all four cases on the running app:
+
+| case | result |
+|---|---|
+| window in front | routed focus + in front → focused, blink runs at ~1.7/sec |
+| foreground moves away | `LostFocus`, blink stops, reports stop |
+| foreground comes back | focused again, blink resumes |
+| window never in front | `GotFocus` with `inFront=0` → **never focused, never blinks** |
+
+`scripts\probe-idle-focus.ps1` is the instrument: 7 blink reports before
+backgrounding, **1 in the following 15 s** (0.07/sec against 1.7/sec).
+
+**Not covered by any automated test.** It needs a real window, a real foreground
+and a GPU; the WT suites cannot see any of it. The probe script is the check, and
+it is item 8 of [manual-validation](manual-validation.md).
+
+#### What this leaves
+
+The blink *rate*, and whether it blinks at all, are still ours to get wrong:
+KD-05 — the system's cursor-blink settings are ignored — is untouched by this, and
+is what makes an idle **focused** ghostty pane cost ~1.7 presents/sec where a
+cascadia pane on the same machine costs none.
 
 ---
 

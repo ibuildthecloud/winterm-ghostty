@@ -34,6 +34,7 @@ To confirm a pane is really using it, open the search box (`Ctrl+Shift+F`): on a
 
 ## Fixed since 0.2.2
 
+- **A terminal in the background no longer looks focused.** A window that came up behind another one — one launched from a script while you work elsewhere — gave its pane a blinking, focused-looking cursor that never went away, told the application it had focus, and woke the GPU renderer twice a second for the rest of the window's life. A pane is now focused only when its window is genuinely in front ([KD-04](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/known-defects.md)).
 - **A `sendInput` action can send an escape sequence again.** Non-paste writes went through the engine's *paste* entry point, which replaces every ESC and control character with a space and frames the result as a paste — so a `sendInput` binding carrying an escape sequence sent spaces where the escapes should have been, and broadcast input did the same. Those writes are now literal; a real paste is still filtered and framed ([GD-15](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/documented-diffs.md)).
 - **Pastes are no longer treated as if every application were paste-blind.** The engine had always framed a paste in `ESC[200~`/`ESC[201~` correctly, but WT itself did not know the application had asked for it — so it trimmed pasted text that should have been left alone, dropped an empty paste that shells use to detect a paste at all, and raised the multi-line paste warning even for applications that can tell a paste from typing ([GD-08](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/documented-diffs.md)).
 - **Mouse input now reaches applications properly.** Mouse reporting was never implemented, so a full-screen application saw the selection machinery's side effects instead of its input: every press arrived twice, a single click sent no press at all, and the right button, middle button and wheel never arrived. Buttons, wheel and modifiers are now reported, and holding shift still selects text ([GD-07](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/documented-diffs.md)).
@@ -57,9 +58,7 @@ Its own package identity (`WintermGhostty`), its own execution alias (`wtg.exe`)
 
 - **No accessibility.** There is no UIA text provider on a ghostty pane, so **Narrator and NVDA cannot read one**. If you rely on a screen reader, keep those profiles on `"engine": "cascadia"`.
 - **x64 only.** Zig 0.16.0 cannot target `aarch64-windows-msvc` at all, so there is no ARM64 build to ship.
-- **KD-04** — a pane in a background *window* keeps drawing a focused-looking blinking cursor, and keeps presenting frames to do it.
-- **KD-05** — the Windows cursor-blink settings are ignored, including turning blinking off.
-- **GD-15** — a `sendInput` action can only send literal text into a ghostty pane. Its escape sequences and control characters arrive as spaces, because the write goes through the engine's paste encoder. Broadcast input is affected the same way.
+- **KD-05** — the Windows cursor-blink settings are ignored, including turning blinking off. A focused ghostty pane blinks at a fixed 600 ms and presents a frame for each blink, where a cascadia pane obeys the system setting.
 
 Each defect in `docs/known-defects.md` records what was measured rather than what was assumed, and what would tell the remaining hypotheses apart.
 

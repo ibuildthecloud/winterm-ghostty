@@ -1,0 +1,300 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 11 Aug 2026 18:20:33 -0700
+Subject: [PATCH] fix(control): a pane in a background window is not focused
+ (KD-04)
+
+A ghostty pane in a window that never came to the front blinked a
+focused-looking cursor for as long as it lived, and paid a full grid
+rebuild and a full-surface present every 600 ms for each blink -
+measured at an unbroken 1.7/sec through the whole life of such a window.
+
+KD-04 blamed a missing LostFocus. That was wrong, and its own numbers
+said so: `notify` never moved, and a focus change queues a render, so
+the surface was never told anything about focus in either direction.
+Tracing every focus call shows LostFocus does arrive when another window
+takes the foreground, and the blink stops there correctly.
+
+What actually happens is at the other end. XAML's routed focus is
+app-internal: a control in a window that has never been activated still
+gets GotFocus, because logical focus lives inside the app's own tree.
+Nothing contradicts it afterwards, because no deactivation can follow an
+activation that never happened. So the pane believes it is focused
+forever - blinking cursor, focus reported to the application, renderer
+woken twice a second.
+
+WM_ACTIVATE does not answer the question either. WT's activation signal
+reports the active window of the thread's input queue, not the
+foreground: TerminalPage::WindowActivated(1) arrives while
+GetForegroundWindow() is another application's window. A first version
+of this gated on that flag and changed nothing at all.
+
+So TermControl::_pushCoreFocus sends the core routed focus AND the
+window really being in front (GetForegroundWindow() == OwningHwnd()),
+and only on a change, since GotFocus/LostFocus enable and disable the
+UIA engine and send the DECSET 1004 focus reports. Activation stays as a
+trigger to re-evaluate - fanned out from TerminalPage::WindowActivated
+the way WindowVisibilityChanged already is, with the initial state set
+in _SetupControl - never as the answer. XAML's GotFocus is a second
+trigger and it arrives after the foreground has changed, so a genuine
+activation is evaluated at least once with the foreground correct.
+
+GhosttyControlCore::_createSurface also pushes the initial state: a
+libghostty surface is born believing it is focused, and libghostty's own
+comment says "it is up to the apprt to set the correct value". We are
+the apprt.
+
+Measured on the running app, all four cases: in front -> focused and
+blinking at 1.7/sec; foreground moves away -> LostFocus, blink stops;
+foreground returns -> blinking resumes; never in front -> GotFocus with
+inFront=0, never focused, never blinks. scripts\probe-idle-focus.ps1
+reports 7 blink reports before backgrounding against 1 in the following
+15 seconds.
+
+The gate is in TermControl, which both engines share, so cascadia sees
+it too: a cascadia pane in a never-activated window now also comes up
+unfocused, which is what its renderer's initial cursor-visibility
+inhibitor already assumed. Suites unchanged: terminalCore 54/54,
+unitSettingsModel 159/159, unitControl 63/63, localTerminalApp 76/76.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/cascadia/TerminalApp/TerminalPage.cpp     | 24 +++++++
+ .../TerminalControl/GhosttyControlCore.cpp    | 23 ++++++
+ src/cascadia/TerminalControl/TermControl.cpp  | 70 ++++++++++++++++---
+ src/cascadia/TerminalControl/TermControl.h    |  8 +++
+ src/cascadia/TerminalControl/TermControl.idl  |  1 +
+ 5 files changed, 118 insertions(+), 8 deletions(-)
+
+diff --git a/src/cascadia/TerminalApp/TerminalPage.cpp b/src/cascadia/TerminalApp/TerminalPage.cpp
+index 6ac715084..658b93520 100644
+--- a/src/cascadia/TerminalApp/TerminalPage.cpp
++++ b/src/cascadia/TerminalApp/TerminalPage.cpp
+@@ -3739,6 +3739,13 @@ namespace winrt::TerminalApp::implementation
+             term.WindowVisibilityChanged(_visible);
+         }
+ 
++        // A control is born assuming its window is not active, because that is
++        // the case nothing else would ever correct: a window that is never
++        // activated raises no WM_ACTIVATE, so the fan-out in WindowActivated
++        // never runs. A control created into an already-active window has to be
++        // told here instead - including a tab torn off into another window.
++        term.WindowActivated(_activated);
++
+         // Even in the case of re-attaching content from another window, this
+         // will correctly update the control's owning HWND
+         if (_hostingHwnd.has_value())
+@@ -5420,6 +5427,23 @@ namespace winrt::TerminalApp::implementation
+         _activated = activated;
+         _updateThemeColors();
+ 
++        // Every control needs this, not just the focused one: XAML's routed
++        // focus stays inside the app, so a control keeps logical focus while its
++        // window sits in the background, and the terminal underneath it goes on
++        // believing it is focused. Only the two together mean focused. KD-04.
++        for (const auto& tab : _tabs)
++        {
++            if (const auto tabImpl{ _GetTabImpl(tab) })
++            {
++                tabImpl->GetRootPane()->WalkTree([activated](const auto& pane) {
++                    if (const auto& control{ pane->GetTerminalControl() })
++                    {
++                        control.WindowActivated(activated);
++                    }
++                });
++            }
++        }
++
+         _adjustProcessPriorityThrottled->Run();
+ 
+         if (const auto& tab{ _GetFocusedTabImpl() })
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 063a7c13d..30baf9038 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -120,6 +120,23 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         _pushSettings();
+ 
++        // Tell the surface whether it is focused. A surface is born believing it
++        // is - libghostty's own comment says "this defaults to true and it is up
++        // to the apprt to set the correct value" (renderer/Thread.zig) - and we
++        // are the apprt, so leaving it unsaid means a pane that comes up in a
++        // background window blinks a focused-looking cursor and pays a rebuild
++        // and a full-surface present every 600 ms for it. The gate that decides
++        // this is TermControl::_pushCoreFocus; this is the starting position it
++        // needs, and it is the same one cascadia's renderer takes (the Host
++        // cursor-visibility inhibitor is set until something says focused). KD-04.
++        //
++        // _focused may already be true: if XAML focused the control before the
++        // panel had a size to initialize from, GotFocus arrived while _surface
++        // was still null and dropped its call. Pushing the tracked value rather
++        // than a literal false covers that order as well as the ordinary one.
++        _trace(L"initial focus = %d", _focused ? 1 : 0);
++        ghostty_surface_set_focus(_surface, _focused);
++
+         ghostty_surface_set_content_scale(_surface, scale, scale);
+         SizeChanged(width, height);
+     }
+@@ -892,8 +909,13 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         ghostty_surface_text(_surface, utf8.data(), utf8.size());
+     }
+ 
++    // Focus is traced because it is not observable any other way and it decides
++    // whether an idle pane costs a rebuild and a present every 600 ms. These
++    // are XAML's *routed* focus events on the control, which is not the same
++    // thing as the window being active - see _createSurface and KD-04.
+     void GhosttyControlCore::GotFocus()
+     {
++        _trace(L"GotFocus (surface=%p)", _surface);
+         _focused = true;
+         if (_surface)
+         {
+@@ -903,6 +925,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+     void GhosttyControlCore::LostFocus()
+     {
++        _trace(L"LostFocus (surface=%p)", _surface);
+         _focused = false;
+         if (_surface)
+         {
+diff --git a/src/cascadia/TerminalControl/TermControl.cpp b/src/cascadia/TerminalControl/TermControl.cpp
+index 827998147..2c313b080 100644
+--- a/src/cascadia/TerminalControl/TermControl.cpp
++++ b/src/cascadia/TerminalControl/TermControl.cpp
+@@ -2495,10 +2495,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // That way, new selections are notified to automation clients.
+         // The _uiaEngine lives in _interactivity, so call into there to enable it.
+ 
+-        if (_interactivity)
+-        {
+-            _interactivity.GotFocus();
+-        }
++        _pushCoreFocus();
+ 
+         // If the searchbox is focused, we don't want TSFInputControl to think
+         // it has focus so it doesn't intercept IME input. We also don't want the
+@@ -2541,10 +2538,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         // This will disable the accessibility notifications, because the
+         // UiaEngine lives in ControlInteractivity
+-        if (_interactivity)
+-        {
+-            _interactivity.LostFocus();
+-        }
++        _pushCoreFocus();
+ 
+         // Check if there is an unfocused config we should set the appearance to
+         // upon losing focus
+@@ -3077,6 +3071,66 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         _core.WindowVisibilityChanged(showOrHide);
+     }
+ 
++    // Method Description:
++    // - Tells the control whether its *window* is the active one. This is a
++    //   different question from whether the control has focus: XAML's routed
++    //   GotFocus/LostFocus are app-internal, and a control in a window that has
++    //   never been activated still gets GotFocus, keeping logical focus inside
++    //   its own app. A terminal is only really focused when both are true.
++    // - Without this, a pane in a window that is never brought to the front
++    //   believes it is focused for as long as it lives: it shows a blinking,
++    //   focused-looking cursor, tells the application it has focus, and - on the
++    //   ghostty engine, whose renderer wakes for each blink - rebuilds and
++    //   presents the whole surface every 600 ms. Deactivation was never the
++    //   broken half; a control that had focus does get LostFocus when another
++    //   window takes the foreground, measured. KD-04.
++    // Arguments:
++    // - activated: whether the hosting window is now the active window.
++    void TermControl::WindowActivated(const bool activated)
++    {
++        _windowActivated = activated;
++        _pushCoreFocus();
++    }
++
++    // Method Description:
++    // - Send the core the focus state it should act on - routed focus AND the
++    //   window really being in front - and only when it changes. The core's
++    //   GotFocus/LostFocus are not idempotent for what is downstream of them:
++    //   they enable and disable the UIA engine and send the focus-reporting
++    //   escapes (DECSET 1004) to the application.
++    // - The window half is read from the *foreground window*, not from the
++    //   activation flag, because WM_ACTIVATE does not answer this question. It
++    //   reports the active window of the thread's input queue, so a window
++    //   created while another application is in front is told it is active:
++    //   measured, `TerminalPage::WindowActivated(1)` while GetForegroundWindow()
++    //   was another app's window. Activation is still worth having as a trigger,
++    //   which is what WindowActivated is for - and XAML's GotFocus is a second
++    //   one, arriving after the foreground has changed, so a genuine activation
++    //   is evaluated at least once with the foreground already correct.
++    void TermControl::_pushCoreFocus()
++    {
++        const auto owning = reinterpret_cast<HWND>(OwningHwnd());
++        // No owning window (content not yet attached to one) leaves nothing to
++        // compare against; trust the activation flag rather than guess.
++        const auto windowInFront = owning ? (::GetForegroundWindow() == owning) : _windowActivated;
++
++        const auto focused = _focused && windowInFront;
++        if (focused == _coreFocused || !_interactivity)
++        {
++            return;
++        }
++        _coreFocused = focused;
++
++        if (focused)
++        {
++            _interactivity.GotFocus();
++        }
++        else
++        {
++            _interactivity.LostFocus();
++        }
++    }
++
+     // Method Description:
+     // - Get the modifier keys that are currently pressed. This can be used to
+     //   find out which modifiers (ctrl, alt, shift) are pressed in events that
+diff --git a/src/cascadia/TerminalControl/TermControl.h b/src/cascadia/TerminalControl/TermControl.h
+index 3da6f814b..0b636ae75 100644
+--- a/src/cascadia/TerminalControl/TermControl.h
++++ b/src/cascadia/TerminalControl/TermControl.h
+@@ -84,6 +84,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         double QuickFixButtonCollapsedWidth();
+ 
+         void WindowVisibilityChanged(const bool showOrHide);
++        void WindowActivated(const bool activated);
+ 
+         void ColorSelection(Control::SelectionColor fg, Control::SelectionColor bg, Core::MatchMode matchMode);
+ 
+@@ -286,6 +287,12 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         bool _closing{ false };
+         bool _focused{ false };
++        // Whether the *window* is active, and what the core was last told. XAML's
++        // routed focus is app-internal - a control in a window that has never been
++        // activated still receives GotFocus - so terminal focus is the two together.
++        // See _pushCoreFocus and KD-04.
++        bool _windowActivated{ false };
++        bool _coreFocused{ false };
+         bool _initializedTerminal{ false };
+         bool _quickFixButtonCollapsible{ false };
+         bool _quickFixesAvailable{ false };
+@@ -382,6 +389,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         void _GotFocusHandler(const Windows::Foundation::IInspectable& sender, const Windows::UI::Xaml::RoutedEventArgs& e);
+         void _LostFocusHandler(const Windows::Foundation::IInspectable& sender, const Windows::UI::Xaml::RoutedEventArgs& e);
++        void _pushCoreFocus();
+ 
+         safe_void_coroutine _DragDropHandler(Windows::Foundation::IInspectable sender, Windows::UI::Xaml::DragEventArgs e);
+         void _DragOverHandler(const Windows::Foundation::IInspectable& sender, const Windows::UI::Xaml::DragEventArgs& e);
+diff --git a/src/cascadia/TerminalControl/TermControl.idl b/src/cascadia/TerminalControl/TermControl.idl
+index faf16be6c..5566dfff6 100644
+--- a/src/cascadia/TerminalControl/TermControl.idl
++++ b/src/cascadia/TerminalControl/TermControl.idl
+@@ -116,6 +116,7 @@ namespace Microsoft.Terminal.Control
+         Single SnapDimensionToGrid(Boolean widthOrHeight, Single dimension);
+ 
+         void WindowVisibilityChanged(Boolean showOrHide);
++        void WindowActivated(Boolean activated);
+ 
+         void ScrollViewport(Int32 viewTop);
+ 
