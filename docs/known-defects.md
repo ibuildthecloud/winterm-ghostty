@@ -855,3 +855,74 @@ Worth recording, because both cost more time than the defect:
 2. The wedged channel was real and measured, but the "0 of 6" that seemed to
    confirm it proved nothing. With the counter fixed and the channel clear:
    4 of 4 launches, window in **1.3 s**.
+
+---
+
+### KD-10 — A focused pane presents on every blink, but the drawn cursor barely toggles  ([#16](https://github.com/ibuildthecloud/winterm-ghostty/issues/16))
+
+**Found** 2026-08-12 while validating the KD-04 fix, from a user's report that a
+pane brought to the front "did not have a blinking cursor" until the mouse moved
+onto it.
+
+#### What is measured
+
+One run, no input of any kind, window brought to the front after being held
+back, with `GHOSTTY_RENDER_DIAG=1` and captures interleaved:
+
+```
+after coming forward: 10 blink reports, ~1.2 s apart
+  [ghostty-diag] notify=11 wakeup=18 update=18 present=21
+  [ghostty-diag] notify=11 wakeup=20 update=20 present=23   <- +2 present per report
+  ...
+8 captures over ~6 s: every consecutive pair pixel-identical
+```
+
+So the blink timer is running (its own heartbeat is what emits those lines), it
+wakes the renderer twice a second, the renderer presents twice a second - and
+the pixels never change.
+
+A pane launched normally, focused from birth, never held back, with no input,
+shows the same thing with one exception: **exactly one toggle** across eight
+frames, 28 pixels in a one-pixel-wide column (`x 241..241 y 105..132`), which is
+precisely the bar cursor for a 28-pixel cell. Then static.
+
+#### Not the focus gate
+
+The same run traces `GotFocus` reaching the core when the window comes forward,
+and a capture at that moment plainly shows the bar cursor drawn after the
+prompt. Focus arrives; the cursor is drawn; it just does not blink. A pane that
+has never been in front draws no cursor and reports no blinks at all, which is
+KD-04 working.
+
+#### The instrument was wrong twice before this was believed
+
+- Eight frames at a fixed 200 ms sleep were all identical, and were read as
+  "not blinking". One `wgc-shot` invocation costs ~400 ms of process startup, so
+  the real cadence was ~600 ms - exactly the blink interval. **A capture cadence
+  must never be commensurate with the thing being sampled**; the intervals are
+  jittered now.
+- "Identical frames" was then suspected to mean a stale capture. Ruled out: with
+  three characters typed into the pane, consecutive captures differ by 743
+  pixels. The captures do track the swap chain.
+
+#### The hypothesis, and what would settle it
+
+KD-06 was this shape: the cursor moved and no row was invalidated, so a stale
+ligature stayed on screen. The suspicion here is the same family - the blink
+toggles `cursor_blink_visible` and notifies, but nothing marks the cursor's cell
+dirty, so the rebuild produces the same cells and the present carries identical
+pixels. Input dirties something, which is why moving the mouse onto the pane
+made it start blinking for the reporter.
+
+To settle it, instrument the renderer rather than the pixels: on a blink wake,
+does `rebuildCells` see the cursor cell as dirty, and does the cursor's own
+draw state change between frames? A `GHOSTTY_RENDER_DIAG`-style counter on the
+cursor path would answer it in one run. Pixel capture is too slow an instrument
+for a 600 ms toggle - at ~400 ms a shot it can only sample, never watch.
+
+#### Why it matters beyond cosmetics
+
+If the cursor cell is not dirtied, then the ~1.7 presents/sec an idle focused
+pane costs are buying **nothing at all** - the same pixels, twice a second, for
+the life of the window. That is Phase 7's idle criterion and KD-05's cost, and
+it makes both cheaper to fix than they looked.
