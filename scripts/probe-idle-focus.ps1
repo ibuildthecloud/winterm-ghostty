@@ -72,12 +72,22 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# Both Add-Type blocks are guarded, because a type cannot be redefined in a
-# PowerShell session and this script is meant to be run more than once in the
-# same shell - the second run used to die on "the type name 'IdleDbwin' already
-# exists" before it measured anything.
-if (-not ('Probe.Win' -as [type])) {
-Add-Type -Namespace Probe -Name Win -MemberDefinition @'
+# Both helper types are named after a hash of their own source.
+#
+# A type cannot be redefined in a PowerShell session, so a script run twice in
+# one shell either dies on "the type name already exists" or - worse, and this
+# is what happened - guards the Add-Type and silently keeps the *stale*
+# definition from the earlier run, failing later with "does not contain a method
+# named 'keybd_event'" because that run predated the method. Hashing the source
+# into the name means a changed definition is simply a different type, and the
+# right one is always the one in use.
+function Get-TypeSuffix([string] $source) {
+    $md5 = [System.Security.Cryptography.MD5]::Create()
+    $bytes = $md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($source))
+    -join ($bytes[0..3] | ForEach-Object { $_.ToString('x2') })
+}
+
+$winSource = @'
 [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
 [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
 [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
@@ -88,13 +98,16 @@ Add-Type -Namespace Probe -Name Win -MemberDefinition @'
 [DllImport("user32.dll")] public static extern IntPtr SendMessageTimeoutW(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr res);
 [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
 '@
+$winName = 'Win' + (Get-TypeSuffix $winSource)
+if (-not ("Probe.$winName" -as [type])) {
+    Add-Type -Namespace Probe -Name $winName -MemberDefinition $winSource
 }
+$W = "Probe.$winName" -as [type]
 
 # The DBWIN channel. Same shape as scripts\smoke-release.ps1 - the pid is not
 # optional, because DBWIN is machine-global and every other Windows Terminal on
 # the box writes to it too.
-if (-not ('IdleDbwin' -as [type])) {
-Add-Type @'
+$dbwinSource = @'
 using System;using System.Threading;using System.Runtime.InteropServices;
 using System.IO.MemoryMappedFiles;
 public class IdleDbwin : IDisposable {
@@ -144,6 +157,9 @@ public class IdleDbwin : IDisposable {
   }
 }
 '@
+$dbwinName = 'IdleDbwin' + (Get-TypeSuffix $dbwinSource)
+if (-not ($dbwinName -as [type])) {
+    Add-Type ($dbwinSource -replace 'IdleDbwin', $dbwinName)
 }
 
 # SetForegroundWindow is refused unless this thread shares an input queue with
@@ -152,17 +168,17 @@ public class IdleDbwin : IDisposable {
 # the trick scripts\smoke-release.ps1 already relies on for the same reason.
 # Without it, this can only measure an idle desktop.
 function Set-Foreground([IntPtr]$hwnd) {
-    [Probe.Win]::keybd_event(0x12, 0x38, 0, [UIntPtr]::Zero)          # ALT down
-    [Probe.Win]::keybd_event(0x12, 0x38, 2, [UIntPtr]::Zero)          # ALT up
-    $fg = [Probe.Win]::GetForegroundWindow()
+    $W::keybd_event(0x12, 0x38, 0, [UIntPtr]::Zero)          # ALT down
+    $W::keybd_event(0x12, 0x38, 2, [UIntPtr]::Zero)          # ALT up
+    $fg = $W::GetForegroundWindow()
     $fgPid = [uint32]0
-    $other = [Probe.Win]::GetWindowThreadProcessId($fg, [ref]$fgPid)
-    $me = [Probe.Win]::GetCurrentThreadId()
-    [void][Probe.Win]::AttachThreadInput($me, $other, $true)
-    [void][Probe.Win]::SetForegroundWindow($hwnd)
-    [void][Probe.Win]::AttachThreadInput($me, $other, $false)
+    $other = $W::GetWindowThreadProcessId($fg, [ref]$fgPid)
+    $me = $W::GetCurrentThreadId()
+    [void]$W::AttachThreadInput($me, $other, $true)
+    [void]$W::SetForegroundWindow($hwnd)
+    [void]$W::AttachThreadInput($me, $other, $false)
     Start-Sleep -Milliseconds 250
-    return ([Probe.Win]::GetForegroundWindow() -eq $hwnd)
+    return ($W::GetForegroundWindow() -eq $hwnd)
 }
 
 function Get-MainHwnd([int]$procId) {
@@ -187,7 +203,7 @@ function Get-Counters($lines, [uint32]$procId, [long]$notAfter = [long]::MaxValu
     }
 }
 
-$dbwin = New-Object IdleDbwin
+$dbwin = New-Object $dbwinName
 if (-not $dbwin.Started) { throw 'could not open the DBWIN channel; nothing can be measured' }
 
 $env:GHOSTTY_RENDER_DIAG = '1'
@@ -209,7 +225,7 @@ try {
     if ($HoldForeground) {
         $hold = [Diagnostics.Stopwatch]::StartNew()
         while ($hold.Elapsed.TotalSeconds -lt 6) {
-            if ([Probe.Win]::GetForegroundWindow() -ne $holderHwnd) { [void](Set-Foreground $holderHwnd) }
+            if ($W::GetForegroundWindow() -ne $holderHwnd) { [void](Set-Foreground $holderHwnd) }
             Start-Sleep -Milliseconds 100
         }
     }
@@ -234,7 +250,7 @@ try {
     # achieved is a record rather than an assumption.
     $everForeground = $false
     for ($i = 0; $i -lt ($SettleSeconds * 4); $i++) {
-        if ([Probe.Win]::GetForegroundWindow() -eq $hwnd) { $everForeground = $true }
+        if ($W::GetForegroundWindow() -eq $hwnd) { $everForeground = $true }
         Start-Sleep -Milliseconds 250
     }
 
@@ -274,7 +290,7 @@ try {
 
     if ($paint) { Stop-Process -Id $paint.Id -Force -ErrorAction SilentlyContinue }
     [IntPtr]$res = 0
-    [void][Probe.Win]::SendMessageTimeoutW($hwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero, 0x0002, 3000, [ref]$res)
+    [void]$W::SendMessageTimeoutW($hwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero, 0x0002, 3000, [ref]$res)
 
     Write-Host ''
     if ($traces.Count -eq 0) {
@@ -353,7 +369,7 @@ try {
             $ctlHwnd = try { Get-MainHwnd $ctlPid } catch { [IntPtr]::Zero }
             if ($ctlHwnd -ne [IntPtr]::Zero) {
                 [IntPtr]$r2 = 0
-                [void][Probe.Win]::SendMessageTimeoutW($ctlHwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero, 0x0002, 3000, [ref]$r2)
+                [void]$W::SendMessageTimeoutW($ctlHwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero, 0x0002, 3000, [ref]$r2)
             }
         }
         Write-Host ("  control window: {0} blink reports in 8s" -f $ctlLines.Count)
