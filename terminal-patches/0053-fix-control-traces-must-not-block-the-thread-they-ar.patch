@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 11 Aug 2026 22:43:05 -0700
+Subject: [PATCH] fix(control): traces must not block the thread they are
+ traced from (KD-09)
+
+GhosttyControlCore::_trace wrote straight to OutputDebugStringW on the
+calling thread, three calls per line, under a comment claiming
+"OutputDebugString costs nothing when no debugger is attached".
+
+Measured on this machine, with a listener that had stopped draining the
+machine-wide DBWIN channel: 10,005 ms per call. DBWIN's writers wait on
+DBWIN_BUFFER_READY and give up only after a ten-second timeout, and the
+shared events outliving whoever created them is enough to trigger it -
+no debugger required. A pane traces about forty lines while it starts,
+on the UI thread, at three calls each, so the terminal window took
+minutes to appear. It was reported as "nothing pops up, the terminal is
+never shown".
+
+Traces now go through a bounded queue drained by one worker: a wedged
+channel costs a trace and never the terminal. Formatting stays on the
+caller so a line still reflects the moment it was traced, and it is one
+call per line rather than three - which also makes each DBWIN record a
+whole line, so the release gate's [ghostty] match reads better than it
+did.
+
+Verified with the channel deliberately still wedged and then clear:
+traces arrive as single lines, engine identification still works, and a
+launch reaches a visible window in 1.3 s. Suites unchanged: terminalCore
+54/54, unitSettingsModel 159/159, unitControl 63/63, localTerminalApp
+76/76.
+
+Not covered: WT's own #ifdef _DEBUG traces write synchronously on the UI
+thread too, so a Debug build still crawls on a wedged channel. Those are
+upstream's and absent from a Release build; ours were the only
+unconditional ones.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 90 +++++++++++++++++--
+ 1 file changed, 85 insertions(+), 5 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 30baf9038..dc111942e 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -9,6 +9,13 @@
+ 
+ #include "GhosttyControlCore.g.cpp"
+ 
++// For the trace sink below - a queue and a worker, so a wedged debugger channel
++// cannot stall the UI thread.
++#include <condition_variable>
++#include <deque>
++#include <mutex>
++#include <thread>
++
+ using namespace ::Microsoft::Terminal::Core;
+ using namespace winrt::Windows::Foundation;
+ using namespace winrt::Microsoft::Terminal::TerminalConnection;
+@@ -674,8 +681,83 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     }
+ 
+     // Sizing and DPI bugs here are invisible from the outside - the pane just
+-    // looks wrong - and a packaged app has no stdout. OutputDebugString costs
+-    // nothing when no debugger is attached and shows up in cdb when one is.
++    // looks wrong - and a packaged app has no stdout, so the traces go to the
++    // debugger channel where `scripts\smoke-release.ps1` can also read them and
++    // prove which engine a window is running.
++    //
++    // They go out on their own thread, and that is not tidiness.
++    // OutputDebugString is **not** the free call this code used to claim it was
++    // when no debugger is attached: DBWIN is a machine-wide channel, and once
++    // anything has attached to it and stopped servicing it - a debugger that was
++    // killed, a script that exited without closing the shared events - every
++    // writer on the machine waits on DBWIN_BUFFER_READY and gives up only after
++    // **ten seconds**, per call. Measured here at 10,005 ms a call after a probe
++    // script leaked its listener. A pane traces about forty lines while it comes
++    // up, on the UI thread, so the terminal window took minutes to appear and
++    // looked for all the world like a hang - reported as "nothing pops up, the
++    // terminal is never shown".
++    //
++    // A bounded queue drained by one worker means a wedged channel costs a
++    // trace and never the terminal. Formatting stays on the caller so the line
++    // reflects the moment it was traced.
++    namespace
++    {
++        class TraceSink
++        {
++        public:
++            static TraceSink& Get()
++            {
++                // Deliberately leaked. The worker has to outlive static
++                // destruction: a trace emitted while the process is tearing
++                // itself down must not reach a half-destroyed object.
++                static TraceSink* sink = new TraceSink();
++                return *sink;
++            }
++
++            void Write(std::wstring line)
++            {
++                {
++                    std::lock_guard<std::mutex> guard{ _mutex };
++                    // Drop rather than grow without bound or wait, which is the
++                    // whole point of being here.
++                    if (_queue.size() >= 512)
++                    {
++                        return;
++                    }
++                    _queue.push_back(std::move(line));
++                }
++                _cv.notify_one();
++            }
++
++        private:
++            TraceSink()
++            {
++                std::thread{ [this]() { _run(); } }.detach();
++            }
++
++            void _run()
++            {
++                for (;;)
++                {
++                    std::wstring line;
++                    {
++                        std::unique_lock<std::mutex> guard{ _mutex };
++                        _cv.wait(guard, [this]() { return !_queue.empty(); });
++                        line = std::move(_queue.front());
++                        _queue.pop_front();
++                    }
++                    // One call per line, not three: each is a round trip on the
++                    // channel, and three was three times the exposure.
++                    OutputDebugStringW(line.c_str());
++                }
++            }
++
++            std::mutex _mutex;
++            std::condition_variable _cv;
++            std::deque<std::wstring> _queue;
++        };
++    }
++
+     void GhosttyControlCore::_trace(const wchar_t* format, ...)
+     {
+         wchar_t buf[512];
+@@ -685,9 +767,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         va_end(args);
+         if (n > 0)
+         {
+-            OutputDebugStringW(L"[ghostty] ");
+-            OutputDebugStringW(buf);
+-            OutputDebugStringW(L"\n");
++            TraceSink::Get().Write(L"[ghostty] " + std::wstring{ buf } + L"\n");
+         }
+     }
+ 

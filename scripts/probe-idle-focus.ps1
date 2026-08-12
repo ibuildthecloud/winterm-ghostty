@@ -108,7 +108,22 @@ public class IdleDbwin : IDisposable {
           System.Text.Encoding.Default.GetString(buf, 4, end - 4).TrimEnd('\r','\n')));
     }
   }
-  public void Dispose() { _stop = true; try { _t.Join(800); } catch {} }
+  // Closing these is not housekeeping. DBWIN is a machine-wide channel: while
+  // the shared events exist and nobody signals DBWIN_BUFFER_READY, every
+  // OutputDebugString call on the machine blocks for its full ten-second
+  // timeout. Leaving them open behind a listener that has stopped draining
+  // therefore wedges the debug channel for every process on the box - which is
+  // exactly how an earlier version of this script made the terminal itself take
+  // minutes to open a window, because a ghostty pane traces while it starts.
+  public void Dispose() {
+    _stop = true;
+    try { _t.Join(800); } catch {}
+    try { if (_ready != null) _ready.Dispose(); } catch {}
+    try { if (_data  != null) _data.Dispose(); } catch {}
+    try { if (_view  != null) _view.Dispose(); } catch {}
+    try { if (_mmf   != null) _mmf.Dispose(); } catch {}
+    _ready = null; _data = null; _view = null; _mmf = null;
+  }
 }
 '@
 
@@ -149,7 +164,12 @@ try {
         $d = $now | Where-Object { $before -notcontains $_ }
         if ($d) { $newPid = $d[0]; break }
     }
-    if (-not $newPid) { throw 'the fork did not start a new WindowsTerminal process' }
+    if (-not $newPid) {
+        throw ('no new WindowsTerminal process appeared. The usual cause is that a fork ' +
+               'window is already open: a second launch hands its request to the first ' +
+               'and exits, so there is no process here to attribute counters to. Close ' +
+               'any open fork windows and run this again.')
+    }
     $hwnd = Get-MainHwnd $newPid
     Write-Host "pid=$newPid hwnd=$([int64]$hwnd) profile='$ProfileName'" -ForegroundColor Cyan
 

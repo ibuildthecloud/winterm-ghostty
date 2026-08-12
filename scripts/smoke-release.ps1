@@ -211,7 +211,21 @@ public class Dbwin : IDisposable {
       Lines.Enqueue(Tuple.Create(pid, System.Text.Encoding.Default.GetString(buf, 4, end - 4)));
     }
   }
-  public void Dispose() { _stop = true; try { _t.Join(800); } catch {} }
+  // The handles must be closed, not just the thread stopped. DBWIN is
+  // machine-wide: while the shared events exist with nobody signalling
+  // DBWIN_BUFFER_READY, every OutputDebugString call on the box blocks for its
+  // full ten-second timeout - which, for an app that traces while it starts,
+  // reads as a hang. Leaking them here would wedge the machine for whatever the
+  // developer runs next.
+  public void Dispose() {
+    _stop = true;
+    try { _t.Join(800); } catch {}
+    try { if (_ready != null) _ready.Dispose(); } catch {}
+    try { if (_data  != null) _data.Dispose(); } catch {}
+    try { if (_view  != null) _view.Dispose(); } catch {}
+    try { if (_mmf   != null) _mmf.Dispose(); } catch {}
+    _ready = null; _data = null; _view = null; _mmf = null;
+  }
 }
 '@
 $dbwin = New-Object Dbwin

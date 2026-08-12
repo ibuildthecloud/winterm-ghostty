@@ -783,3 +783,75 @@ and leaves mangled fragments.
 Also note the probe's flags were unrepresentative: `13` includes *report all keys
 as escape codes*, which no ordinary application requests. Testing a mode nobody
 uses answers a question nobody asked.
+
+---
+
+### KD-09 — A pane's traces block the UI thread on the debugger channel — **fixed 2026-08-11**
+
+**Found** 2026-08-11 from a user report while validating KD-04: "after running
+wtgd, nothing pops up, the terminal is never shown". The window did eventually
+appear — minutes later.
+
+#### `OutputDebugString` is not free, and our own comment said it was
+
+`GhosttyControlCore::_trace` wrote straight to `OutputDebugStringW` on the
+calling thread, three calls per line (prefix, text, newline), carrying this
+comment:
+
+> OutputDebugString costs nothing when no debugger is attached
+
+Measured on this machine at the time of the report:
+
+```
+call #0:      2 ms
+call #1: 10,005 ms
+call #2: 10,010 ms
+```
+
+DBWIN is a **machine-wide** channel. Once anything has attached to it and
+stopped servicing it — a debugger that was killed, a script that exited without
+closing the shared events — every writer on the box waits on
+`DBWIN_BUFFER_READY` and gives up only after its full ten-second timeout, per
+call. Nothing is attached in any meaningful sense; the shared objects simply
+still exist with nobody draining them.
+
+A ghostty pane traces about forty lines while it starts — the settings
+translation alone is one line per setting — on the UI thread, at three calls
+each. That is the terminal window not appearing.
+
+#### What wedged it here: our own probe script
+
+`scripts\probe-idle-focus.ps1` listens on DBWIN to read libghostty's counters.
+Its `Dispose` stopped the listener thread and **left the events and the mapping
+open**, which is precisely the state that costs every writer ten seconds a call.
+So the instrument written to measure KD-04 broke the thing it was measuring, and
+the person who ran it got a terminal that would not open. `smoke-release.ps1`
+had the same shape. Both now close the handles.
+
+#### The fix
+
+Traces go through a bounded queue drained by one worker thread (terminal patch
+53), so a wedged channel costs a trace and never the terminal, and one call per
+line instead of three. The lines the release gate matches on are unchanged —
+better, in fact, since each record is now a whole line rather than a fragment.
+
+#### What this does not cover
+
+A **Debug** Windows Terminal still crawls on a wedged channel, because WT's own
+`#ifdef _DEBUG` traces write synchronously on the UI thread too
+(`TerminalPage.cpp`). Those are upstream's and do not exist in a Release build.
+Ours were the only unconditional ones. libghostty writes two lines at device
+creation (`renderer/directx11/device.zig`) on the renderer thread, which can
+delay a first frame but not the window.
+
+#### The instrument lied twice in one hour
+
+Worth recording, because both cost more time than the defect:
+
+1. A launch-loop script reported "NO WINDOW" for 6 of 6 launches while windows
+   were opening on screen in front of the user, who said so. The callback
+   incremented `$script:n` and the function returned a local `$n` — always zero.
+   **A detector that has never been seen to report success is not a detector.**
+2. The wedged channel was real and measured, but the "0 of 6" that seemed to
+   confirm it proved nothing. With the counter fixed and the channel clear:
+   4 of 4 launches, window in **1.3 s**.
