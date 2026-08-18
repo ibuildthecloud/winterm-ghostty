@@ -1072,23 +1072,32 @@ Sentry crash reporting is compiled out on Windows — `src/build/Config.zig`
 defaults `sentry` to true only on macOS/iOS — and this fork does not pass
 `-Dsentry`. So a user's crash is invisible to us unless they say so.
 
-#### Why the frames cannot be named yet, and the measurement that would fix it
+#### Why these frames cannot be named, and what was done about it
 
-The portable ZIP ships **no PDB**, so those RVAs cannot be resolved to
-functions. That is the whole gap between "a double free somewhere in libghostty"
-and a diagnosis, and it is fixable rather than inherent:
+The v0.2.4 portable ZIP ships **no PDB**, so its RVAs cannot be resolved. That
+is the whole gap between "a double free somewhere in libghostty" and a
+diagnosis, and it is not recoverable after the fact: no PDB on any machine here
+matches a binary CI built, and a same-named PDB from a different build resolves
+addresses to confidently wrong functions.
 
-1. Have `release.yml` publish (or retain as a build artifact) the
-   `ghostty-internal.pdb` it already produces. Then `harness/pdbaddr` maps
-   `0x8252ec`, `0x24c2a3` and `0x1d0f17` to functions in one run, against the
-   binary the user actually ran.
-2. Failing that, rebuild the pin plus the patch series with the release flags
-   and map the RVAs there — weaker, since the layout is only *probably* the
-   same, and a wrong-by-one-function answer looks exactly like a right one.
+**Fixed forward, from 0.2.6**: `scripts/package-symbols.ps1` collects the PDBs
+for everything in the published layout and `release.yml` publishes them as
+`winterm-ghostty-<version>-x64-symbols.zip`. Pairing is by **CodeView GUID**,
+read out of each image and checked against the PDB's own MSF stream-1 header —
+not by filename — and every signature is written into `SYMBOLS.txt` so a
+debugger's match can be verified rather than assumed. PDBs are stored under the
+name the image records (zig records a bare `ghostty.pdb`), because that is the
+only name dbghelp will look for.
 
-Until one of those happens, no cause should be asserted. What is known is the
-class of fault (double free), the module (ours), and that it has happened twice
-in one day of ordinary use.
+Proven end to end before shipping: with the collected PDB on the symbol path,
+`harness/pdbaddr` resolves addresses to function *and source line*
+(`grow + 0x2f13  ghostty/src/terminal/PageList.zig:3680`). That was a local
+Debug build and says **nothing** about this crash — different binary, different
+layout — it only shows the pipeline works.
+
+So this defect stays open with the class of fault (double free), the module
+(ours), and the fact that it happened twice in one day of ordinary use. The
+**next** occurrence on 0.2.6 or later can be named.
 
 #### What is not known
 

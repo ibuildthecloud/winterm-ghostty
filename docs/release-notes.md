@@ -32,6 +32,24 @@ Nothing switches engine by itself. Add `"engine": "ghostty"` to a profile — or
 
 To confirm a pane is really using it, open the search box (`Ctrl+Shift+F`): on a ghostty pane the regex and case toggles are greyed out.
 
+## New in 0.2.6
+
+- **Every release now ships its own symbols**, as `winterm-ghostty-{{VERSION}}-x64-symbols.zip`. You do not need them to run anything — they exist so that a crash can be *read*. If this build dies on you, Windows keeps a full dump (see below), and with these symbols that dump names the function and source line rather than an address in a stripped DLL.
+
+  Each PDB is paired to its binary by CodeView GUID, not by filename, and `SYMBOLS.txt` inside the ZIP lists every signature so a debugger's match can be checked rather than assumed.
+
+### If it crashes, this is what to send
+
+Nothing is reported anywhere — there is no telemetry in this build, and the engine's own crash reporter is compiled out on Windows. A crash is invisible unless you say so.
+
+Windows keeps the evidence locally:
+
+- `%LOCALAPPDATA%\CrashDumps\WindowsTerminal.exe.<pid>.dmp` — a full dump, if [LocalDumps](https://learn.microsoft.com/windows/win32/wer/collecting-user-mode-dumps) is enabled on the machine (it is not on by default).
+- `%ProgramData%\Microsoft\Windows\WER\ReportArchive\AppCrash_WindowsTerminal.*` — the WER report.
+- Application event log, IDs **1000** (faulting module and offset) and **1001** (the bucket).
+
+The event-log line alone is useful: it names the faulting module and the offset within it, which the matching symbols ZIP turns into a function.
+
 ## Fixed in 0.2.5
 
 - **Alt+drag block-selects.** Windows Terminal's block selection did nothing on a ghostty pane — alt+drag drew the ordinary linear selection, because the modifier the engine reads for a rectangular selection was never sent to it. Alt at the click now makes the drag a block one, and holds for the whole drag, as it does on a cascadia pane ([KD-11](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/known-defects.md)).
