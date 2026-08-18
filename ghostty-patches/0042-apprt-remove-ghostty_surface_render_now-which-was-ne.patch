@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 18 Aug 2026 14:06:04 -0700
+Subject: [PATCH] apprt: remove ghostty_surface_render_now, which was never
+ thread-safe
+
+The export ran the renderer's whole frame update on the caller's thread.
+Its own comment argued that was safe because "both halves take the
+renderer state mutex, the same as the render thread's own path" - which
+confuses the mutex that protects the *terminal* with the renderer's
+private state. updateFrame clears and repopulates each row's highlight
+list, and defers the denormalization that resizes row_data, both outside
+that lock, because upstream calls it from one thread and one only.
+
+A pane crashed on 2026-08-18 reading a freed highlight list, with an
+embedder's UI thread inside rebuildCells and that surface's render thread
+parked on a renderer futex. See KD-19 in the winterm-ghostty docs.
+
+Embedders that need a frame after changing state should wake the render
+thread, which every path that mutates terminal state already does through
+queueRender; the render thread renders on that wakeup with no coalescing
+delay. The staleness this export was added for had a different cause
+entirely - the renderer wakeup was held by value, so notify() set a bool
+nobody read, fixed separately.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ include/ghostty.h      | 11 -----------
+ src/Surface.zig        | 23 -----------------------
+ src/apprt/embedded.zig | 21 ---------------------
+ 3 files changed, 55 deletions(-)
+
+diff --git a/include/ghostty.h b/include/ghostty.h
+index 2759b8924..36a44fed8 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -1227,17 +1227,6 @@ GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
+ GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
+-// Rebuild the frame from current terminal state and draw it immediately, on
+-// the calling thread.
+-//
+-// For embedders that feed pty output and have no paint loop.
+-// ghostty_surface_draw only re-presents the cells the render thread last
+-// built; this rebuilds them first, so bytes just written with
+-// ghostty_surface_write_pty_output actually reach the screen instead of
+-// waiting for an unrelated event (focus, scroll, resize) to force a render.
+-//
+-// Safe to call from the thread feeding output.
+-GHOSTTY_API void ghostty_surface_render_now(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
+ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
+ GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 11bf06988..7f921555a 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -920,29 +920,6 @@ pub fn draw(self: *Surface) !void {
+     try self.renderer.drawFrame(true);
+ }
+ 
+-/// Rebuild the frame from the current terminal state and draw it, now, on
+-/// the calling thread.
+-///
+-/// `draw` only re-presents the cells the render thread last built, which is
+-/// what a resize needs. An embedder that has just pushed pty output needs the
+-/// other half too: without the rebuild it re-presents stale content.
+-///
+-/// This exists because scheduling a render is not sufficient for an embedder
+-/// whose surface is not driven by a paint loop. `queueRender` goes through the
+-/// renderer's coalescing wakeup, and an update landing after the render thread
+-/// has sampled terminal state is folded into a wake that has already done its
+-/// work - so the last output of a burst never reaches the screen and the
+-/// surface sits stale until some unrelated event (focus, scroll, visibility)
+-/// forces a render. A terminal in a XAML SwapChainPanel has no paint loop to
+-/// hide that.
+-///
+-/// Both halves take the renderer state mutex, the same as the render thread's
+-/// own path, so calling this from the thread feeding output is safe.
+-pub fn renderNow(self: *Surface) !void {
+-    try self.renderer.updateFrame(&self.renderer_state, true);
+-    try self.renderer.drawFrame(true);
+-}
+-
+ /// Activate the inspector. This will begin collecting inspection data.
+ /// This will not affect the GUI. The GUI must use performAction to
+ /// show/hide the inspector UI.
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index b50584704..0c6cc9405 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -930,13 +930,6 @@ pub const Surface = struct {
+         };
+     }
+ 
+-    pub fn renderNow(self: *Surface) void {
+-        self.core_surface.renderNow() catch |err| {
+-            log.err("error in renderNow err={}", .{err});
+-            return;
+-        };
+-    }
+-
+     pub fn updateContentScale(self: *Surface, x: f64, y: f64) void {
+         // We are an embedded API so the caller can send us all sorts of
+         // garbage. We want to make sure that the float values are valid
+@@ -1950,20 +1943,6 @@ pub const CAPI = struct {
+         surface.draw();
+     }
+ 
+-    /// Rebuild the frame from current terminal state and draw it immediately,
+-    /// on the calling thread.
+-    ///
+-    /// For embedders that feed pty output and have no paint loop to fall back
+-    /// on. ghostty_surface_draw only re-presents the cells the render thread
+-    /// last built; this rebuilds them first, so output that has just been
+-    /// written with ghostty_surface_write_pty_output actually reaches the
+-    /// screen rather than waiting for an unrelated event to force a render.
+-    ///
+-    /// Safe to call from the thread feeding output.
+-    export fn ghostty_surface_render_now(surface: *Surface) void {
+-        surface.renderNow();
+-    }
+-
+     /// Update the size of a surface. This will trigger resize notifications
+     /// to the pty and the renderer.
+     export fn ghostty_surface_set_size(surface: *Surface, w: u32, h: u32) void {

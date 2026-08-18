@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 18 Aug 2026 14:05:52 -0700
+Subject: [PATCH] fix(control): do not run the renderer's frame update on the
+ UI thread (KD-19)
+
+A v0.2.7 pane crashed reading a freed heap block in rebuildRow, iterating
+a row's highlight list, reached from SetPreedit -> render_now on the XAML
+UI thread by way of TSF's unfocus. The dump named every frame: 463
+threads, 14 renderer/io pairs, and exactly one renderer thread not in its
+event loop - parked on a renderer futex while the UI thread held the draw
+mutex inside rebuildCells.
+
+Upstream calls updateFrame from the surface's render thread and nowhere
+else, and relies on it: the block that clears and repopulates every row's
+highlight list, and the denormalization that resizes row_data, both run
+outside any lock a second caller would take. Calling it from here was
+never safe, whatever the export's comment claimed.
+
+Nothing replaces the six calls. Each operation already queues a render
+inside libghostty - selection through cursorPosCallback and
+mouseButtonCallback, select_all and clear_selection in their binding
+actions, preedit on all three of its paths, the scroll actions through
+the IO thread - and the render thread renders immediately on that wakeup.
+
+Verified in a pane, driving a real left-button drag with SendInput and
+capturing the frame that follows it with no other input: 4404 selection
+pixels on the dragged row in the ghostty pane, 5933 in the cascadia pane
+beside it. Six focus round-trips over the path that crashed leave the
+process alive.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 36 ++++++++++++-------
+ .../TerminalControl/GhosttyControlCore.h      |  1 -
+ 2 files changed, 23 insertions(+), 14 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 0c2812fb7..6c0a9f803 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -1142,13 +1142,29 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     // is reached through a *named binding action* instead - the same route
+     // ghostty's own keybindings take. `scroll_to_row` in Phase 5 was the first;
+     // selection, search and copy in Phase 6 all arrive the same way.
+-    void GhosttyControlCore::_renderNow() const
+-    {
+-        if (_surface)
+-        {
+-            ghostty_surface_render_now(_surface);
+-        }
+-    }
++    // There is no _renderNow, and that is deliberate - see KD-19.
++    //
++    // It used to call ghostty_surface_render_now, which ran the renderer's
++    // whole frame update on *this* thread. That is not a thing a second thread
++    // may do: upstream calls updateFrame from the surface's render thread and
++    // nowhere else, and the parts of it that clear and repopulate each row's
++    // highlight list, and that resize row_data, run outside any lock another
++    // caller would take. A ghostty pane crashed on 2026-08-18 reading a freed
++    // highlight list, with the UI thread inside rebuildCells and that surface's
++    // render thread parked on a renderer futex.
++    //
++    // Nothing replaces it, because nothing needs to: every operation these call
++    // sites perform already calls queueRender inside libghostty - selection
++    // through cursorPosCallback and mouseButtonCallback, select_all and
++    // clear_selection in their binding actions, preedit on all three of its
++    // paths, and the scroll actions through the IO thread. The render thread
++    // renders immediately on that wakeup; its coalescing timer is commented out
++    // upstream.
++    //
++    // The staleness this was written to fix was never coalescing either. It was
++    // the renderer wakeup being held by value, so notify() set a bool nobody
++    // read - ghostty patch 34, after which output alone drove 321 renders in
++    // the second where it used to manage 2.
+ 
+     bool GhosttyControlCore::_bindingAction(const std::string_view action) const
+     {
+@@ -1294,7 +1310,6 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     {
+         // Only meaningful mid-drag, which is the only time WT calls it.
+         _mouseTo(positionCore, _selectionMods());
+-        _renderNow();
+     }
+ 
+     // The click that begins a selection.
+@@ -1351,7 +1366,6 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             _mouseDown = true;
+         }
+ 
+-        _renderNow();
+ 
+         // Cascadia's meaning, not "is copy-on-select on": the flag says whether
+         // there is now a selection worth copying when the button comes up. A
+@@ -1404,14 +1418,12 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         }
+         _releaseMouseIfHeld();
+         _bindingAction("clear_selection");
+-        _renderNow();
+     }
+ 
+     void GhosttyControlCore::SelectAll()
+     {
+         _releaseMouseIfHeld();
+         _bindingAction("select_all");
+-        _renderNow();
+     }
+ 
+     // Copy goes through ghostty rather than through read-back, because the
+@@ -1685,7 +1697,6 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             _bindingAction("scroll_to_bottom");
+             break;
+         }
+-        _renderNow();
+     }
+     void GhosttyControlCore::SelectCommand(const bool /*goUp*/) {}
+     void GhosttyControlCore::SelectOutput(const bool /*goUp*/) {}
+@@ -1776,7 +1787,6 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         GhosttyEngine::RunWithEngineStack([&]() {
+             ghostty_surface_preedit(_surface, utf8.data(), utf8.size());
+         });
+-        _renderNow();
+     }
+     bool GhosttyControlCore::ForceCursorVisible() const noexcept { return false; }
+     void GhosttyControlCore::ForceCursorVisible(bool /*force*/) {}
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.h b/src/cascadia/TerminalControl/GhosttyControlCore.h
+index c1ac2d434..e2bf66c79 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.h
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.h
+@@ -275,7 +275,6 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         // Output has to draw itself; libghostty's wakeup coalesces. Same
+         // reasoning as _connectionOutputHandler's render.
+-        void _renderNow() const;
+         void _raiseSwapChainChanged();
+         void _raiseOnUiThread(std::function<void()> action);
+ 

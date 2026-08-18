@@ -1481,7 +1481,7 @@ ignoring it matches FreeType and is correct.
 
 ---
 
-### KD-19 — The UI thread runs the renderer's frame update, racing the render thread — **open**
+### KD-19 — The UI thread runs the renderer's frame update, racing the render thread — **fixed 2026-08-18**
 
 **Reported** by the user: the portable **v0.2.7.0** build crashed while they were
 using it, 2026-08-18 13:02 local. This is the first crash with symbols
@@ -1594,5 +1594,56 @@ Three shapes, and they are not equivalent:
    most likely to deadlock against the terminal state mutex if the order is ever
    inverted.
 
-Option 1 is what "match upstream" means here. Option 2 is what the selection
-code was written expecting. This is a decision, not a session's call.
+**Option 1 was chosen** and is what shipped: the export is gone from libghostty
+(so the compiler, not a reviewer, prevents its return) and the six call sites
+are simply deleted.
+
+#### Why nothing replaces them
+
+Every operation those six perform already queues a render *inside* libghostty,
+checked one at a time:
+
+| call site | what queues the render |
+|---|---|
+| `SetEndSelectionPoint` | `cursorPosCallback` -> `queueRender` on the drag paths |
+| `LeftClickOnTerminal` | `mouseButtonCallback`'s selection paths -> `queueRender` |
+| `ClearSelection`, `SelectAll` | their binding actions, `Surface.zig:5548`/`5559` |
+| `ScrollToMark` | `queueIo(.scroll_viewport)`, and the IO thread wakes the renderer |
+| `SetPreedit` | `preeditCallback` -> `queueRender` on all three of its paths |
+
+And the wakeup is not a coalescing one: `wakeupCallback` drains the mailbox and
+calls `renderCallback` immediately (`Thread.zig:547`), with the delay-timer code
+commented out upstream.
+
+#### About the staleness this was meant to prevent
+
+The fear was reasonable and the diagnosis behind it was wrong, which is why it
+is worth writing down. `_connectionOutputHandler` already carries the finding:
+the pane that froze mid-output was blamed on "libghostty's wakeup coalescing",
+but the real cause was the renderer wakeup being **held by value** - libxev's
+IOCP async keeps its state in the struct, so the copy's `notify()` set a bool
+nobody read. Fixed in ghostty patch 34, after which output alone drove **321
+renders in the second where it used to manage 2**. Nothing was ever wrong with
+the wakeup as a mechanism.
+
+#### Measured after the fix
+
+A real left-button drag driven with SendInput - press, twelve moves, release -
+then the pointer parked off-window and a capture taken with no other input, so
+the selection can only be on screen if the render thread's own wakeup drew it:
+
+```
+ghostty pane, dragged row : selection pixels = 4404
+cascadia pane, same drag  : selection pixels = 5933
+```
+
+Six focus round-trips over the exact path that crashed (foreground away and
+back, driving TSF unfocus -> ClearComposition -> SetPreedit) leave the process
+alive. `zig build test` passes on both font backends.
+
+`scripts/probe-drag-select.ps1` is that drag, kept so the check is repeatable.
+Two things it had to get right, both of which produced a *false* "the selection
+never appeared": the calling process must be DPI-aware or every coordinate is
+off by the display scale, and the window must be taken to the foreground with
+`AttachThreadInput` first, with an activating click before the drag - the click
+that raises a window is consumed by activation and selects nothing.
