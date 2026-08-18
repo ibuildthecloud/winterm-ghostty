@@ -32,9 +32,13 @@ Nothing switches engine by itself. Add `"engine": "ghostty"` to a profile — or
 
 To confirm a pane is really using it, open the search box (`Ctrl+Shift+F`): on a ghostty pane the regex and case toggles are greyed out.
 
+## New in 0.2.7
+
+- **The engine ships debuggable.** 0.2.6 published symbols but the engine had none: `-Dstrip` defaults to on for a fast release, and in ghostty's build it also sets `unwind_tables = .none` — so `ghostty-internal.dll` carried neither a PDB nor the tables a debugger needs to walk a stack out of it. That is why the crash dump behind [KD-11's neighbour KD-12](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/known-defects.md) showed one real frame and then nonsense. The release build now passes `-Dstrip=false`, and the packaging step **fails** rather than publishing a build whose engine cannot be debugged.
+
 ## New in 0.2.6
 
-- **Every release now ships its own symbols**, as `winterm-ghostty-{{VERSION}}-x64-symbols.zip`. You do not need them to run anything — they exist so that a crash can be *read*. If this build dies on you, Windows keeps a full dump (see below), and with these symbols that dump names the function and source line rather than an address in a stripped DLL.
+- **Every release now ships its own symbols**, as `winterm-ghostty-{{VERSION}}-x64-symbols.zip`. (In 0.2.6 these covered everything *except* the engine — see 0.2.7.) You do not need them to run anything — they exist so that a crash can be *read*. If this build dies on you, Windows keeps a full dump (see below), and with these symbols that dump names the function and source line rather than an address in a stripped DLL.
 
   Each PDB is paired to its binary by CodeView GUID, not by filename, and `SYMBOLS.txt` inside the ZIP lists every signature so a debugger's match can be checked rather than assumed.
 

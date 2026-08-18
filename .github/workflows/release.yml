@@ -122,7 +122,14 @@ jobs:
 
       - name: Build libghostty
         shell: pwsh
-        run: ./scripts/build-ghostty.ps1 -Optimize ReleaseFast -Dfont-backend=directwrite_harfbuzz
+        # -Dstrip=false is not about symbols alone. ghostty ties unwind tables
+        # to the same flag - `unwind_tables = if (cfg.strip) .none else .sync`
+        # in GhosttyLib.zig - and it defaults to true for ReleaseFast, so the
+        # shipped engine had neither a PDB nor the tables a debugger needs to
+        # walk out of it. KD-12's dump showed exactly that: one real frame and
+        # then nonsense. A release that cannot be debugged is one this project
+        # cannot support.
+        run: ./scripts/build-ghostty.ps1 -Optimize ReleaseFast -Dfont-backend=directwrite_harfbuzz -Dstrip=false
 
       - name: Build the package (Release branding)
         shell: pwsh

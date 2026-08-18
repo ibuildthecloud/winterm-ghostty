@@ -36,7 +36,23 @@
 param(
     [string] $Zip,
     [string] $Layout,
-    [string] $DistDir
+    [string] $DistDir,
+
+    # Binaries this project owns and must be able to debug. If one of these
+    # yields no PDB the ZIP is not written at all, because a symbols ZIP that
+    # silently omits the engine is worse than none: it looks like coverage.
+    #
+    # v0.2.6 shipped exactly that. ghostty-internal.dll came out with *no
+    # CodeView record*, because -Dstrip defaults to true for ReleaseFast - and
+    # the same flag sets unwind_tables to .none, so the engine could not be
+    # symbolized *or* stack-walked. Nothing failed; the manifest just said
+    # "no codeview record" in a list of successes.
+    [string[]] $Require = @(
+        'ghostty-internal.dll',
+        'WindowsTerminal.exe',
+        'Microsoft.Terminal.Control.dll',
+        'TerminalApp.dll'
+    )
 )
 
 $ErrorActionPreference = 'Stop'
@@ -286,6 +302,18 @@ try {
     $collected = @($rows | Where-Object State -eq 'collected')
     if ($collected.Count -eq 0) {
         throw 'no PDBs were found for any binary - refusing to publish an empty symbols ZIP'
+    }
+
+    $missing = @($Require | Where-Object { $n = $_; -not ($collected | Where-Object Binary -eq $n) })
+    if ($missing.Count -gt 0) {
+        foreach ($m in $missing) {
+            $row = $rows | Where-Object Binary -eq $m | Select-Object -First 1
+            $why = if ($row) { $row.State } else { 'not present in the layout at all' }
+            Write-Host ("  REQUIRED {0,-38} {1}" -f $m, $why) -ForegroundColor Red
+        }
+        throw ("no symbols for {0}. A 'no codeview record' here means the binary was built stripped - " +
+               "for libghostty that is -Dstrip, which also drops the unwind tables. Build it with " +
+               "-Dstrip=false rather than publishing a build nobody can debug.") -f ($missing -join ', ')
     }
 
     # The manifest is what makes these symbols trustworthy later: the signature

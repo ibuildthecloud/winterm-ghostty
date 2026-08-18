@@ -1095,9 +1095,28 @@ Proven end to end before shipping: with the collected PDB on the symbol path,
 Debug build and says **nothing** about this crash — different binary, different
 layout — it only shows the pipeline works.
 
+**And the first attempt at that shipped broken, which is the more useful
+finding.** v0.2.6 published a symbols ZIP whose manifest read
+`ghostty-internal.dll ... no codeview record` — the engine had no PDB at all,
+because `-Dstrip` defaults to **true** for `ReleaseFast`. The same flag decides
+something worse:
+
+```zig
+// GhosttyLib.zig
+.strip = deps.config.strip,
+.unwind_tables = if (deps.config.strip) .none else .sync,
+```
+
+So every shipped build up to and including 0.2.6 had **no unwind tables in the
+engine** — which is exactly why this dump's stack degenerates into
+`0x53000000`53000000` after two frames. The stack was never truncated by bad
+luck; it could not be walked. From 0.2.7 the release passes `-Dstrip=false`,
+and `package-symbols.ps1` **fails the build** if a binary this project owns
+yields no PDB, so the silent version of this cannot recur.
+
 So this defect stays open with the class of fault (double free), the module
 (ours), and the fact that it happened twice in one day of ordinary use. The
-**next** occurrence on 0.2.6 or later can be named.
+**next** occurrence on 0.2.7 or later can be named, and its stack read.
 
 #### What is not known
 
