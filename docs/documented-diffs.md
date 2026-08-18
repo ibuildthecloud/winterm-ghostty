@@ -24,16 +24,37 @@ known from the code and has not been exercised.
 These four were decided at the gate (2026-08-05) and are deferred by decision, not
 by omission.
 
-### GD-01 — Hyperlinks are not detected, hovered or clickable  ([#3](https://github.com/ibuildthecloud/winterm-ghostty/issues/3))
+### GD-01 — Hyperlinks — **implemented 2026-08-18**  ([#3](https://github.com/ibuildthecloud/winterm-ghostty/issues/3))
 
-`GetHyperlink`, `HoveredUriText`, `HoveredCell` and `SetHoveredCell` all return
-empty. A URL in output is plain text in a ghostty pane: no underline on hover, no
-tooltip, no ctrl-click.
+A URL in a ghostty pane highlights under ctrl, under the pointer; WT's tooltip
+shows it; and ctrl+click opens it through Windows Terminal's own opener, dialog
+for refused schemes included.
 
-ghostty finds links itself (`Surface.linkAtPin`) and even selects them on
-double-click, but nothing in the C API reads a link back out or reports one under
-the pointer. Closing this needs a new libghostty entry point, which is exactly
-what the gate ruled out of Phase 6. *Read.*
+**The gate's reason for deferring this was wrong**, and worth recording as a
+lesson rather than quietly deleting: it read "nothing in the C API reads a link
+back out or reports one under the pointer", and concluded that a new libghostty
+entry point was needed. `GHOSTTY_ACTION_MOUSE_OVER_LINK` reports exactly that,
+and always did — the C API was searched for a *getter* and the answer was an
+action. Not one line of the ghostty fork changed to close this.
+[KD-20](known-defects.md#kd-20--a-url-highlighted-where-the-last-click-was-and-ctrlclick-opened-nothing--fixed-2026-08-18)
+is what was wrong and how it was measured.
+
+What stays different:
+
+- **Which text is a link is ghostty's answer, not WT's.** ghostty's URL regex,
+  its scheme list, and its rules about a trailing `.` or `)` decide it
+  (`config/url.zig`); cascadia has its own pattern. The two agree on ordinary
+  URLs and can disagree at the edges.
+- **A detected URL previews only while ctrl is held.** ghostty reports a link
+  when it highlights one, and its default rule for a regex link is
+  `hover_mods = ctrl`. Cascadia shows its tooltip on a plain hover. OSC 8 links
+  highlight on plain hover on both, so those preview alike.
+- **The underline is ghostty's**, drawn by its renderer in its own weight and
+  colour rather than by WT's.
+- **`GetHyperlink` answers about the pointer, not about the position it is
+  handed.** ghostty reports the hovered link rather than answering questions
+  about arbitrary cells; WT only ever asks about the cell the pointer is in, so
+  the answer is the same one, from a different question.
 
 ### GD-02 — `SelectCommand` / `SelectOutput` do nothing, and the context menu hides them  ([#4](https://github.com/ibuildthecloud/winterm-ghostty/issues/4))
 

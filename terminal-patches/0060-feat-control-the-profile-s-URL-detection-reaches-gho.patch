@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 18 Aug 2026 16:32:16 -0700
+Subject: [PATCH] feat(control): the profile's URL detection reaches ghostty
+ (KD-20)
+
+detectURLs is WT's switch for whether a URL in output is a link at all.
+ghostty spells the same thing link-url and defaults it on, so a profile
+that turned detection off still got links in a ghostty pane - and, since
+ghostty is the only side that finds them now, a ctrl+click that Windows
+Terminal itself would never have offered.
+
+OSC 8 hyperlinks are unaffected on both sides: an application that marks
+its own links keeps them either way.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../GhosttySettingsTranslator.cpp             |  7 ++++++
+ .../GhosttySettingsTests.cpp                  | 22 +++++++++++++++++++
+ 2 files changed, 29 insertions(+)
+
+diff --git a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+index cb99e1bcb..6e6d709f3 100644
+--- a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
++++ b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+@@ -114,6 +114,13 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             }
+         }
+ 
++        // WT's own switch for turning URL detection off, which ghostty spells
++        // `link-url`. Both default to on, and both mean the same thing: with it
++        // off a URL in output is plain text - no highlight under ctrl, nothing
++        // for ctrl+click to open. OSC 8 hyperlinks are unaffected either side;
++        // an application that marks its own links keeps them.
++        set("link-url", settings.DetectURLs() ? "true" : "false");
++
+         // A triple click highlights the whole width of the line here, the way
+         // cascadia's does. ghostty's own default stops where the line's content
+         // stops, which reads as a highlight that falls short next to a cascadia
+diff --git a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+index 643542dcb..a62078f1c 100644
+--- a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
++++ b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+@@ -41,6 +41,7 @@ namespace ControlUnitTests
+         TEST_METHOD(SchemeProducesForegroundBackgroundAndFullPalette);
+         TEST_METHOD(WordDelimitersReachTheEngine);
+         TEST_METHOD(TripleClickHighlightsTheWholeLine);
++        TEST_METHOD(UrlDetectionFollowsTheProfile);
+         TEST_METHOD(CursorShapeIsForwarded);
+         TEST_METHOD(IntenseTextStyleIsForwarded);
+         TEST_METHOD(BackslashesAreDoubledForTheWordCharsFieldOnly);
+@@ -213,6 +214,27 @@ namespace ControlUnitTests
+                        L"a triple click must highlight the full width of the line");
+     }
+ 
++    // The profile switch that decides whether a URL in output is a link at all.
++    // WT calls it detectURLs and ghostty calls it link-url, and with it off
++    // neither engine highlights a URL under ctrl or opens one on a click.
++    //
++    // It has to be *forwarded*, not assumed: ghostty defaults it on, so a
++    // profile that turns it off used to get links anyway - and then, because
++    // ghostty is the only side that finds them, a ctrl+click that WT itself
++    // would never have offered.
++    void GhosttySettingsTests::UrlDetectionFollowsTheProfile()
++    {
++        const auto on = Control::implementation::TranslateGhosttySettings(*_settings());
++        VERIFY_IS_TRUE(_has(on, "link-url", "true"),
++                       L"URL detection is on by default, on both sides");
++
++        auto settings = _settings();
++        settings->DetectURLs(false);
++        const auto off = Control::implementation::TranslateGhosttySettings(*settings);
++        VERIFY_IS_TRUE(_has(off, "link-url", "false"),
++                       L"a profile that turns URL detection off must turn ghostty's off too");
++    }
++
+     // Found by hand: a ghostty pane drew a block cursor beside a cascadia pane
+     // drawing a bar, because the profile's cursorShape was never forwarded.
+     //

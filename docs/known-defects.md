@@ -1751,3 +1751,113 @@ ghostty subtracted 4 px before taking the fraction, landing in cell X-1 at about
 94% across — which the 60% rule then resolves to the boundary between X-1 and X,
 the intended one. Correct by luck at this cell width, not by construction, and
 correct for the right reason now.
+
+
+---
+
+### KD-20 — A URL highlighted where the last click was, and ctrl+click opened nothing — **fixed 2026-08-18**
+
+**Reported** by the user, from use: *"when we hold ctrl in ghostty it does seem
+to highlight URLs but when we click them it does not open in browser like it
+does in cascadia."*
+
+Both halves of that sentence were evidence. The highlight was real ghostty
+highlighting — of the link at a stale point — and the click had nothing to open
+on either side of the seam.
+
+#### What was wrong
+
+**1. ghostty was never told where the pointer was.** `SetHoveredCell` and
+`ClearHoveredCell` were empty stubs, and the only mouse positions libghostty
+ever received came from a selection (`SetSelectionAnchor`,
+`SetEndSelectionPoint`) or from VT mouse reporting. Its cursor sat wherever the
+last click or drag had left it.
+
+That is what the user was seeing. ghostty re-runs link detection whenever the
+modifiers change — `Surface.zig`'s key handler calls `mouseRefreshLinks` against
+`rt_surface.getCursorPos()` — so pressing ctrl lit up the link at that stale
+position. A feature that looks like it works and answers about the wrong cell.
+
+**2. The click had nothing to open.** `ControlInteractivity::PointerPressed`
+prioritises a hyperlink over everything else on a ctrl+left-click (GH#9396) and
+asks the core for one; `GhosttyControlCore::GetHyperlink` returned an empty
+string unconditionally, so the branch never ran and the click fell through to
+the selection path.
+
+**3. ghostty's own opener could not run either.** ghostty opens a link on the
+*release* of a click over one (`Surface.zig`, `processLinks`), and the selection
+path sends no press at all for a single click and synthesises the release
+lazily. `GHOSTTY_ACTION_OPEN_URL` was unhandled as well — it fell to
+`default: return false`, which is what makes libghostty fall back to its own
+opener (`rundll32 url.dll,FileProtocolHandler`), so had the click arrived it
+would have opened the URL *around* WT's dialog rather than through it.
+
+#### The fix
+
+`SetHoveredCell` sends the position, and everything else follows from ghostty
+already doing the work:
+
+- **The position.** One `ghostty_surface_mouse_pos` per *cell* the pointer
+  enters, and `ClearHoveredCell` sends a negative one, which is what ghostty
+  reads as "outside".
+- **The modifiers.** A position has to state them, and WT's hover call carries
+  none, so the value is the one the last key event carried. That is not a second
+  source of truth: ghostty derives its own modifier state from those same key
+  events, so the two can only ever agree. It is dropped on `LostFocus`.
+- **The drag.** ControlInteractivity calls `SetHoveredCell` at the end of *every*
+  pointer move, a drag's included, where the position has just been sent with
+  the selection's modifiers — so the selection path marks the event and the
+  hover stands aside. The first hover after a drag is also where the synthesised
+  release now happens, since WT reports no release outside VT mouse mode; before
+  this the release waited for the next click, and hover positions would have
+  been read as a drag that never ended.
+- **The link.** `GHOSTTY_ACTION_MOUSE_OVER_LINK` carries the URL under the
+  pointer, or an empty one when it leaves. That is what `GetHyperlink`,
+  `HoveredUriText` and `HoveredCell` answer with, and what raises
+  `HoveredHyperlinkChanged` for the tooltip. WT's own ctrl+click path does the
+  rest, unchanged.
+- **`GHOSTTY_ACTION_OPEN_URL`** is claimed and raised as `OpenHyperlink`, so a
+  link ghostty decides to open goes through WT's opener and its dialog instead
+  of `rundll32`.
+- **A synthesised release must not open a link.** ghostty opens on release, and
+  WT's release is inferred rather than reported, so `_releaseMouseIfHeld` flags
+  the window in which an `OPEN_URL` is ours to ignore. Without it, a
+  double-click inside a URL followed by ctrl and a mouse move would open it.
+
+The profile's `detectURLs` now reaches ghostty as `link-url`, so a profile that
+turns URL detection off gets a pane with no links rather than ghostty's default
+of on.
+
+#### Measured, in a pane
+
+A portable build of this tree, driven by `scripts/probe-link-hover.ps1`:
+
+| Step | Before | After |
+|---|---|---|
+| ctrl+hover a URL in output | the link at the last *click* highlighted, if any | `ftp://example.com/kd20` underlines **under the pointer** |
+| ctrl+click a URL | nothing at all | opens through WT's opener — a typed `http://www.google.com` launches the browser |
+
+The click was confirmed by hand, on a typed URL, because the scripted half
+of the probe is not yet trustworthy: the run that ctrl+clicked
+`ftp://example.com/kd20` produced no refused-scheme dialog, and by then
+the window had lost the foreground to the user, so that run says nothing
+either way. **Unverified: WT's dialog for a scheme it will not launch.**
+The path it takes is the same one the browser case exercises, up to
+`TerminalPage::_OpenHyperlinkHandler`.
+
+One thing the probe had to get right, and got wrong first, costing a
+capture that showed a working fix as broken: **the injected modifier must
+be `VK_LCONTROL`, not `VK_CONTROL`**. `_GetPressedModifierKeys` asks
+`CoreWindow::GetKeyState` about `LeftControl` and `RightControl`
+specifically, and a generic `VK_CONTROL` injection sets neither, so the
+pane never sees ctrl and no link is ever highlighted.
+
+`unitControl`: 68 tests, 67 passed, 1 pre-existing skip. The new one pins
+the `link-url` translation; the hover and the click need a window and are
+measured above rather than in a test.
+
+#### Still ghostty's, not cascadia's
+
+Which text counts as a link, and the fact that a *detected* URL previews only
+while ctrl is held — both are ghostty's rules and are written up as
+[GD-01](documented-diffs.md#gd-01--hyperlinks--implemented-2026-08-18).

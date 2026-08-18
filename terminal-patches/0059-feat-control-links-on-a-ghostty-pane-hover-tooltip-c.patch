@@ -1,0 +1,361 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 18 Aug 2026 16:32:09 -0700
+Subject: [PATCH] feat(control): links on a ghostty pane - hover, tooltip,
+ ctrl+click (KD-20)
+
+Reported from use: holding ctrl highlighted URLs, but clicking one opened
+nothing. Both halves are the same gap - libghostty was never told where
+the pointer was.
+
+SetHoveredCell and ClearHoveredCell were empty, so the only mouse
+positions the engine ever received came from a selection or from VT mouse
+reporting, and its cursor sat wherever the last click had left it. ghostty
+re-runs link detection whenever the modifiers change, against that cached
+position, so ctrl lit up the link at a stale point: real highlighting, of
+the wrong cell. GetHyperlink returned empty unconditionally, so WT's
+ctrl+click branch never ran, and ghostty's own opener could not run either
+- the selection path sends no press at all for a single click, and
+GHOSTTY_ACTION_OPEN_URL was unhandled.
+
+The Phase 6 gate deferred this (GD-01) believing it needed a new
+libghostty entry point. It did not. GHOSTTY_ACTION_MOUSE_OVER_LINK already
+reports the URL under the pointer; the C API had been searched for a
+getter and the answer was an action. No ghostty patch changes.
+
+SetHoveredCell now sends one position per cell the pointer enters,
+carrying the modifiers the last key event carried - the same events
+ghostty derives its own modifier state from, so the two cannot disagree.
+The selection path marks the pointer events it has already driven, so the
+hover stands aside mid-drag rather than re-sending the position with the
+keyboard's modifiers and flipping a block selection to linear. The first
+hover after a drag is also where the synthesised release now lands, since
+WT reports no release outside VT mouse mode; without it these positions
+would read as a drag that never ended.
+
+MOUSE_OVER_LINK fills GetHyperlink, HoveredUriText and HoveredCell and
+raises HoveredHyperlinkChanged, so WT's existing ctrl+click and tooltip
+work unchanged. OPEN_URL is claimed and raised as OpenHyperlink, so a link
+ghostty decides to open goes through WT's opener and its refused-scheme
+dialog instead of libghostty's rundll32 fallback. A release WT synthesised
+is flagged while it is sent, because ghostty opens a link on release and
+that release is inferred rather than reported - otherwise a double-click
+inside a URL followed by ctrl and a mouse move would open it.
+
+Measured in a pane, a portable build of this tree: ctrl+hover over
+ftp://example.com/kd20 underlines the URL under the pointer, where before
+nothing under the pointer was ever considered, and a ctrl+click on a typed
+http://www.google.com opens the browser. unitControl 67/68, the one skip
+pre-existing.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 190 ++++++++++++++++--
+ .../TerminalControl/GhosttyControlCore.h      |  21 ++
+ 2 files changed, 198 insertions(+), 13 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 6c0a9f803..5a723a2f0 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -568,6 +568,49 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             return true;
+         }
+ 
++        // The link under the pointer - the only way an embedder learns there
++        // is one, because ghostty owns link detection (its `link-url` regex and
++        // OSC 8) and draws the highlight itself. An empty URL means the pointer
++        // left the link. Reported only when the highlight changes, so this is
++        // not a per-move event.
++        case GHOSTTY_ACTION_MOUSE_OVER_LINK:
++        {
++            // The bytes belong to an arena that dies with this call, so the
++            // copy happens here rather than on the UI thread.
++            const auto& link = action.action.mouse_over_link;
++            const winrt::hstring uri{ link.len > 0 ? til::u8u16(std::string_view{ link.url, link.len }) : std::wstring{} };
++            _raiseOnUiThread([this, uri]() {
++                if (_hoveredUri == uri)
++                {
++                    return;
++                }
++                _hoveredUri = uri;
++                HoveredHyperlinkChanged.raise(*this, nullptr);
++            });
++            return true;
++        }
++
++        // ghostty decided a link should open: a ctrl+click it handled itself,
++        // or an `open_url` binding. Windows Terminal has its own opener, with
++        // the confirmation dialog for schemes it does not trust, so this is
++        // handed up rather than opened here - and *claimed*, because a
++        // libghostty told that nobody handled it falls back to its own opener
++        // (rundll32 url.dll,FileProtocolHandler, os/open.zig), which would step
++        // around that dialog.
++        case GHOSTTY_ACTION_OPEN_URL:
++        {
++            if (_suppressOpenUrl)
++            {
++                return true;
++            }
++            const auto& open = action.action.open_url;
++            const winrt::hstring uri{ til::u8u16(std::string_view{ open.url, open.len }) };
++            _raiseOnUiThread([this, uri]() {
++                OpenHyperlink.raise(*this, winrt::make<implementation::OpenHyperlinkEventArgs>(uri));
++            });
++            return true;
++        }
++
+         case GHOSTTY_ACTION_RENDERER_HEALTH:
+         {
+             if (action.action.renderer_health != GHOSTTY_RENDERER_HEALTH_HEALTHY)
+@@ -809,6 +852,19 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+ #pragma region Input
+ 
++    // The modifier bits libghostty wants, from the modifier state Windows
++    // Terminal reports on the event that carried them. Every path into
++    // libghostty that takes modifiers comes through here, so they cannot drift
++    // apart.
++    static ghostty_input_mods_e GhosttyMods(const ControlKeyStates states) noexcept
++    {
++        auto mods = GHOSTTY_MODS_NONE;
++        if (states.IsShiftPressed()) { mods = static_cast<ghostty_input_mods_e>(mods | GHOSTTY_MODS_SHIFT); }
++        if (states.IsCtrlPressed()) { mods = static_cast<ghostty_input_mods_e>(mods | GHOSTTY_MODS_CTRL); }
++        if (states.IsAltPressed()) { mods = static_cast<ghostty_input_mods_e>(mods | GHOSTTY_MODS_ALT); }
++        return mods;
++    }
++
+     // The text a key press produces, as UTF-8, or empty for keys that produce
+     // none. ToUnicode rather than waiting for the CharacterReceived event, so
+     // the text arrives *with* the key ghostty is given rather than as a
+@@ -835,11 +891,14 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         ev.keycode = GhosttyNativeKeycode(scanCode, (modifiers.Value() & ENHANCED_KEY) != 0);
+         ev.composing = false;
+ 
+-        auto mods = GHOSTTY_MODS_NONE;
+-        if (modifiers.IsShiftPressed()) { mods = static_cast<ghostty_input_mods_e>(mods | GHOSTTY_MODS_SHIFT); }
+-        if (modifiers.IsCtrlPressed()) { mods = static_cast<ghostty_input_mods_e>(mods | GHOSTTY_MODS_CTRL); }
+-        if (modifiers.IsAltPressed()) { mods = static_cast<ghostty_input_mods_e>(mods | GHOSTTY_MODS_ALT); }
++        const auto mods = GhosttyMods(modifiers);
+         ev.mods = mods;
++
++        // Kept for the pointer, which has to state the modifiers on every
++        // position it sends and is handed none by WT's hover call. Not a second
++        // source of truth: ghostty derives its own modifier state from these
++        // same key events, so the two can only ever agree.
++        _keyMods = mods;
+         // consumed_mods is set below, once the text is known - it cannot be
+         // decided before we have seen what the layout produced.
+ 
+@@ -1008,6 +1067,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     {
+         _trace(L"LostFocus (surface=%p)", _surface);
+         _focused = false;
++
++        // What is held while another window owns the keyboard is not ours to
++        // report. Keeping it would let a ctrl released elsewhere go on
++        // highlighting links here on the next hover.
++        _keyMods = GHOSTTY_MODS_NONE;
+         if (_surface)
+         {
+             ghostty_surface_set_focus(_surface, false);
+@@ -1044,10 +1108,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             return false;
+         }
+ 
+-        auto mods = GHOSTTY_MODS_NONE;
+-        if (states.IsShiftPressed()) { mods = static_cast<ghostty_input_mods_e>(mods | GHOSTTY_MODS_SHIFT); }
+-        if (states.IsCtrlPressed()) { mods = static_cast<ghostty_input_mods_e>(mods | GHOSTTY_MODS_CTRL); }
+-        if (states.IsAltPressed()) { mods = static_cast<ghostty_input_mods_e>(mods | GHOSTTY_MODS_ALT); }
++        const auto mods = GhosttyMods(states);
+ 
+         // Every report carries a position, so the pointer moves first whatever
+         // the event is. ghostty derives the reported cell from this.
+@@ -1254,7 +1315,15 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         {
+             return;
+         }
++
++        // ghostty opens a link on the *release* of a click over one
++        // (Surface.zig, processLinks). This release is not a click - WT never
++        // said the button came up, we are inferring it - so a URL that opened
++        // out of it would be one nobody asked for. The action arrives
++        // synchronously, on this thread, so a flag separates the two.
++        _suppressOpenUrl = true;
+         ghostty_surface_mouse_button(_surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
++        _suppressOpenUrl = false;
+         _mouseDown = false;
+     }
+ 
+@@ -1282,6 +1351,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         _releaseMouseIfHeld();
+         _bindingAction("clear_selection");
++        _selectionDroveTheMouse();
+         _mouseTo(positionCore, _selectionMods());
+ 
+         // The press carries no modifiers, and that is deliberate: ghostty reads
+@@ -1309,6 +1379,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     void GhosttyControlCore::SetEndSelectionPoint(const Core::Point positionCore)
+     {
+         // Only meaningful mid-drag, which is the only time WT calls it.
++        _selectionDroveTheMouse();
+         _mouseTo(positionCore, _selectionMods());
+     }
+ 
+@@ -1350,6 +1421,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // click extends the previous selection instead of starting one.
+         _releaseMouseIfHeld();
+         _bindingAction("clear_selection");
++        _selectionDroveTheMouse();
+ 
+         if (numberOfClicks > 1)
+         {
+@@ -1705,11 +1777,103 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     bool GhosttyControlCore::ShouldShowSelectCommand() { return false; }
+     bool GhosttyControlCore::ShouldShowSelectOutput() { return false; }
+ 
+-    void GhosttyControlCore::SetHoveredCell(Core::Point /*terminalPosition*/) {}
+-    void GhosttyControlCore::ClearHoveredCell() {}
+-    winrt::hstring GhosttyControlCore::GetHyperlink(const Core::Point /*position*/) const { return {}; }
+-    winrt::hstring GhosttyControlCore::HoveredUriText() const { return {}; }
+-    IReference<Core::Point> GhosttyControlCore::HoveredCell() const { return nullptr; }
++    // Where the pointer is. Nothing here looks for a URL: ghostty finds links
++    // itself and reports the one under its *own* cursor as MOUSE_OVER_LINK, so
++    // all this owes it is a cursor that is where the pointer is.
++    //
++    // Until this existed the only positions ghostty ever got came from a
++    // selection or from VT mouse reporting, so its cursor sat wherever the last
++    // click had left it. Holding ctrl still lit up a link - ghostty re-runs
++    // link detection when the modifiers change - but it was the link at that
++    // stale point, and ctrl+click opened nothing at all (KD-20).
++    void GhosttyControlCore::SetHoveredCell(Core::Point terminalPosition)
++    {
++        // A drag owns the mouse. ControlInteractivity calls this at the end of
++        // every pointer move, a drag's moves included, and the drag has just
++        // sent this same position with the *selection's* modifiers - repeating
++        // it with the keyboard's would turn a block selection back into a
++        // linear one halfway through.
++        //
++        // The flag is per event, so it also swallows the first hover after an
++        // auto-scroll tick, which drives the mouse with no pointer move behind
++        // it. That costs one mouse move of latency and nothing else.
++        if (_selectionDrove)
++        {
++            _selectionDrove = false;
++            return;
++        }
++
++        if (!_surface || _closing)
++        {
++            return;
++        }
++
++        // The application owns the mouse. It is already being told where the
++        // pointer is, by SendMouseEvent, with the real event's modifiers; a
++        // second position from here would report an extra motion event to it.
++        if (ghostty_surface_mouse_captured(_surface))
++        {
++            return;
++        }
++
++        // The button is up, and this is the first thing WT calls after a drag
++        // ends - it reports no release outside VT mouse mode - so this is where
++        // the synthesised release belongs. Without it ghostty reads these hover
++        // positions as a drag that never ended, and the selection follows the
++        // pointer with no button held.
++        _releaseMouseIfHeld();
++
++        // A move within one cell is not worth a position: ghostty re-runs link
++        // detection on every one it is given, and WT sends one per pixel.
++        const til::point cell{ terminalPosition };
++        if (_hoveredCell == cell)
++        {
++            return;
++        }
++        _hoveredCell = cell;
++        _mouseTo(terminalPosition, _keyMods);
++    }
++
++    // The pointer left the control. A negative position is what ghostty reads
++    // as "outside": it drops the highlight and reports the link gone, which is
++    // what clears _hoveredUri.
++    void GhosttyControlCore::ClearHoveredCell()
++    {
++        _hoveredCell.reset();
++
++        // Not mid-drag. A drag that leaves the control keeps the pointer
++        // captured and the selection live, and "outside" would end it.
++        if (!_surface || _closing || _mouseDown)
++        {
++            return;
++        }
++        ghostty_surface_mouse_pos(_surface, -1.0, -1.0, _keyMods);
++    }
++
++    // The URL under the pointer, or empty for none.
++    //
++    // The position is ignored, deliberately. ghostty's answer is *about* the
++    // pointer's cell and arrives as an action rather than as an answer to a
++    // question, and the one caller - ControlInteractivity's ctrl+click - asks
++    // about the cell the pointer is in. So this is the same answer, and it is
++    // the only one available: the C API has no "what is at this point" call.
++    winrt::hstring GhosttyControlCore::GetHyperlink(const Core::Point /*position*/) const { return _hoveredUri; }
++
++    winrt::hstring GhosttyControlCore::HoveredUriText() const { return _hoveredUri; }
++
++    // Where TermControl draws the tooltip. Null when no link is under the
++    // pointer, which is how it reads "nothing to show".
++    IReference<Core::Point> GhosttyControlCore::HoveredCell() const
++    {
++        return (_hoveredUri.empty() || !_hoveredCell) ? nullptr :
++                                                        IReference<Core::Point>{ _hoveredCell->to_core_point() };
++    }
++
++    void GhosttyControlCore::_selectionDroveTheMouse()
++    {
++        _hoveredCell.reset();
++        _selectionDrove = true;
++    }
+ 
+     // Whether the application has asked for the mouse. This is the switch that
+     // makes ControlInteractivity route pointer events to SendMouseEvent instead
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.h b/src/cascadia/TerminalControl/GhosttyControlCore.h
+index e2bf66c79..c22eebb1e 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.h
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.h
+@@ -269,6 +269,10 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         void _mouseTo(Core::Point cell, ghostty_input_mods_e mods) const;
+         void _releaseMouseIfHeld() const;
+ 
++        // Said by the selection path when it has already driven the mouse for
++        // the pointer event WT is delivering. See SetHoveredCell.
++        void _selectionDroveTheMouse();
++
+         // The modifiers every mouse event of a selection carries - the engine
+         // reads block-vs-linear off them, per event. See GhosttySelectionMods.h.
+         ghostty_input_mods_e _selectionMods() const noexcept;
+@@ -333,6 +337,23 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // _releaseMouseIfHeld.
+         mutable bool _mouseDown{ false };
+ 
++        // The modifiers the last key event carried, which is what a hover
++        // position claims. See TrySendKeyEvent.
++        ghostty_input_mods_e _keyMods{ GHOSTTY_MODS_NONE };
++
++        // The cell the pointer was last reported at - a gate against sending a
++        // position per pixel - and the link ghostty says is under it, empty for
++        // none. The link is ghostty's answer, not a lookup: MOUSE_OVER_LINK.
++        std::optional<til::point> _hoveredCell;
++        winrt::hstring _hoveredUri;
++
++        // Whether the selection path drove the mouse for this pointer event.
++        bool _selectionDrove{ false };
++
++        // A release WT synthesised must not open a link the pointer happens to
++        // be over. See _releaseMouseIfHeld.
++        mutable bool _suppressOpenUrl{ false };
++
+         // Whether the drag in progress is a block selection. Alt at the moment
+         // of the click decides it, as it does on cascadia, and it holds for the
+         // whole drag - releasing alt halfway through does not turn a block
