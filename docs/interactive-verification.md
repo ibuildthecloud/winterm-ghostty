@@ -71,3 +71,56 @@ only by that flag. `stty raw -echo; cat -v` with synthetic Up/Down/Left/Right yi
 - IME / composition input (`winkeys` always reports `composing = false`).
 - Shift/Ctrl/Alt modified keys beyond ctrl+c, which was verified interactively.
 - Any font other than the default JetBrains Mono for ligatures.
+
+---
+
+## Liveness: does a change still reach the screen? (KD-19)
+
+Since KD-19 the UI thread no longer forces a frame of its own - every path
+wakes the render thread instead. The property to check by hand is therefore
+*liveness*: after something changes, pixels follow, without another event
+having to force them.
+
+**The discipline is the test.** The failure mode is "the pane repaints only
+when something unrelated happens", so the moment you act, stop generating
+events: do not move the mouse (`focusFollowMouse` is on in this repo's test
+settings, so even crossing a pane boundary changes focus), do not type, do not
+alt-tab. Act, then sit still and look.
+
+### By hand, one per path that lost its forced render
+
+| do this | pass |
+|---|---|
+| drag-select a few words, release, **hands off the mouse** | the highlight is there the instant you release, and does not appear a second later |
+| select-all from the keyboard | the whole buffer highlights with no mouse involved |
+| clear the selection | the highlight goes at once |
+| scroll to a mark / prompt from the keyboard | the viewport moves without a nudge |
+| with an IME active, compose a word | the preedit appears and updates per keystroke |
+| with a preedit open, alt-tab away | the preedit clears, and the process survives - this is the exact path that crashed |
+
+A pane that repaints *late* is the interesting result, not a pass. Late means
+the wake was lost and something else drew the frame.
+
+### Objectively, with the stage counters
+
+`scripts/probe-render-liveness.ps1` reads libghostty's own counters, which exist
+for this question:
+
+```powershell
+.\scripts\probe-render-liveness.ps1 -Launch          # or -Seconds 60 to attach
+```
+
+Each line is a per-second delta of `notify` (a render was asked for), `wakeup`,
+`update` and `present` (pixels reached the swap chain). A stall is `notify`
+climbing while `present` stands still, and is printed in red; the script exits
+1 if it ever sees one, 2 if it saw no reports at all.
+
+Two things silence it, and it says so rather than reporting a clean run:
+`GHOSTTY_RENDER_DIAG` is read once and cached, so the terminal must be
+*started* with it; and the report rides the cursor blink timer, so the pane has
+to be focused. Close DebugView first - only one process may own the DBWIN
+buffer.
+
+The detector was checked against synthetic input in both directions before being
+trusted: three healthy reports pass, and a fed stall (`notify +4 present +0`)
+is caught and exits 1.
