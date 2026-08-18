@@ -41,6 +41,23 @@ param(
     # transfer.
     [string] $Cpu = 'baseline',
 
+    # The font backend, which decides discovery *and* rasterization (ADR 0005).
+    #
+    # This is a parameter with a default rather than something the caller
+    # remembers to pass, because for months it was the latter and the two
+    # builds silently disagreed: release.yml passed
+    # -Dfont-backend=directwrite_harfbuzz while this script passed nothing, so
+    # `zig build` fell through to ghostty's own Windows default,
+    # `freetype_windows`. Every local build - and so every dev package, every
+    # capture, every by-hand check - ran FreeType rasterization and a
+    # C:\Windows\Fonts directory scan, while what shipped ran DirectWrite and
+    # the system fallback chain. Two different font stacks, one of them never
+    # exercised by the person testing it.
+    #
+    # Pass '' to build ghostty's default instead, which is the only way to
+    # reproduce that older behaviour deliberately.
+    [string] $FontBackend = 'directwrite_harfbuzz',
+
     # Run `zig build test` instead of building the library.
     [switch] $Test,
 
@@ -65,6 +82,7 @@ $zigArgs += "-Doptimize=$Optimize"
 if (-not $Test) { $zigArgs += '-Dapp-runtime=none' }
 if ($Target)    { $zigArgs += "-Dtarget=$Target" }
 if ($Cpu)       { $zigArgs += "-Dcpu=$Cpu" }
+if ($FontBackend) { $zigArgs += "-Dfont-backend=$FontBackend" }
 if ($Rest)      { $zigArgs += $Rest }
 
 Push-Location $GhosttyRoot

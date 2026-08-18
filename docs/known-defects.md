@@ -1222,3 +1222,108 @@ and the bold row now carries the same stroke weight as the plain row in both
 panes. `IntenseTextStyleIsForwarded` pins all four cases of the enum plus the
 foreground-not-in-the-palette case; `unitControl` is 66 tests, 65 passed, 1
 pre-existing skip.
+
+
+---
+
+### KD-14 — The glyph atlas held a corrected mask, not coverage — **fixed 2026-08-18**
+
+**Found** while answering a user's question about antialiasing: is a ghostty
+pane's thinner, crisper text a style difference from cascadia, or is it wrong?
+
+#### What was wrong
+
+ghostty's cell shader owns every gamma step. `alpha-blending` decides whether
+blending happens in linear space and whether the weight correction runs, and the
+shader's input is assumed to be the rasterizer's *coverage*: FreeType renders
+`.normal`, and CoreText turns platform font smoothing on only when
+`font-thicken` is set, which is off by default (`face/coretext.zig:483`).
+
+The DirectWrite face handed it something else. Direct2D applies the **system's**
+text rendering params unless a render target says otherwise, and this face set
+only the antialias mode. `harness/glyphmask` draws one glyph both ways and
+measures the difference:
+
+```
+system params: gamma=1.800 contrast=0.500 grayscaleContrast=1.000 mode=DEFAULT
+glyph U+0065 of Cascadia Code at 14.6667 px/em, 37x37 bitmap
+d2d default params       inked=   49 mass=   34.43
+d2d gamma=1 contrast=0   inked=   49 mass=   29.19
+differing pixels: 47, max delta: 51
+```
+
+47 of 49 inked pixels, up to 51/255, and 18% more ink. The shader's own
+correction was then applied on top of DirectWrite's.
+
+#### The fix
+
+Rendering params created once per library with gamma 1.0 and no contrast
+enhancement - for grayscale as well as ClearType, since grayscale is the only
+antialiasing this backend uses (ADR 0005) - and set on the raster target.
+Rendering mode stays `DEFAULT`, so DirectWrite's own per-size choice is
+unchanged and only gamma and contrast move.
+
+#### Measured, in a pane
+
+One row of identical text, coverage normalised to the plain foreground:
+
+| | inked | ink mass | faint (<30%) |
+|---|---|---|---|
+| DirectWrite, system params (before) | 3693 | 2855 | 234 |
+| DirectWrite, linear params (after) | 3693 | 2530 | 736 |
+| FreeType, for comparison | 3792 | 2686 | 677 |
+
+After the fix the DirectWrite mask has the *shape* FreeType's coverage has - a
+faint tail rather than a lifted middle - which is the point. The remaining
+difference from cascadia is [GD-16](documented-diffs.md), and is by decision.
+
+`zig build test` passes on both font backends.
+
+---
+
+### KD-15 — Dev builds did not run the font stack that ships — **fixed 2026-08-18**
+
+**Found** by measuring: the KD-14 fix landed, the dev package was rebuilt, and a
+capture of the pane was **byte-identical** to the one before it. A fix that
+provably changes the glyph mask changed nothing on screen, which meant the code
+was not running.
+
+#### What was wrong
+
+`scripts/build-ghostty.ps1` passed no `-Dfont-backend`, so `zig build` fell
+through to ghostty's own Windows default - `freetype_windows`
+(`font/backend.zig:59`, still carrying upstream's "A future DirectWrite backend
+can replace this if needed"). `.github/workflows/release.yml:132` passed
+`-Dfont-backend=directwrite_harfbuzz`.
+
+So the two builds ran different font stacks:
+
+| | dev build | release build |
+|---|---|---|
+| rasterizer | FreeType | DirectWrite / Direct2D |
+| discovery | `C:\Windows\Fonts` directory scan | DirectWrite font collection |
+| fallback | scan every font's cmap | `IDWriteFontFallback::MapCharacters` |
+| colour emoji | none (no `ftcolor` binding) | `TranslateColorGlyphRun` |
+
+Confirmed from the artifact rather than the flags: a default-built
+`ghostty-internal.dll` imports `d3d11.dll` and `dcomp.dll` and **no**
+`dwrite.dll`, `d2d1.dll` or `windowscodecs.dll` - the whole ADR 0005 font stack
+was absent from every local build.
+
+Everything verified locally against the font stack - by hand, by capture, in the
+smoke harness - was therefore verifying a stack that no user runs, and ADR 0005,
+which is Accepted, was not what a developer was exercising.
+
+#### The fix
+
+`-FontBackend` is now a parameter of `build-ghostty.ps1` with the shipped
+backend as its default, so a plain local build matches the release. `''`
+reproduces ghostty's own default deliberately, which is how the FreeType numbers
+in KD-14 were taken.
+
+#### Not fixed here, and worth knowing
+
+Findings taken on a dev build before this date describe FreeType's behaviour
+unless they say otherwise. [KD-13](#kd-13--intense-text-is-neither-brightened-nor-un-emboldened--fixed-2026-08-18)'s
+ink counts are one such: the fix there is a settings translation and is backend
+independent, but the "ghostty draws a bold face" measurement was FreeType's.

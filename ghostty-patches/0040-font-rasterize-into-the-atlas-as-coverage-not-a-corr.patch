@@ -1,0 +1,248 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 18 Aug 2026 11:38:22 -0700
+Subject: [PATCH] font: rasterize into the atlas as coverage, not a corrected
+ mask
+
+ghostty's cell shader owns every gamma step - `alpha-blending` decides
+whether blending happens in linear space and whether the weight
+correction runs - and it assumes the grayscale atlas holds the
+rasterizer's coverage. FreeType renders `.normal`, and CoreText turns
+platform font smoothing on only when `font-thicken` is set, which is off
+by default. This face handed it something else.
+
+Direct2D applies the *system's* text rendering params unless a render
+target is told otherwise: on the dev box gamma 1.8 with grayscale
+enhanced contrast 1.0, as tuned by the ClearType tuner. harness/glyphmask
+draws one glyph both ways and measures the difference - 47 of 49 inked
+pixels differ on a 14.67px 'e', up to 51/255, and the corrected mask
+carries 18% more ink. The shader's correction was then landing on top of
+one that was already there.
+
+Creating rendering params with gamma 1.0 and no contrast enhancement -
+for grayscale as well as ClearType, since grayscale AA is all this
+backend uses - leaves the coverage alone. Rendering mode stays DEFAULT,
+so DirectWrite's own per-size choice is unchanged and only the gamma and
+contrast move.
+
+Measured in a pane, one row of identical text: ink mass falls from 2855
+to 2530 and the faint tail grows from 234 pixels to 736, which is the
+shape FreeType's coverage has (2686 / 677) rather than the shape a
+gamma-corrected mask has.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/font/face/directwrite.zig |  5 +++
+ src/font/face/dwrite/api.zig  | 69 ++++++++++++++++++++++++++++++++++-
+ src/font/face/dwrite/d2d.zig  |  9 ++++-
+ src/font/library.zig          | 25 +++++++++++++
+ 4 files changed, 105 insertions(+), 3 deletions(-)
+
+diff --git a/src/font/face/directwrite.zig b/src/font/face/directwrite.zig
+index 854db313a..1f96eb499 100644
+--- a/src/font/face/directwrite.zig
++++ b/src/font/face/directwrite.zig
+@@ -696,6 +696,11 @@ pub fn renderGlyph(
+         dc4.?.SetUnitMode(.PIXELS);
+     }
+ 
++    // Coverage, not a corrected mask: the cell shader owns every gamma step
++    // (see `library.zig`'s `text_params`). Without this call D2D applies the
++    // system's own gamma and contrast while drawing, and the shader's
++    // correction then lands on top of one that is already there.
++    rt.?.SetTextRenderingParams(self.lib.text_params);
+     rt.?.SetTextAntialiasMode(.GRAYSCALE);
+     rt.?.BeginDraw();
+     const clear: d2d.D2D1_COLOR_F = .{ .r = 0, .g = 0, .b = 0, .a = 0 };
+diff --git a/src/font/face/dwrite/api.zig b/src/font/face/dwrite/api.zig
+index 1f831c75a..64d271c71 100644
+--- a/src/font/face/dwrite/api.zig
++++ b/src/font/face/dwrite/api.zig
+@@ -428,6 +428,9 @@ pub const IDWriteFactory = extern struct {
+         ) callconv(.winapi) HRESULT,
+         CreateRenderingParams: Reserved,
+         CreateMonitorRenderingParams: Reserved,
++        // Not this one: the version here has no grayscale-contrast parameter,
++        // and grayscale is the only antialiasing this backend uses. See
++        // IDWriteFactory2's slot 25 instead.
+         CreateCustomRenderingParams: Reserved,
+         RegisterFontFileLoader: *const fn (
+             *IDWriteFactory,
+@@ -466,6 +469,7 @@ pub const IDWriteFactory = extern struct {
+         return self.vtable.GetSystemFontCollection(self, out, @intFromBool(check_for_updates));
+     }
+ 
++
+     /// Rasterize a glyph run to a coverage texture.
+     ///
+     /// `pixels_per_dip` is 1.0 because we work in device pixels throughout;
+@@ -539,6 +543,34 @@ pub const IDWriteFactory = extern struct {
+     }
+ };
+ 
++/// Only meaningful for subpixel antialiasing, which this backend never asks
++/// for (ADR 0005: grayscale only). Named so the rendering-params call reads
++/// like its documentation rather than taking a bare integer.
++pub const DWRITE_PIXEL_GEOMETRY = enum(u32) {
++    FLAT = 0,
++    RGB = 1,
++    BGR = 2,
++    _,
++};
++
++/// Gamma, contrast and rendering mode for text drawing. Direct2D applies a
++/// default one - the system's, as tuned by the ClearType tuner - unless a
++/// render target is told otherwise, which is why we create our own.
++pub const IDWriteRenderingParams = extern struct {
++    vtable: *const VTable,
++
++    pub const VTable = extern struct {
++        QueryInterface: *const fn (*IDWriteRenderingParams, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
++        AddRef: *const fn (*IDWriteRenderingParams) callconv(.winapi) u32,
++        Release: *const fn (*IDWriteRenderingParams) callconv(.winapi) u32,
++        // The getters are unused: we only ever hand this back to Direct2D.
++    };
++
++    pub inline fn Release(self: *IDWriteRenderingParams) u32 {
++        return self.vtable.Release(self);
++    }
++};
++
+ pub const DWRITE_RENDERING_MODE = enum(u32) {
+     DEFAULT = 0,
+     ALIASED = 1,
+@@ -925,8 +957,17 @@ pub const IDWriteFactory2 = extern struct {
+         _f19: Reserved,
+         _f20: Reserved,
+         // IDWriteFactory1 24-25 (2 methods)
+-        _f1_0: Reserved,
+-        _f1_1: Reserved,
++        _f1_0: Reserved, // GetEudcFontCollection
++        CreateCustomRenderingParams1: *const fn (
++            *IDWriteFactory2,
++            f32, // gamma
++            f32, // enhancedContrast
++            f32, // enhancedContrastGrayscale
++            f32, // clearTypeLevel
++            DWRITE_PIXEL_GEOMETRY,
++            DWRITE_RENDERING_MODE,
++            *?*IDWriteRenderingParams,
++        ) callconv(.winapi) HRESULT,
+         // IDWriteFactory2 26-30
+         GetSystemFontFallback: *const fn (*IDWriteFactory2, *?*IDWriteFontFallback) callconv(.winapi) HRESULT,
+         CreateFontFallbackBuilder: Reserved,
+@@ -945,6 +986,30 @@ pub const IDWriteFactory2 = extern struct {
+         CreateGlyphRunAnalysis: Reserved,
+     };
+ 
++    /// Rendering params that leave the rasterizer's coverage alone: gamma 1.0,
++    /// and no contrast enhancement for either antialiasing kind. `library.zig`
++    /// says why the atlas wants exactly that.
++    ///
++    /// `DEFAULT` for the rendering mode keeps DirectWrite's own per-size
++    /// choice, which is what the system params carry as well, so gamma and
++    /// contrast are the only things that change. Pixel geometry has no effect
++    /// under grayscale AA, which is all this backend asks for.
++    pub inline fn CreateLinearRenderingParams(
++        self: *IDWriteFactory2,
++        out: *?*IDWriteRenderingParams,
++    ) HRESULT {
++        return self.vtable.CreateCustomRenderingParams1(
++            self,
++            1.0, // gamma
++            0.0, // enhancedContrast
++            0.0, // enhancedContrastGrayscale
++            1.0, // clearTypeLevel
++            .RGB,
++            .DEFAULT,
++            out,
++        );
++    }
++
+     /// Returns null when the glyph has no colour layers (DWRITE_E_NOCOLOR).
+     /// That is the monochrome answer, not a failure.
+     pub inline fn TranslateColorGlyphRun(
+diff --git a/src/font/face/dwrite/d2d.zig b/src/font/face/dwrite/d2d.zig
+index dc4f79696..89ae73ffb 100644
+--- a/src/font/face/dwrite/d2d.zig
++++ b/src/font/face/dwrite/d2d.zig
+@@ -166,7 +166,7 @@ pub const ID2D1RenderTarget = extern struct {
+         GetAntialiasMode: Reserved, // 33
+         SetTextAntialiasMode: *const fn (*ID2D1RenderTarget, D2D1_TEXT_ANTIALIAS_MODE) callconv(.winapi) void, // 34
+         GetTextAntialiasMode: Reserved, // 35
+-        SetTextRenderingParams: Reserved, // 36
++        SetTextRenderingParams: *const fn (*ID2D1RenderTarget, ?*dw.IDWriteRenderingParams) callconv(.winapi) void, // 36
+         GetTextRenderingParams: Reserved, // 37
+         SetTags: Reserved, // 38
+         GetTags: Reserved, // 39
+@@ -203,6 +203,13 @@ pub const ID2D1RenderTarget = extern struct {
+         self.vtable.SetTextAntialiasMode(self, mode);
+     }
+ 
++    pub inline fn SetTextRenderingParams(
++        self: *ID2D1RenderTarget,
++        params: ?*dw.IDWriteRenderingParams,
++    ) void {
++        self.vtable.SetTextRenderingParams(self, params);
++    }
++
+     pub inline fn Clear(self: *ID2D1RenderTarget, color: ?*const D2D1_COLOR_F) void {
+         self.vtable.Clear(self, color);
+     }
+diff --git a/src/font/library.zig b/src/font/library.zig
+index 02d6e6120..2e5194bc5 100644
+--- a/src/font/library.zig
++++ b/src/font/library.zig
+@@ -96,6 +96,24 @@ pub const DirectWriteLibrary = struct {
+     d2d_factory: *d2d.ID2D1Factory,
+     wic_factory: *d2d.IWICImagingFactory,
+ 
++    /// Gamma 1.0, no contrast enhancement - so what lands in the atlas is the
++    /// rasterizer's coverage and nothing else.
++    ///
++    /// Without this, Direct2D uses the *system's* text rendering params, as
++    /// tuned by the ClearType tuner: on the dev box gamma 1.8 with grayscale
++    /// enhanced contrast 1.0, which is a real change to the mask - measured
++    /// with `harness/glyphmask`, 47 of 49 inked pixels differ on a 14.67px
++    /// 'e', up to 51/255, and the corrected mask carries 18% more ink.
++    ///
++    /// That correction is not ours to make here. Every other ghostty face
++    /// hands the atlas plain coverage - FreeType renders `.normal`, and
++    /// CoreText enables font smoothing only when `font-thicken` is set, which
++    /// is off by default - and the cell shader then does all the gamma work
++    /// itself, per `alpha-blending`. Baking DirectWrite's correction into the
++    /// mask means the shader's correction lands on top of one that is already
++    /// there.
++    text_params: *dw.IDWriteRenderingParams,
++
+     alloc: Allocator,
+ 
+     /// Held whenever a face is created or a glyph rasterized. The DirectWrite
+@@ -177,6 +195,11 @@ pub const DirectWriteLibrary = struct {
+         const wic_factory: *d2d.IWICImagingFactory = @ptrCast(@alignCast(wic_o.?));
+         errdefer _ = wic_factory.Release();
+ 
++        var params: ?*dw.IDWriteRenderingParams = null;
++        if (dw.FAILED(factory2.CreateLinearRenderingParams(&params)) or
++            params == null) return error.DirectWriteUnavailable;
++        errdefer _ = params.?.Release();
++
+         const mutex = try alloc.create(std.Io.Mutex);
+         mutex.* = .init;
+ 
+@@ -188,6 +211,7 @@ pub const DirectWriteLibrary = struct {
+             .in_memory_loader = loader.?,
+             .d2d_factory = d2d_factory,
+             .wic_factory = wic_factory,
++            .text_params = params.?,
+             .alloc = alloc,
+             .mutex = mutex,
+         };
+@@ -299,6 +323,7 @@ pub const DirectWriteLibrary = struct {
+ 
+     pub fn deinit(self: *Library) void {
+         self.alloc.destroy(self.mutex);
++        _ = self.text_params.Release();
+         _ = self.wic_factory.Release();
+         _ = self.d2d_factory.Release();
+         _ = self.factory.UnregisterFontFileLoader(@ptrCast(self.in_memory_loader));

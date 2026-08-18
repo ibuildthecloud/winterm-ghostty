@@ -316,55 +316,53 @@ every byte it reads.
 ## Found after release, from side-by-side use
 
 Both were found the same way: one window, a ghostty pane and a cascadia pane on
-the *same* profile, and a capture measured rather than eyeballed. Both are
-colour rules WT applies that the settings translator has no exact ghostty key
-for. (The third finding of that session, intense text, *did* have exact keys and
-is a defect, not a diff — [KD-13](known-defects.md).)
+the *same* profile, and a capture measured rather than eyeballed. The same
+session turned up three defects, which are not diffs and live in
+[known-defects.md](known-defects.md): intense text ([KD-13](known-defects.md)),
+a glyph atlas that was not coverage ([KD-14](known-defects.md)), and a dev build
+that was not running the font stack releases ship
+([KD-15](known-defects.md)).
 
 ### GD-16 — Antialiasing is thinner and crisper than cascadia's
 
 Same font, same size, same colours: a ghostty pane's glyphs read slightly
-thinner and sharper, a cascadia pane's slightly softer. Measured on one text row
-of the identical string in both panes, coverage normalised so the plain
-foreground is 1.0:
+thinner and sharper, a cascadia pane's slightly softer. This is upstream
+ghostty's rendering, and it stays.
+
+Measured on one text row of the identical string in both panes, coverage
+normalised so the plain foreground is 1.0:
 
 | | inked pixels | total ink mass | pixels under 30% coverage |
 |---|---|---|---|
-| ghostty | 3792 | 2686 | 677 |
+| ghostty (DirectWrite raster) | 3693 | 2530 | 736 |
+| ghostty (FreeType raster) | 3792 | 2686 | 677 |
 | cascadia | 3374 | 2677 | 163 |
 
-The *mass* is the same to within 0.4% — neither engine is drawing a heavier
-font. The distribution differs: ghostty pushes partial-coverage pixels down into
-a faint skirt, cascadia holds them mid-to-high, which is exactly "thinner" and
-"fuzzier" as a pair.
+The distinction that matters is the *shape*, not the total: ghostty's mask is
+coverage, so partial-coverage pixels form a faint skirt, and the cell shader
+then applies whatever `alpha-blending` asks for. Cascadia instead reapplies
+DirectWrite's own contrast and gamma-ratio correction in its pixel shader, per
+foreground colour (`shader_ps.hlsl:49`), which lifts those pixels into the
+middle of the range - "fuzzier", and by the same token heavier-looking.
 
 **Not the blending space.** `alpha-blending` was driven through all three of its
-values on the real pane, one build, an environment-variable probe: `native` and
-`linear-corrected` are **pixel-identical** here (3792 / 2686 / 677 both times —
-the correction is an exact inversion over a flat background), and `linear` is
-heavier than either *and* than cascadia (mass 3103). No value of that knob lands
-on cascadia's curve.
+values on the real pane: `native` and `linear-corrected` are pixel-identical
+here (the correction is an exact inversion over a flat background), and `linear`
+is heavier than either *and* than cascadia. No value of that knob lands on
+cascadia's curve, because the curve is not the difference.
 
-**What actually differs** is a stage WT has and this renderer does not.
-AtlasEngine hands Direct2D *linear* rendering params — gamma 1.0, contrast 0
-(`dwrite_helpers.cpp:36`, `BackendD3D.cpp:868`) — so its atlas holds a raw
-coverage mask, and then reapplies DirectWrite's own correction in the pixel
-shader, per foreground colour: `DWrite_EnhanceContrast` with the grayscale
-enhanced-contrast value, then `DWrite_ApplyAlphaCorrection` with the gamma
-ratios (`shader_ps.hlsl:49`). Our DirectWrite face sets only
-`SetTextAntialiasMode(.GRAYSCALE)` (`font/face/directwrite.zig:699`) and never
-touches the rendering params, so D2D's defaults apply at raster time against the
-white brush, and `cell_text.hlsl` then blends with ghostty's own correction.
+**Closing it** would mean porting AtlasEngine's correction stage into
+`cell_text.hlsl` - well-defined work, WT's implementation is small and is the
+reference - and deciding to look like Windows Terminal rather than like ghostty.
+The project's answer is the latter, so this is a diff by decision.
 
-**Closing it** means porting that stage: linear rendering params into the raster
-target so the mask is raw, and DWrite's contrast + gamma-ratio correction into
-`cell_text.hlsl`. It is well-defined work — WT's implementation is the reference
-and is small — but it is a Windows-only divergence from upstream ghostty's
-blending model, so it wants a decision before it is written. ADR 0005 chose
-grayscale AA and stopped there; this is the part of "text will match other
-Windows applications" that grayscale alone did not deliver.
+What was *not* by decision, and is now fixed, is the mask underneath it: the
+DirectWrite face used to hand the atlas a gamma-corrected mask rather than
+coverage, so the shader's correction landed on top of one that was already
+there. See [KD-14](known-defects.md).
 
-*Measured* — histograms above, from `wgc-shot` captures of one window.
+*Measured* — histograms above, from `wgc-shot` captures of one window, with the
+raster fix in place.
 
 ### GD-17 — `adjustIndistinguishableColors` is not honoured
 

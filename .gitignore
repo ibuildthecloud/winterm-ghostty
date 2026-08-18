@@ -78,3 +78,7 @@ harness/*/*.err
 harness/rawin/*.exe
 harness/rawin/*.obj
 harness/rawin/*.log
+
+# harness/glyphmask: is the glyph atlas coverage, or has D2D corrected it?
+harness/glyphmask/*.exe
+harness/glyphmask/*.obj
