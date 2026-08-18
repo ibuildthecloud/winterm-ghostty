@@ -1114,6 +1114,18 @@ luck; it could not be walked. From 0.2.7 the release passes `-Dstrip=false`,
 and `package-symbols.ps1` **fails the build** if a binary this project owns
 yields no PDB, so the silent version of this cannot recur.
 
+**Verified on the published 0.2.7 artifacts**, not on a green build: the
+symbols ZIP was downloaded, `ghostty.pdb` put beside the shipped
+`ghostty-internal.dll`, and `pdbaddr` asked for the same three RVAs. It answers
+with function and source line —
+`innerStrokePath + 0x307  ghostty/src/font/sprite/canvas.zig:386`.
+
+Those names are **not** this crash's answer, and the run is a neat demonstration
+of why: the identical RVAs resolved in a local Debug build to
+`deallocate` / `grow` / `getIndex`, and here to `innerStrokePath` / `init` /
+`png_write_zTXt`. Nothing but the binary's own PDB can name its addresses, which
+is precisely why the 0.2.4 dump stays unreadable and why the ZIP now ships.
+
 So this defect stays open with the class of fault (double free), the module
 (ours), and the fact that it happened twice in one day of ordinary use. The
 **next** occurrence on 0.2.7 or later can be named, and its stack read.
