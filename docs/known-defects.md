@@ -992,16 +992,21 @@ of the first row and back from the start of the last. `scripts/smoke-harness.ps1
 pins both, and the *contrast* is the regression signal — the bug was that the
 two were identical.
 
-#### What was not verified, and why
+#### Confirmed in a pane, by hand
 
-**A real pane, by a real drag.** The synthetic-mouse driver written for it —
-`SetCursorPos` + `mouse_event` into a deployed dev-package window, DPI-aware,
-with a focusing click first — moves the pointer where it is told and produces
-**no selection at all**, and it produces none on a **cascadia** pane either.
-That makes it an instrument that measures itself, not the engine, so nothing
-about the fix can be read off it in either direction. The engine-level evidence
-above and the unit test are what stand; the pane is a human check, and it is one
-alt+drag.
+**2026-08-17, by the user, on the deployed dev package**: one window, a ghostty
+pane and a cascadia pane side by side on the same fourteen identical lines.
+Alt+drag block-selects on **both**. A capture taken at the same moment shows the
+rectangle in the ghostty pane — four rows, columns K..V, square edges.
+
+That was a human check because the synthetic-mouse driver written for it could
+not do it. `SetCursorPos` + `mouse_event` into the dev-package window,
+DPI-aware, with a focusing click first, moves the pointer exactly where it is
+told and produces **no selection at all** — and produces none on a **cascadia**
+pane either. An instrument that fails identically on the engine that is known to
+work measures itself, so nothing about the fix could be read off it in either
+direction. Left unfixed: the pane check is one drag by a person, and the two
+automated layers above cover the regression.
 
 #### What is still not block-selectable
 
