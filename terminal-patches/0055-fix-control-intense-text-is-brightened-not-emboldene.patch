@@ -1,0 +1,320 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 18 Aug 2026 10:47:35 -0700
+Subject: [PATCH] fix(control): intense text is brightened, not emboldened
+ (KD-13)
+
+WT's intenseTextStyle is two switches and neither reached the engine, so
+`top` beside a cascadia pane showed the difference twice over: cascadia
+lifted its intense headers to bright white where ghostty left them the
+plain foreground, and ghostty drew them with a bold face where cascadia
+- whose default is bright, and *not* bold - drew regular strokes.
+
+The colour half is not `bold-color = bright` on its own. That lifts a
+palette colour to its bright twin, and text in the default foreground
+has no index to lift, which is most of a `top` screen; measured, it
+changed nothing. Cascadia's own rule looks the default foreground up in
+the dark half of the palette and uses the bright entry it matches, so
+the translator does that lookup and names the colour outright - which
+also turns the rest of the bold colours bright, covering both halves of
+the rule in one entry.
+
+The face half is `font-style-bold = false`, ghostty's spelling for a
+disabled style, which falls back to the regular face.
+
+Measured on one capture of two panes on one profile: bold text is
+#F2F2F2 in both, `1;31` is the scheme's brightRed #BA3A45 in both, and
+the bold row carries the plain row's stroke weight in both.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../GhosttySettingsTranslator.cpp             | 177 ++++++++++++------
+ .../GhosttySettingsTests.cpp                  |  72 ++++++-
+ 2 files changed, 189 insertions(+), 60 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+index 614ab7d8b..b72bd4772 100644
+--- a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
++++ b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+@@ -98,65 +98,87 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             }
+         }
+ 
+-        // A triple click highlights the whole width of the line here, the way
+-        // cascadia's does. ghostty's own default stops where the line's content
+-        // stops, which reads as a highlight that falls short next to a cascadia
+-        // pane in the same window. What gets copied is trimmed either way, so
+-        // this widens the highlight without putting trailing spaces on the
+-        // clipboard - measured, because that was the regression to fear.
+-        set("selection-trim-line", "false");
+-
+-        // --- Cursor -------------------------------------------------------
+-        // Found by hand: a ghostty pane drew a block where the cascadia pane
+-        // beside it drew a bar, because the profile's cursorShape was never
+-        // forwarded and ghostty used its own default.
+-        //
+-        // All six shapes map exactly. ghostty had four until patch 31 added the
+-        // two DECSCUSR has no name for - a stacked double underline and the
+-        // thick bottom bar the Windows console has drawn for decades. They were
+-        // both collapsed onto a plain underline before that, which was not an
+-        // approximation so much as a different shape.
+-        //
+-        // CursorHeight is still not forwarded: it exists to size Vintage, and
+-        // cursor-style underline_thick is a fixed quarter of the cell - which is
+-        // what WT itself defaults cursorHeight to. Sending a height would imply
+-        // an effect ghostty has no setting for.
+-        //
+-        // Only the default is set here. A program can still ask for a different
+-        // shape with DECSCUSR, on either engine, and ghostty's shell
+-        // integration puts a bar at the prompt regardless - so a profile's
+-        // cursorShape is the starting point rather than the last word.
+-        if (const auto appearance = settings.try_as<Core::ICoreAppearance>())
+-        {
+-            switch (appearance.CursorShape())
+-            {
+-            case Core::CursorStyle::Bar:
+-                set("cursor-style", "bar");
+-                break;
+-            case Core::CursorStyle::Underscore:
+-                set("cursor-style", "underline");
+-                break;
+-            case Core::CursorStyle::DoubleUnderscore:
+-                set("cursor-style", "underline_double");
+-                break;
+-            case Core::CursorStyle::Vintage:
+-                set("cursor-style", "underline_thick");
+-                break;
+-            case Core::CursorStyle::EmptyBox:
+-                set("cursor-style", "block_hollow");
+-                break;
+-            case Core::CursorStyle::FilledBox:
+-                set("cursor-style", "block");
+-                break;
+-            }
+-        }
+-
+-        // Cascadia draws no cursor at all in an unfocused pane; ghostty's
+-        // default - like most terminals - is a hollow block, so every shape
+-        // became the same hollow box the moment focus moved. Next to a cascadia
+-        // pane that is simply wrong rather than merely different.
+-        set("cursor-style-unfocused", "hidden");
+-
++        // A triple click highlights the whole width of the line here, the way
++        // cascadia's does. ghostty's own default stops where the line's content
++        // stops, which reads as a highlight that falls short next to a cascadia
++        // pane in the same window. What gets copied is trimmed either way, so
++        // this widens the highlight without putting trailing spaces on the
++        // clipboard - measured, because that was the regression to fear.
++        set("selection-trim-line", "false");
++
++        // --- Cursor -------------------------------------------------------
++        // Found by hand: a ghostty pane drew a block where the cascadia pane
++        // beside it drew a bar, because the profile's cursorShape was never
++        // forwarded and ghostty used its own default.
++        //
++        // All six shapes map exactly. ghostty had four until patch 31 added the
++        // two DECSCUSR has no name for - a stacked double underline and the
++        // thick bottom bar the Windows console has drawn for decades. They were
++        // both collapsed onto a plain underline before that, which was not an
++        // approximation so much as a different shape.
++        //
++        // CursorHeight is still not forwarded: it exists to size Vintage, and
++        // cursor-style underline_thick is a fixed quarter of the cell - which is
++        // what WT itself defaults cursorHeight to. Sending a height would imply
++        // an effect ghostty has no setting for.
++        //
++        // Only the default is set here. A program can still ask for a different
++        // shape with DECSCUSR, on either engine, and ghostty's shell
++        // integration puts a bar at the prompt regardless - so a profile's
++        // cursorShape is the starting point rather than the last word.
++        if (const auto appearance = settings.try_as<Core::ICoreAppearance>())
++        {
++            switch (appearance.CursorShape())
++            {
++            case Core::CursorStyle::Bar:
++                set("cursor-style", "bar");
++                break;
++            case Core::CursorStyle::Underscore:
++                set("cursor-style", "underline");
++                break;
++            case Core::CursorStyle::DoubleUnderscore:
++                set("cursor-style", "underline_double");
++                break;
++            case Core::CursorStyle::Vintage:
++                set("cursor-style", "underline_thick");
++                break;
++            case Core::CursorStyle::EmptyBox:
++                set("cursor-style", "block_hollow");
++                break;
++            case Core::CursorStyle::FilledBox:
++                set("cursor-style", "block");
++                break;
++            }
++
++            // --- Intense text, the face half ------------------------------
++            // WT's intenseTextStyle is two independent switches, and neither
++            // was forwarded. This is the one that runs against ghostty:
++            // cascadia only reaches for a bold *face* when the style includes
++            // bold, and WT's default does not - so under the same profile the
++            // ghostty pane was the one drawing heavier strokes. `false` is
++            // ghostty's own spelling for "this style is disabled", and a
++            // disabled style falls back to the regular face, which is what
++            // cascadia draws.
++            //
++            // Bold+italic is deliberately left alone. Matching cascadia there
++            // means "italic, not bold-italic", which ghostty can only be told
++            // as a named style of that particular font; disabling the style
++            // instead would drop the italic rather than the weight.
++            //
++            // The colour half needs the palette, so it lives with the scheme
++            // below.
++            if (!appearance.IntenseIsBold())
++            {
++                set("font-style-bold", "false");
++            }
++        }
++
++        // Cascadia draws no cursor at all in an unfocused pane; ghostty's
++        // default - like most terminals - is a hollow block, so every shape
++        // became the same hollow box the moment focus moved. Next to a cascadia
++        // pane that is simply wrong rather than merely different.
++        set("cursor-style-unfocused", "hidden");
++
+         // --- Padding ------------------------------------------------------
+         // WT already insets the SwapChainPanel by this same padding, so asking
+         // ghostty to pad as well would double it. Ours is therefore zero, and
+@@ -185,6 +207,43 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             {
+                 set("palette", fmt::format("{}={}", i, hex(table[i])));
+             }
++
++            // --- Intense text, the colour half ----------------------------
++            // Found by running `top` in both panes on one profile: cascadia
++            // drew the intense headers bright white and ghostty left them the
++            // plain foreground. Sampled off the screenshot, #F2F2F2 against
++            // #CCCCCC.
++            //
++            // `bold-color = bright` alone does not close that gap. It lifts a
++            // *palette* colour to its bright twin, but text in the default
++            // foreground has no index to brighten, and on a `top` screen that
++            // is most of the intense text. cascadia handles that case by
++            // looking the default foreground up in the dark half of the
++            // palette and using the bright entry it matches - so do the same
++            // lookup here and hand ghostty that colour outright. Naming a
++            // colour also turns the rest of the bold colours bright, which is
++            // the other half of cascadia's rule, so this one entry covers
++            // both.
++            //
++            // No match means the foreground is genuinely its own colour, which
++            // is the case cascadia leaves alone too; `bright` is then exactly
++            // right, because only indexed colours move.
++            if (const auto appearance = settings.try_as<Core::ICoreAppearance>();
++                appearance && appearance.IntenseIsBright())
++            {
++                const auto fg = scheme.DefaultForeground();
++                std::string bold;
++                for (uint32_t i = 0; i + 8 < table.size() && i < 8; ++i)
++                {
++                    const auto& c = table[i];
++                    if (c.R == fg.R && c.G == fg.G && c.B == fg.B)
++                    {
++                        bold = hex(table[i + 8]);
++                        break;
++                    }
++                }
++                set("bold-color", bold.empty() ? "bright" : bold);
++            }
+         }
+ 
+         return entries;
+diff --git a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+index d2de9437d..77a208f57 100644
+--- a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
++++ b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+@@ -39,8 +39,9 @@ namespace ControlUnitTests
+         TEST_METHOD(PaddingIsZeroBecauseWindowsTerminalAlreadyPads);
+         TEST_METHOD(SchemeProducesForegroundBackgroundAndFullPalette);
+         TEST_METHOD(WordDelimitersReachTheEngine);
+-        TEST_METHOD(TripleClickHighlightsTheWholeLine);
++        TEST_METHOD(TripleClickHighlightsTheWholeLine);
+         TEST_METHOD(CursorShapeIsForwarded);
++        TEST_METHOD(IntenseTextStyleIsForwarded);
+         TEST_METHOD(BackslashesAreDoubledForTheWordCharsFieldOnly);
+         TEST_METHOD(NullSettingsProduceNothing);
+ 
+@@ -230,6 +231,75 @@ namespace ControlUnitTests
+                             "hidden"));
+     }
+ 
++    // intenseTextStyle is two switches, and both were missing. Found by
++    // running `top` in a ghostty pane next to a cascadia one on the same
++    // profile: cascadia drew the intense headers bright white (#F2F2F2) where
++    // ghostty left them the plain foreground (#CCCCCC), and ghostty drew them
++    // with a bold face where cascadia - under WT's default, which is bright
++    // and not bold - drew regular strokes.
++    void GhosttySettingsTests::IntenseTextStyleIsForwarded()
++    {
++        // A scheme whose foreground is also palette entry 7, which is the
++        // ordinary case - Campbell and every scheme derived from it are built
++        // that way - and the case that made this visible.
++        const auto scheme = [](bool bright, bool bold) {
++            auto s = _settings();
++            s->IntenseIsBright(bright);
++            s->IntenseIsBold(bold);
++            s->DefaultForeground(til::color{ 0xcc, 0xcc, 0xcc });
++
++            std::array<winrt::Microsoft::Terminal::Core::Color, 16> table{};
++            for (uint32_t i = 0; i < table.size(); ++i)
++            {
++                table[i] = til::color{ gsl::narrow_cast<uint8_t>(i), 0x20, 0x30 };
++            }
++            table[7] = til::color{ 0xcc, 0xcc, 0xcc };
++            table[15] = til::color{ 0xf2, 0xf2, 0xf2 };
++            s->SetColorTable(table);
++            return s;
++        };
++
++        // WT's default: bright, not bold.
++        {
++            const auto entries = Control::implementation::TranslateGhosttySettings(*scheme(true, false));
++
++            VERIFY_IS_TRUE(_has(entries, "bold-color", "#f2f2f2"),
++                           L"the default foreground is palette 7, so intense text is its bright twin");
++            VERIFY_IS_TRUE(_has(entries, "font-style-bold", "false"),
++                           L"cascadia does not reach for a bold face unless asked");
++        }
++
++        // "all": both halves on, so ghostty keeps its own bold face.
++        {
++            const auto entries = Control::implementation::TranslateGhosttySettings(*scheme(true, true));
++
++            VERIFY_IS_TRUE(_has(entries, "bold-color", "#f2f2f2"));
++            VERIFY_IS_FALSE(_hasKey(entries, "font-style-bold"),
++                            L"a bold face is ghostty's default; say nothing");
++        }
++
++        // "none": neither, which is the one case that leaves the colour alone.
++        {
++            const auto entries = Control::implementation::TranslateGhosttySettings(*scheme(false, false));
++
++            VERIFY_IS_FALSE(_hasKey(entries, "bold-color"),
++                            L"without bright, intense text keeps its colour");
++            VERIFY_IS_TRUE(_has(entries, "font-style-bold", "false"));
++        }
++
++        // A foreground that is not in the dark half of the palette: cascadia
++        // leaves it as it is, and so must we - `bright` still moves the
++        // indexed colours, which is all cascadia moves here too.
++        {
++            auto s = scheme(true, false);
++            s->DefaultForeground(til::color{ 0xab, 0xcd, 0xef });
++
++            const auto entries = Control::implementation::TranslateGhosttySettings(*s);
++
++            VERIFY_IS_TRUE(_has(entries, "bold-color", "bright"));
++        }
++    }
++
+     // The one escaping rule left, and it belongs to the field rather than to
+     // the entry. ghostty parses selection-word-chars as a Zig string literal,
+     // so a lone backslash starts an escape sequence there - and WT's default

@@ -1136,3 +1136,89 @@ So this defect stays open with the class of fault (double free), the module
 no repro, no idea whether it was output, a resize, a close, a selection, or a
 pty ending. That is the other half of the diagnosis and it has to come from the
 person who was there.
+
+---
+
+### KD-13 — Intense text is neither brightened nor un-emboldened — **fixed 2026-08-18**
+
+**Reported** by the user, from use: `top` in a ghostty pane beside a cascadia
+one on the same profile. Cascadia draws some words and numbers in a brighter
+white; the ghostty pane draws them like everything else.
+
+#### What was wrong
+
+WT's `intenseTextStyle` is **two independent switches**, and neither reached the
+engine. Its default is `bright` — brighten intense text, and *do not* use a bold
+face — so both halves were wrong at once, in opposite directions.
+
+Measured off one capture, two panes, one profile (`Cascadia Code` 11, scheme
+"Not Campbell"), sampling the most common colour on a line of SGR-1 text:
+
+```
+ghostty  BOLD line  #CCCCCC      cascadia  BOLD line  #F2F2F2
+ghostty  plain line #CCCCCC      cascadia  plain line #CCCCCC
+```
+
+and the ink count on that line — 2196 lit pixels in the ghostty pane against
+1600 in the cascadia one — is the other half: the ghostty pane *was* drawing
+heavier strokes for intense text, where cascadia was not. Cascadia only asks for
+a bold weight when the style says so (`AtlasEngine.cpp:662`, feeding
+`DWRITE_FONT_WEIGHT_BOLD` into the run's axis values); how ghostty arrives at a
+bold face for this variable font was not chased, because the fix is to stop
+asking for one.
+
+#### Why `bold-color = bright` alone was not the fix
+
+The first attempt set exactly that, rebuilt, and measured **no change**:
+`#CCCCCC` still. ghostty's rule is in `terminal/style.zig:158`:
+
+```zig
+.none => default: {                     // the *default* foreground
+    if (self.flags.bold) {
+        if (opts.bold) |bold| switch (bold) {
+            .bright => {},              // <- nothing happens here
+            .color => |v| break :default v,
+        };
+    }
+    break :default opts.default;
+},
+```
+
+`bright` lifts a **palette** colour to its bright twin; text in the default
+foreground has no index to lift, and on a `top` screen that is most of the
+intense text. Cascadia handles that case explicitly — `TextColor::GetColor`
+looks the default foreground up in the dark half of the palette and, on a match,
+returns the bright entry (`TextBuffer/TextColor.cpp:163`, "If we find a match,
+return instead the bright version of this color").
+
+#### The fix
+
+`GhosttySettingsTranslator` now does that same lookup and hands ghostty the
+resulting colour outright, which — per `bold-color`'s own documentation — also
+turns the rest of the bold colours bright, so one entry covers both halves of
+cascadia's rule. No match means the foreground is genuinely its own colour, the
+case cascadia leaves alone too, and `bright` is then exactly right.
+
+The face half is `font-style-bold = false` when `IntenseIsBold` is not set:
+ghostty's spelling for "this style is disabled", which falls back to the regular
+face.
+
+Bold+italic is deliberately untouched — matching cascadia there means "italic,
+not bold-italic", which ghostty can only be told as a named style of that
+particular font, and disabling the style would drop the italic rather than the
+weight.
+
+#### Measured, after
+
+Same two panes, same capture geometry:
+
+```
+ghostty  BOLD line  #F2F2F2      cascadia  BOLD line  #F2F2F2
+ghostty  1;31 block #BA3A45      cascadia  1;31 block #BA3A45   (the scheme's brightRed)
+ghostty  plain line #CCCCCC      cascadia  plain line #CCCCCC
+```
+
+and the bold row now carries the same stroke weight as the plain row in both
+panes. `IntenseTextStyleIsForwarded` pins all four cases of the enum plus the
+foreground-not-in-the-palette case; `unitControl` is 66 tests, 65 passed, 1
+pre-existing skip.

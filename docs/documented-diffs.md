@@ -313,6 +313,82 @@ every byte it reads.
 
 ---
 
+## Found after release, from side-by-side use
+
+Both were found the same way: one window, a ghostty pane and a cascadia pane on
+the *same* profile, and a capture measured rather than eyeballed. Both are
+colour rules WT applies that the settings translator has no exact ghostty key
+for. (The third finding of that session, intense text, *did* have exact keys and
+is a defect, not a diff — [KD-13](known-defects.md).)
+
+### GD-16 — Antialiasing is thinner and crisper than cascadia's
+
+Same font, same size, same colours: a ghostty pane's glyphs read slightly
+thinner and sharper, a cascadia pane's slightly softer. Measured on one text row
+of the identical string in both panes, coverage normalised so the plain
+foreground is 1.0:
+
+| | inked pixels | total ink mass | pixels under 30% coverage |
+|---|---|---|---|
+| ghostty | 3792 | 2686 | 677 |
+| cascadia | 3374 | 2677 | 163 |
+
+The *mass* is the same to within 0.4% — neither engine is drawing a heavier
+font. The distribution differs: ghostty pushes partial-coverage pixels down into
+a faint skirt, cascadia holds them mid-to-high, which is exactly "thinner" and
+"fuzzier" as a pair.
+
+**Not the blending space.** `alpha-blending` was driven through all three of its
+values on the real pane, one build, an environment-variable probe: `native` and
+`linear-corrected` are **pixel-identical** here (3792 / 2686 / 677 both times —
+the correction is an exact inversion over a flat background), and `linear` is
+heavier than either *and* than cascadia (mass 3103). No value of that knob lands
+on cascadia's curve.
+
+**What actually differs** is a stage WT has and this renderer does not.
+AtlasEngine hands Direct2D *linear* rendering params — gamma 1.0, contrast 0
+(`dwrite_helpers.cpp:36`, `BackendD3D.cpp:868`) — so its atlas holds a raw
+coverage mask, and then reapplies DirectWrite's own correction in the pixel
+shader, per foreground colour: `DWrite_EnhanceContrast` with the grayscale
+enhanced-contrast value, then `DWrite_ApplyAlphaCorrection` with the gamma
+ratios (`shader_ps.hlsl:49`). Our DirectWrite face sets only
+`SetTextAntialiasMode(.GRAYSCALE)` (`font/face/directwrite.zig:699`) and never
+touches the rendering params, so D2D's defaults apply at raster time against the
+white brush, and `cell_text.hlsl` then blends with ghostty's own correction.
+
+**Closing it** means porting that stage: linear rendering params into the raster
+target so the mask is raw, and DWrite's contrast + gamma-ratio correction into
+`cell_text.hlsl`. It is well-defined work — WT's implementation is the reference
+and is small — but it is a Windows-only divergence from upstream ghostty's
+blending model, so it wants a decision before it is written. ADR 0005 chose
+grayscale AA and stopped there; this is the part of "text will match other
+Windows applications" that grayscale alone did not deliver.
+
+*Measured* — histograms above, from `wgc-shot` captures of one window.
+
+### GD-17 — `adjustIndistinguishableColors` is not honoured
+
+A profile setting a ghostty pane silently ignores. Cascadia runs every
+foreground through `ColorFix::GetPerceivableColor(fg, bg, 0.25)`
+(`RenderSettings.cpp:221`), nudging the lightness of any colour that sits too
+close to the background; the mode is `automatic` by default (which means "only
+under high contrast") and this repo's own test profile sets `always`.
+
+ghostty's nearest key is `minimum-contrast`, which is a different rule: a
+contrast *ratio* floor, not a perceptual lightness nudge with a distance
+threshold. Forwarding one as the other would change colours cascadia leaves
+alone and miss ones it moves, so nothing is forwarded today and a ghostty pane
+draws the scheme's colours exactly as written.
+
+Note the shape of the rule before assuming the gap is large: cascadia skips the
+adjustment when `fg == bg` exactly (a deliberately invisible cell stays
+invisible), so the two panes agree on that case already.
+
+**Closing it** is a judgement call rather than a port: pick a
+`minimum-contrast` value that approximates the nudge, or implement WT's rule in
+the engine. *Read* — known from both sources; the visible difference has not
+been isolated in a capture.
+
 ## Permanent, by upstream decision
 
 ### GD-14 — Sixel graphics are not supported and never will be  ([#14](https://github.com/ibuildthecloud/winterm-ghostty/issues/14))
