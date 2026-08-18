@@ -1477,3 +1477,122 @@ centres what is left over, and any difference from that is the size of this bug.
 
 `font-thicken` is *not* part of this: upstream documents it as CoreText-only, so
 ignoring it matches FreeType and is correct.
+
+
+---
+
+### KD-19 — The UI thread runs the renderer's frame update, racing the render thread — **open**
+
+**Reported** by the user: the portable **v0.2.7.0** build crashed while they were
+using it, 2026-08-18 13:02 local. This is the first crash with symbols
+([KD-12](#kd-12--a-pane-double-frees-and-the-process-dies-with-heap-corruption--open)
+is the one that could not be read), and the stack names every frame.
+
+#### What crashed
+
+```
+ghostty_internal!rebuildRow+0x79f      generic.zig:2801   <- for (highlights.items) |hl|
+ghostty_internal!rebuildCells+0x1012   generic.zig:2455
+ghostty_internal!updateFrame+0x5344    generic.zig:1382
+ghostty_internal!renderNow             Surface.zig:942
+ghostty_internal!ghostty_surface_render_now   embedded.zig:1964
+Microsoft_Terminal_Control!GhosttyControlCore::_renderNow      GhosttyControlCore.cpp:1149
+Microsoft_Terminal_Control!GhosttyControlCore::SetPreedit      GhosttyControlCore.cpp:1779
+Microsoft_Terminal_Control!TsfDataProvider::ClearComposition   TermControl.cpp:293
+Microsoft_Terminal_Control!TSF::Handle::Unfocus                Handle.cpp:85
+Microsoft_Terminal_Control!TermControl::_LostFocusHandler      TermControl.cpp:2552
+   ... XAML routed event, CoreMessaging dispatch ...
+```
+
+`c0000005`, a **read** of `0x0000026ba1f95120`. That is a heap address, not a
+stack one, and the thread had ~970 KB of stack left (`StackBase 99e8c00000`,
+`StackLimit 99e8b13000`), so this is not [KD-07](#kd-07--zooming-in-crashes-the-terminal--fixed-2026-08-08)
+again. The address is unmapped in the dump: memory that has been freed and
+returned.
+
+#### Why it is a race, from the dump
+
+The process had **463 threads**, of which 14 are ghostty `renderer` threads and
+14 are `io` threads - one pair per live surface. Thirteen of the renderer
+threads sit in their event loop (`GetQueuedCompletionStatusEx`). **Thread 81,
+named `renderer`, is not**: it is parked on a futex
+
+```
+ghostty_internal!park+0x174 <- futexWaitInner <- futexWaitUncancelable
+```
+
+while the UI thread is inside `rebuildCells`, which holds `draw_mutex`. One
+renderer thread blocked on a renderer lock, one UI thread inside the renderer
+holding it, at the moment of the fault.
+
+#### The invariant that was broken
+
+Upstream ghostty calls `updateFrame` from exactly one place: that surface's
+render thread (`renderer/Thread.zig:384` and `:654`). Its internals rely on
+that. The parts of `updateFrame` that mutate renderer-owned state run **outside**
+any lock a second caller would take:
+
+- `generic.zig:1313-1356` clears every row's `highlights` list and repopulates it
+  through `updateHighlightsFlattened`, which allocates.
+- The denormalization that resizes `terminal_state.row_data` is explicitly
+  deferred to `endUpdate`, *outside* the terminal critical section, "keeping our
+  lock" short.
+
+`rebuildRow` then iterates `highlights.items` through a pointer *into* that same
+`row_data`. Reallocate the one while the other walks it and the pointer dangles,
+which is exactly the read that faulted.
+
+Our patch `apprt: ghostty_surface_render_now for embedders without a paint loop`
+added the second caller, and its doc comment states the case for safety:
+
+> Both halves take the renderer state mutex, the same as the render thread's own
+> path, so calling this from the thread feeding output is safe.
+
+That is wrong, and it is the whole defect. The renderer *state* mutex protects
+the **terminal**. It does not protect the renderer's own `terminal_state`,
+`row_data`, highlight lists or cell buffers, which are private to one thread by
+convention rather than by a lock.
+
+#### How often this runs
+
+Six UI-thread call sites, in `GhosttyControlCore.cpp`:
+
+| line | caller |
+|---|---|
+| 1297 | `SetEndSelectionPoint` - **every mouse-drag update** |
+| 1354 | `LeftClickOnTerminal` |
+| 1407 | `ClearSelection` |
+| 1414 | `SelectAll` |
+| 1688 | `ScrollToMark` |
+| 1779 | `SetPreedit` - the one that crashed, via TSF unfocus |
+
+So the race is live on every drag, not only in the IME path. It survives because
+the window is narrow and usually lands on memory still mapped.
+
+**[KD-12](#kd-12--a-pane-double-frees-and-the-process-dies-with-heap-corruption--open)
+is very likely the same root cause** - a double free inside libghostty, one day
+earlier, on a build whose symbols were not published. Same class, same allocator,
+two threads. That remains a hypothesis: 0.2.4's RVAs cannot be resolved, and
+they never will be.
+
+#### The fix, which needs a decision
+
+Three shapes, and they are not equivalent:
+
+1. **Stop calling it from the UI thread.** Restores upstream's invariant exactly:
+   `updateFrame` runs on the render thread and nowhere else. The six call sites
+   become a wakeup. This is what the *output* path already does - the forced
+   render there was deleted in `perf(control): delete the forced render` - so the
+   pattern is proven. The risk is the one that patch series kept rediscovering:
+   a wake that lands after the render thread has sampled state leaves the pane
+   stale until something else forces a frame.
+2. **Marshal it.** Keep "render now" as a request, but have the render thread
+   perform it and wait for completion. Correct, and preserves the synchronous
+   feel the selection path wants, at the cost of a round trip on the UI thread.
+3. **Lock the whole frame.** One renderer-wide mutex held across
+   `updateFrame`+`drawFrame`, taken by both callers. Smallest diff, and the one
+   most likely to deadlock against the terminal state mutex if the order is ever
+   inverted.
+
+Option 1 is what "match upstream" means here. Option 2 is what the selection
+code was written expecting. This is a decision, not a session's call.
