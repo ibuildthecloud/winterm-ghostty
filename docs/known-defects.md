@@ -864,6 +864,37 @@ Worth recording, because both cost more time than the defect:
 pane brought to the front "did not have a blinking cursor" until the mouse moved
 onto it.
 
+#### Why this is presumed to be KD-19
+
+Recorded after KD-19 was diagnosed, because the two fit and the fit is checkable
+even though the proof is not.
+
+1. **The race was live in the build that crashed.** `GhosttyControlCore.cpp` at
+   `506e4bba8`, the commit 0.2.4 was cut from, contains **six** `_renderNow()`
+   call sites - the same six KD-19 removed. Every selection drag on that build
+   ran the renderer's whole frame update on the UI thread while the surface's
+   render thread ran its own.
+2. **The fault class matches, in both of its observed forms.** KD-19's race is
+   two threads inside the renderer's allocator: one clearing and repopulating
+   every row's highlight `ArrayList` and resizing `row_data`, the other
+   iterating those same structures. That produces a freed block read
+   (0.2.7, named exactly) *or* the same block freed twice
+   (`BlockNotBusy`, 0.2.4). This entry recorded both shapes on 0.2.4 - the
+   double free at 23:57 and an access violation at 19:32 - which is the pairing
+   the race predicts.
+3. **The caller is ours, and it is the free itself.** The stack below has
+   `RtlFreeHeap` called from two `ghostty-internal.dll` frames, not from a
+   system component handed a bad pointer.
+
+**What would make it certain, and why it cannot.** Naming those two RVAs. v0.2.4
+shipped no PDB and no machine here has one that matches what CI built, so those
+frames stay anonymous forever. This is inference from build contents and fault
+class, not a resolved stack.
+
+**The bar for closing it**: time on a build that has the KD-19 fix - 0.2.8 or
+later - without a heap-corruption crash. If one *does* occur, it resolves now:
+symbols ship from 0.2.6 and the 0.2.7 dump read frame by frame.
+
 #### What is measured
 
 One run, no input of any kind, window brought to the front after being held
@@ -1019,7 +1050,7 @@ C entry point reaches it. Only the alt+drag gesture is fixed.
 
 ---
 
-### KD-12 — A pane double-frees and the process dies with heap corruption — **open**
+### KD-12 — A pane double-frees and the process dies with heap corruption — **presumed fixed 2026-08-18 by [KD-19](#kd-19--the-ui-thread-runs-the-renderers-frame-update-racing-the-render-thread--fixed-2026-08-18)**
 
 **Reported** by the user, from use: the portable **v0.2.4.0** build
 (`C:\Users\darre\Downloads\winterm-ghostty-0.2.4.0-x64-portable\terminal-0.2.4.0`)
