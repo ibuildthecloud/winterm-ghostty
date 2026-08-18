@@ -145,3 +145,41 @@ inverted the trade:
    building colour-glyph support ourselves, permanently, for one platform.
 3. **AtlasEngine demonstrates the whole pipeline** — including the DXGI-surface atlas trick
    — so the DirectWrite path is a port of proven code rather than new design.
+
+## Amendment, 2026-08-18 — the bundled Noto font wins, and this ADR did not know it
+
+**DECISION-NEEDED.** This ADR rejected "Bundling a CBDT colour emoji font (e.g.
+Noto)" on the grounds that it "means overriding the system emoji font — users
+would get Android-style emoji in a Windows terminal". That is what ships, and
+not because anyone bundled anything: **upstream already does it.**
+
+`SharedGridSet.zig:358` adds `font.embedded.emoji` — `res/NotoColorEmoji.ttf`,
+CBDT bitmaps — to the collection as a fallback face on every non-macOS platform.
+macOS is the exception because the block above it discovers Apple Color Emoji
+and adds it first. Collection faces are consulted before DirectWrite's system
+fallback, so on Windows the bundled Noto answers first and Segoe UI Emoji is
+never reached for any codepoint Noto covers.
+
+Measured with `harness/colorglyph`, U+1F600 at 22 px/em, against the two panes'
+own pixels:
+
+| | dominant colours | matches |
+|---|---|---|
+| Segoe UI Emoji, 6 COLR v0 layer runs | `#FFB02E #BB1D80 #FFFFFF #402A32` | the **cascadia** pane |
+| bundled NotoColorEmoji.ttf, 1 PNG run | `#FDE030 #422B0D #F8C52C #F9CD2D` | the **ghostty** pane |
+
+Exact match on both sides, pixel counts included.
+
+**What this does and does not invalidate.** The decision — DirectWrite discovery
+and rasterization, HarfBuzz shaping — stands, and the colour-glyph machinery is
+still what draws every emoji Noto does not cover, plus SVG and COLR symbol
+fonts. What is wrong is this ADR's claim that the DirectWrite path means users
+see *Segoe UI Emoji*: they do not, and the "on par with AtlasEngine for Segoe UI
+Emoji" consequence is not what ships.
+
+**The open question is which one should ship.** Keeping it matches upstream
+ghostty exactly, which is the project's stated preference for rendering. Changing
+it means mirroring the macOS block for Windows - discover "Segoe UI Emoji" and
+add it ahead of the bundled font - so a Windows terminal draws Windows emoji,
+which is what this ADR assumed all along. Roughly fifteen lines, and a decision
+for the human rather than for a session.
