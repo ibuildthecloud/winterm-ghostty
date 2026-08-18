@@ -1378,3 +1378,102 @@ v1 where AtlasEngine draws v0. That is the outcome ADR 0005 hoped for as a later
 upgrade, arriving without being asked for: we request `GLYPH_IMAGE_COLR` and not
 `COLR_PAINT_TREE`, so *why* DirectWrite hands back the v1 rendering is not
 established. Someone should find out before this is relied on.
+
+
+---
+
+### KD-17 — A font *list* named no font at all — **fixed 2026-08-18**
+
+**Found** while answering the user's question "why aren't we using the
+configured font in the WT preferences?" The answer for the emoji they were
+looking at was that Cascadia Code has no glyph for them
+([KD-16](#kd-16--colour-emoji-were-washed-out-and-flat--fixed-2026-08-18) and the
+ADR 0005 amendment), but the question turned this up on the way.
+
+#### What was wrong
+
+A profile's `fontFace` is a CSS-style *list*, not one name: `"Cascadia Code,
+Segoe UI Emoji"` means the first family for text and the second for whatever the
+first does not cover. WT parses it with `til::iterate_font_families`, which
+splits on commas and treats quotes and backslashes as the list's syntax
+(`AtlasEngine.api.cpp:652`).
+
+The translator forwarded the whole string as one `font-family` value. ghostty
+then searched for a family *literally* named `Cascadia Code, Segoe UI Emoji`,
+found nothing, and fell back to the font it bundles - with no diagnostic a
+libghostty built without an app runtime can surface. A profile's font, silently
+ignored.
+
+Nobody had hit it because a single-family `fontFace` has no comma in it, which
+is what every profile on this machine had.
+
+#### The fix
+
+`til::iterate_font_families` - the same parser, called from the translator - and
+one `font-family` entry per family, which is how ghostty's repeatable key wants
+it.
+
+#### Measured, in a pane
+
+`"face": "Cascadia Code, Segoe UI Emoji"`, both panes, one capture, sampling the
+grinning face:
+
+| | dominant colours |
+|---|---|
+| ghostty, before | `#FDE030 #422B0D #F8C52C` — the bundled Noto |
+| ghostty, after | `#FFB02E #BB1D80 #FFFFFF` |
+| cascadia | `#FFB02E #BB1D80 #FFFFFF` |
+
+So the fix also hands users the lever the ADR 0005 amendment asks about: naming
+the system emoji font in the profile puts it ahead of the bundled Noto, without
+anyone deciding it for them.
+
+`unitControl`: 67 tests, 66 passed, 1 pre-existing skip. One existing test
+changed with the fix, and its old expectation was the wrong one - it asserted
+that `Back\slash "Quoted"` reaches ghostty verbatim, where WT itself reads that
+profile as a single family named `Backslash Quoted`.
+
+
+---
+
+### KD-18 — Glyph constraints are ignored, so emoji are not sized to the cell — **open**
+
+**Found** by reading, while chasing why emoji look different between the panes
+([GD-18](documented-diffs.md)). Not yet measured in a capture, which is the next
+step and is written down here so it is not skipped.
+
+#### What is known
+
+`font.Glyph.RenderOptions.constraint` is how ghostty tells a rasterizer to scale
+and align a glyph to the cell. Both other faces honour it -
+`face/freetype.zig:474` and `face/coretext.zig:341` each call
+`constraint.constrain(...)` and rasterize at the size it returns - and
+`SharedGrid.zig:418` sets it for **every emoji**:
+
+```zig
+render_opts.constraint = .{
+    .size = .cover,            // as large as possible, aspect preserved
+    .align_horizontal = .center,
+    .align_vertical = .center,
+    .pad_left = 0.025,
+    .pad_right = 0.025,
+};
+```
+
+`face/directwrite.zig` never reads `opts.constraint` at all. Its `renderGlyph`
+places the glyph from the font's own metrics and nothing else, so emoji are
+drawn at whatever size the face reports rather than scaled to cover the cell,
+and Nerd Font glyphs miss the constraint table in `Glyph.zig` the same way.
+
+This is a deviation from upstream ghostty, which is the standard this engine
+holds itself to, so it is a defect rather than a diff.
+
+#### What is not known
+
+**What it looks like.** No capture has isolated it. The measurement: one pane,
+a row of emoji and a row of Nerd Font icons, ink bounding box per cell against
+the cell rectangle - upstream covers the cell to within the 2.5% padding and
+centres what is left over, and any difference from that is the size of this bug.
+
+`font-thicken` is *not* part of this: upstream documents it as CoreText-only, so
+ignoring it matches FreeType and is correct.

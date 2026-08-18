@@ -387,6 +387,41 @@ invisible), so the two panes agree on that case already.
 the engine. *Read* — known from both sources; the visible difference has not
 been isolated in a capture.
 
+### GD-18 — Emoji come from a bundled Noto font, not Segoe UI Emoji
+
+The two panes draw visibly different emoji: a ghostty pane's are Google's Noto
+Color Emoji, a cascadia pane's are Windows' Segoe UI Emoji. Same profile, same
+font setting, and neither engine is at fault - Cascadia Code has no glyph for
+`U+1F600`, so both fall back, and they fall back to different fonts.
+
+Measured with `harness/colorglyph`, U+1F600 at 22 px/em, matched against the
+panes' own pixels:
+
+| | what DirectWrite returns | dominant colours | matches |
+|---|---|---|---|
+| Segoe UI Emoji | 6 x COLR v0 layer runs | `#FFB02E #BB1D80 #FFFFFF #402A32` | the cascadia pane |
+| bundled `NotoColorEmoji.ttf` | 1 x PNG run (CBDT bitmap) | `#FDE030 #422B0D #F8C52C #F9CD2D` | the ghostty pane |
+
+`SharedGridSet.zig:358` adds the embedded Noto font to the collection as a
+fallback on every non-macOS platform, and collection faces are consulted before
+DirectWrite's system fallback, so Segoe is never reached for anything Noto
+covers. macOS escapes it only because the block above discovers Apple Color
+Emoji and adds it first.
+
+**This is a diff by decision** (2026-08-18): it is upstream ghostty's behaviour,
+and this engine's standing rule is to match upstream rather than Windows
+Terminal. ADR 0005 assumed the opposite and is amended accordingly.
+
+**A user can override it per profile**, with no code change, because a font list
+now reaches the engine one family at a time ([KD-17](known-defects.md)):
+
+```json
+"font": { "face": "Cascadia Code, Segoe UI Emoji" }
+```
+
+*Measured* — colours above, from `wgc-shot` captures of one window with both
+settings.
+
 ## Permanent, by upstream decision
 
 ### GD-14 — Sixel graphics are not supported and never will be  ([#14](https://github.com/ibuildthecloud/winterm-ghostty/issues/14))

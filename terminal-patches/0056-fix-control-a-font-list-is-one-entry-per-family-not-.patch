@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 18 Aug 2026 13:02:01 -0700
+Subject: [PATCH] fix(control): a font list is one entry per family, not one
+ long name (KD-17)
+
+A profile's fontFace is a CSS-style list - "Cascadia Code, Segoe UI
+Emoji" means the first family for text and the second for what it does
+not cover - and ghostty spells the same thing as a repeated key. The
+translator sent the value whole, so ghostty searched for a family
+literally named "Cascadia Code, Segoe UI Emoji", found nothing, and fell
+back to the font it bundles. A profile's font, silently ignored, with the
+failure visible only as text that looks slightly off.
+
+til::iterate_font_families is the parser AtlasEngine itself uses, so both
+engines now split the value by construction rather than by a second
+implementation that agrees until it doesn't.
+
+Measured end to end: with the list forwarded, a profile naming Segoe UI
+Emoji second draws #FFB02E/#BB1D80 emoji in a ghostty pane, the same as
+the cascadia pane beside it, where before it drew the bundled Noto's
+#FDE030/#422B0D.
+
+The escaping test changes with it, and the old expectation was the wrong
+one: backslashes and quotes are the *list's* syntax, so WT reads
+`Back\slash "Quoted"` as one family named `Backslash Quoted` and a
+ghostty pane has to look for that same name.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../GhosttySettingsTranslator.cpp             | 18 ++++++++-
+ .../GhosttySettingsTests.cpp                  | 37 ++++++++++++++++++-
+ 2 files changed, 52 insertions(+), 3 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+index b72bd4772..cb99e1bcb 100644
+--- a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
++++ b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+@@ -47,7 +47,23 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         };
+ 
+         // --- Font ---------------------------------------------------------
+-        setText("font-family", settings.FontFace());
++        // WT's fontFace is a CSS-style list, not one name: "Cascadia Code,
++        // Segoe UI Emoji" means the first family for text and the second for
++        // whatever the first has no glyph for. ghostty spells the same thing as
++        // a repeated key, one family per `font-family` entry.
++        //
++        // Sending the value whole made ghostty search for a family *literally*
++        // named "Cascadia Code, Segoe UI Emoji", find nothing, and silently
++        // fall back to the font it bundles - a profile's font quietly ignored,
++        // with the failure visible only as text that looks slightly wrong.
++        //
++        // til::iterate_font_families is the parser AtlasEngine itself uses
++        // (`AtlasEngine.api.cpp:652`), so the two engines split the value
++        // identically by construction rather than by a second implementation
++        // that agrees until it doesn't.
++        til::iterate_font_families(settings.FontFace(), [&](std::wstring&& family) {
++            setText("font-family", family);
++        });
+         if (const auto size = settings.FontSize(); size > 0)
+         {
+             set("font-size", fmt::format("{}", size));
+diff --git a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+index 77a208f57..643542dcb 100644
+--- a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
++++ b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+@@ -34,6 +34,7 @@ namespace ControlUnitTests
+         END_TEST_CLASS()
+ 
+         TEST_METHOD(FontFamilyArrivesVerbatim);
++        TEST_METHOD(AFontListBecomesOneEntryPerFamily);
+         TEST_METHOD(InfiniteScrollbackIsNotForwarded);
+         TEST_METHOD(FiniteScrollbackIsForwarded);
+         TEST_METHOD(PaddingIsZeroBecauseWindowsTerminalAlreadyPads);
+@@ -86,6 +87,33 @@ namespace ControlUnitTests
+         VERIFY_IS_TRUE(_has(entries, "font-size", "12"));
+     }
+ 
++    // A profile's fontFace is a list, the way CSS font-family is: the first
++    // family that has the glyph wins, and the rest are there for what it does
++    // not cover. ghostty takes the same idea as a repeated key.
++    //
++    // Whole, the value named no font at all, so ghostty fell back to the font
++    // it bundles and the profile's font was silently ignored. Found while
++    // asking why a ghostty pane drew different emoji than the cascadia pane
++    // beside it - the answer for *emoji* was font fallback working as upstream
++    // intends, but the question turned this up on the way.
++    void GhosttySettingsTests::AFontListBecomesOneEntryPerFamily()
++    {
++        auto s = _settings();
++        s->FontFace(L"Cascadia Code, 'Segoe UI Emoji', \"MS Gothic\"");
++
++        const auto entries = Control::implementation::TranslateGhosttySettings(*s);
++
++        VERIFY_IS_TRUE(_has(entries, "font-family", "Cascadia Code"));
++        VERIFY_IS_TRUE(_has(entries, "font-family", "Segoe UI Emoji"),
++                       L"quotes are the list's syntax, not part of the name");
++        VERIFY_IS_TRUE(_has(entries, "font-family", "MS Gothic"));
++
++        const auto families = std::count_if(entries.begin(), entries.end(), [](const auto& e) {
++            return e.first == "font-family";
++        });
++        VERIFY_ARE_EQUAL(3, families, L"three families, three entries");
++    }
++
+     // WT spells "infinite scrollback" as a negative historySize. ghostty's line
+     // limit is already unlimited by default, so the entry must be omitted
+     // rather than forwarded - a negative line limit is not a thing.
+@@ -320,8 +348,13 @@ namespace ControlUnitTests
+ 
+         VERIFY_IS_TRUE(_has(entries, "selection-word-chars", " .\\\\\"x"),
+                        L"the backslash is doubled for the field's own parser; the quote is not");
+-        VERIFY_IS_TRUE(_has(entries, "font-family", "Back\\slash \"Quoted\""),
+-                       L"every other value is untouched, backslash and all");
++        // The font list is the one value that is *parsed* rather than carried.
++        // Backslash escapes and quotes are the list's own syntax, so WT reads
++        // this profile as a single family named `Backslash Quoted` - and a
++        // ghostty pane has to look for the same one, or it finds nothing and
++        // silently falls back to the font ghostty bundles.
++        VERIFY_IS_TRUE(_has(entries, "font-family", "Backslash Quoted"),
++                       L"the font list is parsed exactly as WT parses it");
+     }
+ 
+     void GhosttySettingsTests::NullSettingsProduceNothing()

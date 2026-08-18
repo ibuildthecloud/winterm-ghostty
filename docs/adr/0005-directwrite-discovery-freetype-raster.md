@@ -177,9 +177,24 @@ fonts. What is wrong is this ADR's claim that the DirectWrite path means users
 see *Segoe UI Emoji*: they do not, and the "on par with AtlasEngine for Segoe UI
 Emoji" consequence is not what ships.
 
-**The open question is which one should ship.** Keeping it matches upstream
-ghostty exactly, which is the project's stated preference for rendering. Changing
-it means mirroring the macOS block for Windows - discover "Segoe UI Emoji" and
-add it ahead of the bundled font - so a Windows terminal draws Windows emoji,
-which is what this ADR assumed all along. Roughly fifteen lines, and a decision
-for the human rather than for a session.
+**Decided 2026-08-18, by the user: keep it.** A ghostty pane draws the bundled
+Noto emoji, exactly as upstream ghostty does on every non-macOS platform. The
+alternative - mirroring the macOS block so Windows discovers "Segoe UI Emoji"
+and adds it ahead of the bundled font - was considered and rejected on the
+standing rule for this engine: match upstream ghostty, and treat only real
+defects and real deviations from it as things to fix. So the rejection of
+"bundling a CBDT colour emoji font" in the alternatives above no longer
+describes what this project wants; it describes what this ADR assumed before
+anyone looked.
+
+A user who wants Windows emoji has a per-profile lever and needs no code change:
+naming the font as a list puts the system font ahead of the bundled one.
+
+```json
+"font": { "face": "Cascadia Code, Segoe UI Emoji" }
+```
+
+Measured: that draws #FFB02E / #BB1D80 emoji in a ghostty pane, the same as the
+cascadia pane beside it. It only works because the translator forwards a font
+list as one entry per family, which was itself broken until
+[KD-17](../known-defects.md).
