@@ -926,3 +926,88 @@ If the cursor cell is not dirtied, then the ~1.7 presents/sec an idle focused
 pane costs are buying **nothing at all** - the same pixels, twice a second, for
 the life of the window. That is Phase 7's idle criterion and KD-05's cost, and
 it makes both cheaper to fix than they looked.
+
+---
+
+### KD-11 — Alt+drag did not block-select — **fixed 2026-08-17**
+
+**Reported** by the user, from use: block select (alt+mouse) works on a cascadia
+pane and does nothing on a ghostty one — an alt+drag draws the ordinary linear
+selection, with no error anywhere.
+
+#### What was wrong
+
+Both engines have the feature; they are told about it differently, and the
+translation was missing.
+
+Cascadia is told once, at the click: `ControlCore::LeftClickOnTerminal` takes
+`altEnabled` and calls `_terminal->SetBlockSelection(altEnabled)`.
+`GhosttyControlCore::LeftClickOnTerminal` took the same parameter and named it
+`/*altEnabled*/` — it went nowhere.
+
+ghostty asks per *mouse event* instead. `SelectionGesture.drag` takes a
+`rectangle` flag, and `Surface` fills it in from the modifiers that came with
+the latest mouse position:
+
+```zig
+pub fn isRectangleSelectState(mods: input.Mods) bool {
+    return if (comptime builtin.target.os.tag.isDarwin())
+        mods.alt
+    else
+        mods.ctrlOrSuper() and mods.alt;
+}
+```
+
+Every mouse event the selection path sent carried `GHOSTTY_MODS_NONE`, so the
+answer was always "no rectangle". Note the second branch: forwarding WT's alt
+faithfully would not have been enough either — off macOS this engine wants
+ctrl+alt.
+
+#### The fix
+
+`GhosttySelectionMods.h` maps "WT says this drag is a block selection" to the
+modifiers the engine's predicate requires, and `GhosttyControlCore` latches the
+alt state at the click (as cascadia does — releasing alt mid-drag does not turn
+a block selection back into a linear one) and puts those modifiers on every
+mouse *position* of the drag.
+
+Positions only. A press is read differently — `if (mods.ctrlOrSuper()) .output
+else .line` chooses what a third click selects — so a press claiming ctrl would
+quietly turn alt+triple-click into "select the command's output". The presses
+stay bare, and the harness confirms the rectangle forms all the same.
+
+#### Measured, on the real engine
+
+`GHOSTTY_HARNESS_SELECT_BLOCK` drives the sequence `GhosttyControlCore` sends,
+in cells, with and without those modifiers. Over three rows of
+`ABCDEFGHIJ` / `KLMNOPQRST` / `UVWXYZ0123`, dragging cell (2,0) → (5,2):
+
+```
+[selblock] block=1 text "CDE<LF>MNO<LF>WXY"
+[selblock] block=0 text "CDEFGHIJ<LF>KLMNOPQRST<LF>UVWXY"
+```
+
+A rectangle takes columns 2..4 out of every row; the plain drag runs to the end
+of the first row and back from the start of the last. `scripts/smoke-harness.ps1`
+pins both, and the *contrast* is the regression signal — the bug was that the
+two were identical.
+
+#### What was not verified, and why
+
+**A real pane, by a real drag.** The synthetic-mouse driver written for it —
+`SetCursorPos` + `mouse_event` into a deployed dev-package window, DPI-aware,
+with a focusing click first — moves the pointer where it is told and produces
+**no selection at all**, and it produces none on a **cascadia** pane either.
+That makes it an instrument that measures itself, not the engine, so nothing
+about the fix can be read off it in either direction. The engine-level evidence
+above and the unit test are what stand; the pane is a human check, and it is one
+alt+drag.
+
+#### What is still not block-selectable
+
+A double- or triple-click *drag* selects by word or by line and ignores the
+rectangle flag, in ghostty's gesture and in cascadia's expansion modes alike, so
+alt changes nothing there on either engine. `ToggleBlockSelection` — the
+keyboard action that flips an existing selection between shapes — still returns
+false on a ghostty pane: the rectangle lives inside ghostty's `Selection` and no
+C entry point reaches it. Only the alt+drag gesture is fixed.

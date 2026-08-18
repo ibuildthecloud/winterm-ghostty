@@ -347,6 +347,65 @@ if (-not $dragFailed) {
     Add-Pass ("{0} drags selected exactly the cells cascadia would" -f $drags.Count)
 }
 
+# --- 1cc. Alt+drag block-selects, the way a cascadia pane does --------------
+#
+# WT block-selects on alt+drag. ghostty has the same feature and calls it a
+# rectangular selection, but it reads the answer off the modifiers carried by
+# every mouse event, and off macOS it wants ctrl+alt
+# (SurfaceMouse.isRectangleSelectState). The pane used to send no modifiers at
+# all, so an alt+drag came back as an ordinary linear selection with nothing
+# reporting an error anywhere - which is why this needs the real engine.
+#
+# Three rows of distinct characters make the two shapes unmistakable: a
+# rectangle takes the same columns out of every row, a linear selection runs to
+# the end of the first row and back from the start of the last.
+Write-Host 'check: alt+drag selects a block, not a run' -ForegroundColor Cyan
+$blockRows = @('ABCDEFGHIJ', 'KLMNOPQRST', 'UVWXYZ0123')
+$blockFeed = Join-Path $scratch 'block.bin'
+[System.IO.File]::WriteAllBytes($blockFeed, [System.Text.Encoding]::UTF8.GetBytes(
+    "`e[2J`e[H" + ($blockRows -join "`r`n") + "`r`n"))
+
+# Columns 2..4 of rows 0..2 - the same half-open span a linear drag between
+# those two points would give on one row, which is what makes the two
+# comparable at all.
+$blockExpected = (($blockRows | ForEach-Object { $_.Substring(2, 3) }) -join '<LF>')
+$blockText = @{}
+$blockFailed = $false
+foreach ($mode in @('1', '0')) {
+    $r = Invoke-Harness -Name "selblock-$mode" -TimeoutMs $FeedTimeoutMs -Env @{
+        GHOSTTY_HARNESS_EXTERNAL     = '1'
+        GHOSTTY_HARNESS_FEED         = $blockFeed
+        GHOSTTY_HARNESS_SELECT_BLOCK = "2,0,5,2,$mode"
+        GHOSTTY_HARNESS_EXIT_MS      = '2000'
+    }
+    if ($r.TimedOut -or $r.ExitCode -ne 0) {
+        Add-Failure ("harness did not survive the block={0} drag" -f $mode)
+        $blockFailed = $true
+        continue
+    }
+    if ($r.Stderr -notmatch ('\[selblock\] block={0} text "([^"]*)"' -f $mode)) {
+        Add-Failure ("no selection reported for the block={0} drag" -f $mode)
+        $blockFailed = $true
+        continue
+    }
+    $blockText[$mode] = $Matches[1]
+}
+if (-not $blockFailed) {
+    if ($blockText['1'] -ne $blockExpected) {
+        Add-Failure ("an alt+drag selected '{0}', expected the rectangle '{1}'" -f
+            $blockText['1'], $blockExpected)
+    }
+    # The contrast is the regression signal: the bug was that the modifiers
+    # changed nothing, so both drags came back identical.
+    elseif ($blockText['0'] -eq $blockText['1']) {
+        Add-Failure ("the modifiers changed nothing - both drags selected '{0}'" -f $blockText['0'])
+    }
+    else {
+        Add-Pass ("alt+drag selects '{0}' where a plain drag selects '{1}'" -f
+            $blockText['1'], $blockText['0'])
+    }
+}
+
 # --- 1e. Copy carries styles as well as text --------------------------------
 #
 # Windows Terminal puts plain text and HTML on the clipboard together, and the

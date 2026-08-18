@@ -717,6 +717,67 @@ int main(void) {
                 }
             }
 
+            // GHOSTTY_HARNESS_SELECT_BLOCK=x1,y1,x2,y2[,block] drags in
+            // *cells*, the way a Windows Terminal pane does when alt is held at
+            // the click, and prints what came back. `block` (default 1) is that
+            // alt state: 1 sends the modifiers GhosttySelectionMods asks for, 0
+            // sends none, so one fixture can show the same drag both ways.
+            //
+            // The modifiers are the whole point. ghostty decides
+            // rectangle-vs-linear per mouse event, in
+            // SurfaceMouse.isRectangleSelectState, which off macOS reads
+            // `ctrlOrSuper() and alt` - so a pane that forwards alt alone, or
+            // (as it did) nothing at all, gets an ordinary linear selection and
+            // no complaint from anywhere.
+            char selblock[64];
+            if (GetEnvironmentVariableA("GHOSTTY_HARNESS_SELECT_BLOCK", selblock, sizeof(selblock)) > 0) {
+                int x1 = 0, y1 = 0, x2 = 0, y2 = 0, block = 1;
+                if (sscanf(selblock, "%d,%d,%d,%d,%d", &x1, &y1, &x2, &y2, &block) >= 4) {
+                    const ghostty_surface_size_s size = ghostty_surface_size(g_state.surface);
+                    const double scale = scale_for_window(g_state.hwnd);
+                    const double cw = (double)size.cell_width_px / scale;
+                    const double ch = (double)size.cell_height_px / scale;
+                    const ghostty_input_mods_e mods = block
+                        ? (ghostty_input_mods_e)(GHOSTTY_MODS_CTRL | GHOSTTY_MODS_ALT)
+                        : GHOSTTY_MODS_NONE;
+
+                    // GhosttyControlCore's sequence: clear, press at the anchor
+                    // cell, then move to the far one. A quarter of the way
+                    // across the cell and half way down it, exactly as _mouseTo
+                    // sends. The modifiers ride on the *positions* only, which
+                    // is where the engine reads them for a drag - a press
+                    // carrying ctrl would pick `.output` as its triple-click
+                    // behavior instead of `.line`.
+                    static const char kClear[] = "clear_selection";
+                    ghostty_surface_binding_action(g_state.surface, kClear, sizeof(kClear) - 1);
+                    ghostty_surface_mouse_pos(g_state.surface, ((double)x1 + 0.25) * cw, ((double)y1 + 0.5) * ch, mods);
+                    ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+                    ghostty_surface_mouse_pos(g_state.surface, ((double)x2 + 0.25) * cw, ((double)y2 + 0.5) * ch, mods);
+
+                    fprintf(stderr, "[selblock] block=%d text ", block ? 1 : 0);
+                    ghostty_text_s got = {0};
+                    if (!ghostty_surface_has_selection(g_state.surface)) {
+                        fprintf(stderr, "(none)\n");
+                    } else if (!ghostty_surface_read_selection(g_state.surface, &got)) {
+                        fprintf(stderr, "READ FAILED\n");
+                    } else {
+                        // Escaped onto one line: a rectangle spans rows by
+                        // definition, and a caller matching this wants the row
+                        // breaks where it can see them.
+                        fputc('"', stderr);
+                        for (size_t i = 0; i < got.text_len; i++) {
+                            const unsigned char c = (unsigned char)got.text[i];
+                            if (c == '\n') fprintf(stderr, "<LF>");
+                            else fputc(c, stderr);
+                        }
+                        fprintf(stderr, "\"\n");
+                        ghostty_surface_free_text(g_state.surface, &got);
+                    }
+                    ghostty_surface_mouse_button(g_state.surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+                    fflush(stderr);
+                }
+            }
+
             // GHOSTTY_HARNESS_CLEAR_SELECTION=press_x,drag_x,near_x,y checks
             // the two things Windows Terminal's control needs from the
             // clear_selection binding action:

@@ -1,0 +1,343 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Mon, 17 Aug 2026 20:44:57 -0700
+Subject: [PATCH] fix(control): alt+drag block-selects on a ghostty pane
+ (KD-11)
+
+Reported from use: block select works on a cascadia pane and does
+nothing on a ghostty one - an alt+drag draws the ordinary linear
+selection, with no error anywhere.
+
+Both engines have the feature; they are told about it differently, and
+the translation was missing. Cascadia is told once, at the click:
+ControlCore::LeftClickOnTerminal takes altEnabled and calls
+SetBlockSelection(altEnabled). GhosttyControlCore took the same
+parameter and named it /*altEnabled*/.
+
+ghostty asks per mouse event instead. SelectionGesture.drag takes a
+`rectangle` flag, and Surface fills it in from the modifiers that came
+with the latest mouse position, through SurfaceMouse:
+
+    pub fn isRectangleSelectState(mods: input.Mods) bool {
+        return if (comptime builtin.target.os.tag.isDarwin())
+            mods.alt
+        else
+            mods.ctrlOrSuper() and mods.alt;
+    }
+
+Every mouse event the selection path sent carried GHOSTTY_MODS_NONE, so
+the answer was always "no rectangle". Note the second branch: forwarding
+WT's alt faithfully would not have been enough either - off macOS this
+engine wants ctrl+alt.
+
+So GhosttySelectionMods.h maps "WT says this drag is a block selection"
+to the modifiers that predicate requires, and the core latches the alt
+state at the click (as cascadia does - releasing alt mid-drag does not
+turn a block selection back into a linear one) and puts those modifiers
+on every mouse *position* of the drag.
+
+Positions only. A press is read differently -
+`if (mods.ctrlOrSuper()) .output else .line` chooses what a third click
+selects - so a press claiming ctrl would quietly turn alt+triple-click
+into "select the command's output". The presses stay bare.
+
+Measured on the real engine, not reasoned: a new
+GHOSTTY_HARNESS_SELECT_BLOCK drives this exact sequence over three rows
+of distinct characters and reads the selection back. Dragging (2,0) to
+(5,2) gives "CDE<LF>MNO<LF>WXY" with the modifiers and
+"CDEFGHIJ<LF>KLMNOPQRST<LF>UVWXY" without, and the rectangle forms with
+the press bare. smoke-harness pins both, and the contrast is the
+regression signal - the bug was that the two were identical.
+
+Suites: unitControl 63 -> 65/65, smoke 10 -> 11 checks.
+
+Not covered: a double- or triple-click drag ignores the rectangle in
+ghostty's gesture and in cascadia's expansion modes alike, so alt
+changes nothing there on either engine; and ToggleBlockSelection - the
+keyboard action that reshapes an existing selection - still returns
+false, since the rectangle lives inside ghostty's Selection and no C
+entry point reaches it.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 37 ++++++++++--
+ .../TerminalControl/GhosttyControlCore.h      | 14 ++++-
+ .../TerminalControl/GhosttySelectionMods.h    | 57 +++++++++++++++++++
+ .../TerminalControlLib.vcxproj                |  1 +
+ .../Control.UnitTests.vcxproj                 |  1 +
+ .../GhosttySelectionModsTests.cpp             | 54 ++++++++++++++++++
+ 6 files changed, 159 insertions(+), 5 deletions(-)
+ create mode 100644 src/cascadia/TerminalControl/GhosttySelectionMods.h
+ create mode 100644 src/cascadia/UnitTests_Control/GhosttySelectionModsTests.cpp
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index dc111942e..0c2812fb7 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -6,6 +6,7 @@
+ #include "GhosttySettingsTranslator.h"
+ #include "GhosttyKeyTranslator.h"
+ #include "GhosttyCopyFormat.h"
++#include "GhosttySelectionMods.h"
+ 
+ #include "GhosttyControlCore.g.cpp"
+ 
+@@ -1213,6 +1214,16 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         ghostty_surface_mouse_pos(_surface, x, y, mods);
+     }
+ 
++    // Every mouse event of a selection carries these, because the engine reads
++    // block-vs-linear off the modifiers of each event rather than latching a
++    // mode at the press. GhosttySelectionMods.h has the engine's rule; what is
++    // decided here is only *when* WT considers a drag to be a block one, which
++    // is the alt state at the click, held for the drag.
++    ghostty_input_mods_e GhosttyControlCore::_selectionMods() const noexcept
++    {
++        return GhosttySelectionMods(_blockSelect);
++    }
++
+     // Windows Terminal never tells the core that the button came up: only VT
+     // mouse mode sees a release, and selection is the non-VT path. ghostty
+     // needs one, or it treats the next pointer move as a continued drag.
+@@ -1255,7 +1266,13 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         _releaseMouseIfHeld();
+         _bindingAction("clear_selection");
+-        _mouseTo(positionCore);
++        _mouseTo(positionCore, _selectionMods());
++
++        // The press carries no modifiers, and that is deliberate: ghostty reads
++        // the rectangle off each mouse *position*, but off the press it reads
++        // something else entirely - `if (mods.ctrlOrSuper()) .output else .line`
++        // picks what a third click would select. A press claiming ctrl would
++        // quietly turn alt+triple-click into "select the command's output".
+         ghostty_surface_mouse_button(_surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+         _mouseDown = true;
+ 
+@@ -1276,7 +1293,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     void GhosttyControlCore::SetEndSelectionPoint(const Core::Point positionCore)
+     {
+         // Only meaningful mid-drag, which is the only time WT calls it.
+-        _mouseTo(positionCore);
++        _mouseTo(positionCore, _selectionMods());
+         _renderNow();
+     }
+ 
+@@ -1296,7 +1313,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     // the replay always starts from zero.
+     void GhosttyControlCore::LeftClickOnTerminal(const Core::Point terminalPositionCore,
+                                                  const int32_t numberOfClicks,
+-                                                 const bool /*altEnabled*/,
++                                                 const bool altEnabled,
+                                                  const bool /*shiftEnabled*/,
+                                                  const bool /*isOnOriginalPosition*/,
+                                                  bool& selectionNeedsToBeCopied)
+@@ -1306,6 +1323,13 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             return;
+         }
+ 
++        // Alt at the click is what makes the drag that follows a block
++        // selection, exactly as it is for cascadia (ControlCore's
++        // SetBlockSelection(altEnabled) on this same call). The drag arrives
++        // later, through SetSelectionAnchor and SetEndSelectionPoint, and
++        // neither is told about modifiers - so the answer is latched here.
++        _blockSelect = altEnabled;
++
+         // A new physical click ends whatever drag ghostty still thinks is in
+         // progress. Without this a press below is swallowed as a move and the
+         // click extends the previous selection instead of starting one.
+@@ -1314,7 +1338,12 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         if (numberOfClicks > 1)
+         {
+-            _mouseTo(terminalPositionCore);
++            // A double- or triple-click drag selects by word or by line, and
++            // ghostty's gesture ignores `rectangle` for both - the same as
++            // cascadia, whose expansion modes overrule block mode too. So the
++            // position carries the drag's modifiers for whatever follows, and
++            // the presses stay bare for the reason SetSelectionAnchor gives.
++            _mouseTo(terminalPositionCore, _selectionMods());
+             for (auto i = 0; i < numberOfClicks; ++i)
+             {
+                 ghostty_surface_mouse_button(_surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE);
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.h b/src/cascadia/TerminalControl/GhosttyControlCore.h
+index bce44549d..c1ac2d434 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.h
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.h
+@@ -266,9 +266,13 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         // Selection is driven through ghostty's mouse handling, because that
+         // is the only thing that both sets the selection *and* draws it.
+-        void _mouseTo(Core::Point cell, ghostty_input_mods_e mods = GHOSTTY_MODS_NONE) const;
++        void _mouseTo(Core::Point cell, ghostty_input_mods_e mods) const;
+         void _releaseMouseIfHeld() const;
+ 
++        // The modifiers every mouse event of a selection carries - the engine
++        // reads block-vs-linear off them, per event. See GhosttySelectionMods.h.
++        ghostty_input_mods_e _selectionMods() const noexcept;
++
+         // Output has to draw itself; libghostty's wakeup coalesces. Same
+         // reasoning as _connectionOutputHandler's render.
+         void _renderNow() const;
+@@ -330,6 +334,14 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // _releaseMouseIfHeld.
+         mutable bool _mouseDown{ false };
+ 
++        // Whether the drag in progress is a block selection. Alt at the moment
++        // of the click decides it, as it does on cascadia, and it holds for the
++        // whole drag - releasing alt halfway through does not turn a block
++        // selection back into a linear one. ghostty would happily change its
++        // mind on the next mouse position; WT's semantics are the latch, so
++        // every event of the drag repeats what the click said.
++        bool _blockSelect{ false };
++
+         // Scroll state, from the SCROLLBAR action.
+         int32_t _scrollOffset{ 0 };
+         int32_t _viewHeight{ 0 };
+diff --git a/src/cascadia/TerminalControl/GhosttySelectionMods.h b/src/cascadia/TerminalControl/GhosttySelectionMods.h
+new file mode 100644
+index 000000000..2b9ad7f3f
+--- /dev/null
++++ b/src/cascadia/TerminalControl/GhosttySelectionMods.h
+@@ -0,0 +1,57 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++//
++// Module Name:
++// - GhosttySelectionMods.h
++//
++// Abstract:
++// - Windows Terminal's "this drag is a block selection" -> the modifiers
++//   libghostty has to see on the mouse before it makes one. Pure, so it can be
++//   tested without an engine; the rest of the selection path needs a live
++//   surface.
++
++#pragma once
++
++#include <ghostty.h>
++
++namespace winrt::Microsoft::Terminal::Control::implementation
++{
++    // WT block-selects on alt+drag. ghostty has the same feature - a
++    // rectangular selection - but it asks for different keys, and it asks per
++    // *mouse event* rather than once per drag: `SelectionGesture.drag` takes a
++    // `rectangle` flag, and `Surface` fills it in from the modifiers that came
++    // with the latest mouse position, through `SurfaceMouse`:
++    //
++    //     pub fn isRectangleSelectState(mods: input.Mods) bool {
++    //         return if (comptime builtin.target.os.tag.isDarwin())
++    //             mods.alt
++    //         else
++    //             mods.ctrlOrSuper() and mods.alt;
++    //     }
++    //
++    // Windows takes the second branch, so alt on its own is not a rectangle to
++    // this engine - which is why a ghostty pane used to answer an alt+drag with
++    // an ordinary linear selection while a cascadia pane block-selected. Ctrl
++    // is asserted alongside it to satisfy that predicate.
++    //
++    // These belong on mouse *positions* only. A press is read differently -
++    // `if (mods.ctrlOrSuper()) .output else .line` decides what a third click
++    // selects - so the presses of a selection stay bare and only the moves
++    // carry these, which is all the engine needs for a drag. Measured:
++    // GHOSTTY_HARNESS_SELECT_BLOCK produces the same rectangle either way.
++    //
++    // Claiming ctrl costs nothing beyond that. The only thing WT's ctrl adds to
++    // a left click is the hyperlink gesture, and ControlInteractivity takes that
++    // branch before the selection path runs at all (and a ghostty pane reports
++    // no hyperlinks anyway - GD-01). Nothing else in ghostty's non-VT mouse path
++    // reads ctrl: link highlighting wants ctrl *alone* and so stays off.
++    //
++    // If this ever stops producing block selections, read isRectangleSelectState
++    // first - the rule is the engine's, not ours.
++    constexpr ghostty_input_mods_e GhosttySelectionMods(const bool blockSelection) noexcept
++    {
++        return blockSelection ?
++                   static_cast<ghostty_input_mods_e>(GHOSTTY_MODS_CTRL | GHOSTTY_MODS_ALT) :
++                   GHOSTTY_MODS_NONE;
++    }
++}
+diff --git a/src/cascadia/TerminalControl/TerminalControlLib.vcxproj b/src/cascadia/TerminalControl/TerminalControlLib.vcxproj
+index 72ab6d5d4..e12402787 100644
+--- a/src/cascadia/TerminalControl/TerminalControlLib.vcxproj
++++ b/src/cascadia/TerminalControl/TerminalControlLib.vcxproj
+@@ -35,6 +35,7 @@
+     <ClInclude Include="GhosttySettingsTranslator.h" />
+     <ClInclude Include="GhosttyKeyTranslator.h" />
+     <ClInclude Include="GhosttyCopyFormat.h" />
++    <ClInclude Include="GhosttySelectionMods.h" />
+     <ClInclude Include="GhosttyControlCore.h">
+       <DependentUpon>GhosttyControlCore.idl</DependentUpon>
+     </ClInclude>
+diff --git a/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj b/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
+index bf12a0184..b355b5abb 100644
+--- a/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
++++ b/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
+@@ -40,6 +40,7 @@
+     <ClCompile Include="GhosttySearchTests.cpp" />
+     <ClCompile Include="GhosttyKeyTests.cpp" />
+     <ClCompile Include="GhosttyCopyFormatTests.cpp" />
++    <ClCompile Include="GhosttySelectionModsTests.cpp" />
+     <!-- Compiled straight into the tests: it is a pure function with no
+          libghostty dependency, so the test binary needs no engine DLL. -->
+     <ClCompile Include="..\TerminalControl\GhosttySettingsTranslator.cpp" />
+diff --git a/src/cascadia/UnitTests_Control/GhosttySelectionModsTests.cpp b/src/cascadia/UnitTests_Control/GhosttySelectionModsTests.cpp
+new file mode 100644
+index 000000000..30502c147
+--- /dev/null
++++ b/src/cascadia/UnitTests_Control/GhosttySelectionModsTests.cpp
+@@ -0,0 +1,54 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++//
++// Alt+drag block-selects on a cascadia pane. It did nothing on a ghostty one,
++// because the two engines ask for the modifier differently: cascadia is told
++// `SetBlockSelection(alt)` once at the click, and ghostty re-reads the mouse
++// modifiers on every event and wants ctrl+alt for a rectangle on any platform
++// that is not macOS.
++//
++// This pins the translation. The rest of the drag needs a live surface, so
++// this is the part a unit test can reach.
++
++#include "pch.h"
++#include "../TerminalControl/GhosttySelectionMods.h"
++
++using namespace WEX::Logging;
++using namespace WEX::TestExecution;
++using namespace WEX::Common;
++
++using namespace winrt::Microsoft::Terminal::Control::implementation;
++
++namespace ControlUnitTests
++{
++    class GhosttySelectionModsTests
++    {
++        BEGIN_TEST_CLASS(GhosttySelectionModsTests)
++            TEST_CLASS_PROPERTY(L"TestTimeout", L"0:0:10")
++        END_TEST_CLASS()
++
++        TEST_METHOD(AnOrdinaryDragCarriesNoModifiers);
++        TEST_METHOD(ABlockSelectionCarriesCtrlAndAlt);
++    };
++
++    // Not "whatever the user is holding": a plain drag has to look plain to the
++    // engine. Shift especially - to ghostty that is the mouse-reporting
++    // override, and WT has already decided what a shift+drag means by the time
++    // it calls the selection path at all.
++    void GhosttySelectionModsTests::AnOrdinaryDragCarriesNoModifiers()
++    {
++        VERIFY_ARE_EQUAL(GHOSTTY_MODS_NONE, GhosttySelectionMods(false));
++    }
++
++    // Ctrl is the part that is easy to "clean up" and must not be: ghostty's
++    // SurfaceMouse.isRectangleSelectState is `mods.ctrlOrSuper() and mods.alt`
++    // off macOS, so alt on its own produces an ordinary linear selection - the
++    // bug this pins.
++    void GhosttySelectionModsTests::ABlockSelectionCarriesCtrlAndAlt()
++    {
++        const auto mods = GhosttySelectionMods(true);
++        VERIFY_IS_TRUE((mods & GHOSTTY_MODS_ALT) != 0, L"alt, as WT's own gesture");
++        VERIFY_IS_TRUE((mods & GHOSTTY_MODS_CTRL) != 0, L"and ctrl, as the engine's predicate");
++        VERIFY_IS_TRUE((mods & GHOSTTY_MODS_SHIFT) == 0, L"never shift - that is the VT-mouse override");
++    }
++}
