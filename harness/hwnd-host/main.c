@@ -379,9 +379,31 @@ int main(void) {
     // the harness sends lands a third of a cell further left than the same
     // position would in a WT pane, which makes the harness a measuring
     // instrument for a geometry nobody ships.
-    set_config(config, "window-padding-x", "0");
-    set_config(config, "window-padding-y", "0");
-    set_config(config, "window-padding-balance", "false");
+    //
+    // GHOSTTY_HARNESS_PADDING_VIA_UPDATE=1 withholds the pin here and pushes it
+    // after the surface exists instead, which is the order Windows Terminal is
+    // stuck with: a surface is born with the app's config and only then hears
+    // about the profile. That run must put the first glyph exactly where the
+    // default run does. Until the `config: window padding takes effect on a
+    // config update` patch it did not - the late pin was dropped on the floor
+    // and the surface kept ghostty's default 2pt (KD-21).
+    //
+    // =2 withholds it and never pushes it, so the surface keeps that default.
+    // It is the negative control the =1 run needs: without it, "both runs
+    // agree" is equally consistent with this variable doing nothing at all.
+    char padding_mode = '0';
+    {
+        char buf[8];
+        if (GetEnvironmentVariableA("GHOSTTY_HARNESS_PADDING_VIA_UPDATE", buf, sizeof(buf)) > 0) {
+            padding_mode = buf[0];
+        }
+    }
+    const bool padding_via_update = padding_mode == '1';
+    if (padding_mode == '0') {
+        set_config(config, "window-padding-x", "0");
+        set_config(config, "window-padding-y", "0");
+        set_config(config, "window-padding-balance", "false");
+    }
 
     // GHOSTTY_HARNESS_WORD_CHARS is passed straight through, exactly as
     // Windows Terminal's settings translator would hand it over. WT's default
@@ -464,6 +486,22 @@ int main(void) {
 
     push_size();
 
+    // The late half of GHOSTTY_HARNESS_PADDING_VIA_UPDATE: the surface exists
+    // and has been sized with ghostty's default padding, and only now is it
+    // told what the padding should be - the embedder's order, and the one that
+    // used to be ignored.
+    if (padding_via_update) {
+        ghostty_config_t late = ghostty_config_new();
+        if (!late) { fprintf(stderr, "ghostty_config_new (late) failed\n"); return 1; }
+        set_config(late, "window-padding-x", "0");
+        set_config(late, "window-padding-y", "0");
+        set_config(late, "window-padding-balance", "false");
+        ghostty_config_finalize(late);
+        ghostty_surface_update_config(g_state.surface, late);
+        ghostty_config_free(late);
+        trace("zero padding pushed via ghostty_surface_update_config");
+    }
+
     // After the surface exists, so the reader thread has something to feed,
     // and after push_size, so the grid size resize_pty_cb recorded is the one
     // the surface actually ended up with rather than its initial guess.
@@ -505,8 +543,12 @@ int main(void) {
             fclose(f);
             fprintf(stderr, "[hwnd-host] feeding %zu bytes of pty output\n", got);
             fflush(stderr);
+            // No render call follows the write. ghostty_surface_render_now was
+            // removed - it ran the renderer's frame update on this thread and
+            // raced the render thread (KD-19) - and writing pty output already
+            // wakes that thread, which renders on the wakeup with no
+            // coalescing delay.
             ghostty_surface_write_pty_output(g_state.surface, (const uint8_t *)feed, got);
-            ghostty_surface_render_now(g_state.surface);
             fprintf(stderr, "[hwnd-host] feed survived\n");
             fflush(stderr);
 

@@ -1647,3 +1647,107 @@ never appeared": the calling process must be DPI-aware or every coordinate is
 off by the display scale, and the window must be taken to the foreground with
 `AttachThreadInput` first, with an activating click before the drag - the click
 that raises a window is consumed by activation and selects nothing.
+
+---
+
+### KD-21 — A pane's padding is ghostty's default plus the profile's — **fixed 2026-08-18**
+
+**Reported** by the user, as a suspicion rather than a symptom: *"ghostty is not
+being passed or respecting the window padding configuration that is in
+settings.json"*. Half right, and the half that was wrong is the interesting one.
+
+The profile's `padding` **is** delivered. `TermControl::_ApplyUISettings`
+(`TermControl.cpp:1069`) applies it as the SwapChainPanel's margin, and that
+code does not know which engine is behind the panel — a ghostty pane is inset
+by `"padding": "8, 8, 8, 8"` exactly as a cascadia one is. What failed is the
+other half of the arrangement: `GhosttySettingsTranslator` pins
+`window-padding-x/y = 0` so that ghostty does not pad the same pane a second
+time, and **that pin never took effect**. Every ghostty pane drew ghostty's
+default 2pt inside WT's 8 DIP.
+
+#### What was measured
+
+A live dev window at 144 DPI, two panes split horizontally running the same
+shell and showing the same line, captured with `harness/wgc-shot` and measured
+in pixels:
+
+| pane | ink extent | first ink, relative to the pane's top-left |
+|---|---|---|
+| ghostty | 738 x 124 | (19, 19) |
+| cascadia | 738 x 124 | (15, 15) |
+
+Identical metrics — same font, same cell advance, the same 738x124 box of ink —
+offset by **exactly 4 physical pixels on both axes**. ghostty's default
+`window-padding-x`/`-y` is 2, and `Surface.zig`'s `scaledPadding` converts
+points to pixels as `floor(pt * dpi / 72)`, so at 144 DPI that default is
+`floor(2 * 144/72)` = 4. The number is not close to the prediction, it is the
+prediction.
+
+#### Why the pin did not land
+
+`Surface.size.padding` — the value the renderer actually draws with — was
+assigned in exactly two places:
+
+1. `Surface.init`, from the config the surface is **born** with. For an
+   embedder that is the *app's* config: `ghostty_surface_new` takes no config
+   of its own.
+2. `contentScaleCallback`, which returns early when the DPI has not changed.
+
+`Surface.updateConfig` — what `ghostty_surface_update_config` runs, and the only
+way an embedder can configure a surface at all — refreshed the derived config,
+the renderer and termio, and left `size.padding` alone. `resize` looks like the
+safety net, but it delegates to `balancePaddingIfNeeded`, whose first line
+returns when `window-padding-balance` is `false`, which is the default and which
+the translator also sets explicitly.
+
+So `window-padding-x`/`-y` were the settings a reload could not change. This is
+upstream behaviour, not something the fork introduced: a `ghostty +reload` would
+have had the same problem. It is simply invisible to an app that reads its
+config before the surface exists and never changes it afterwards, and fatal to
+an embedder, which has no other order available.
+
+A tell worth keeping: the value **did** correct itself on a DPI change. Dragging
+a window between monitors of different scale ran `contentScaleCallback`, which
+recomputed the padding from the by-then-correct config, and the 4 pixels
+vanished for the rest of the session.
+
+#### The fix, and the experiment that confirms it
+
+Two patches, because the defect has two halves:
+
+- ghostty, `config: window padding takes effect on a config update` —
+  `updateConfig` recomputes `size.padding` from the new config after
+  `setFontSize` (where the cell size balanced padding is measured against
+  settles) and forces a resize when it changed, the way `contentScaleCallback`
+  already does, so the renderer and the child both see the new grid.
+- terminal, `fix(control): a pane is born with zero ghostty padding` —
+  `GhosttyEngine::NewConfig` sets the zero padding on the **app** config, which
+  is what a surface is actually born with. That closes the ordering window
+  rather than depending on the later call, and keeps a pane correct against a
+  libghostty built from a pin that predates the engine patch. It is also what
+  `harness/hwnd-host` has always done.
+
+Confirmed in the harness rather than by reading the diff.
+`GHOSTTY_HARNESS_PADDING_VIA_UPDATE` was added to `hwnd-host` for it: `1`
+withholds the app-config pin and pushes it afterwards through
+`ghostty_surface_update_config` — Windows Terminal's order — and `2` withholds
+it and never pushes it, which is the negative control the run needs, because
+"both runs agree" is otherwise equally consistent with the variable doing
+nothing. Three runs, same window, first ink measured from the client rect:
+
+```
+pin on the app config (default)   ink at (3, 50)   <- control
+pinned via update_config (=1)     ink at (3, 50)   <- the fix: identical
+never pinned (=2)                 ink at (7, 54)   <- the defect: +4, +4
+```
+
+#### What this leaves
+
+`GhosttyControlCore::_mouseTo` states in a comment that it carries no padding
+term *because* the pin holds, and says that if the padding ever stops being zero
+the term has to grow with it. For the whole time the pin did not hold, it did
+not: a pointer aimed at cell X was sent as `(X + 0.25) * cellWidth`, from which
+ghostty subtracted 4 px before taking the fraction, landing in cell X-1 at about
+94% across — which the 60% rule then resolves to the boundary between X-1 and X,
+the intended one. Correct by luck at this cell width, not by construction, and
+correct for the right reason now.

@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 18 Aug 2026 15:37:49 -0700
+Subject: [PATCH] config: window padding takes effect on a config update
+
+`Surface.size.padding` was assigned in exactly two places: `Surface.init`,
+from the config the surface was born with, and `contentScaleCallback`,
+which returns early when the DPI has not moved. `updateConfig` refreshed
+the derived config, the renderer and termio - and left the live padding
+alone. `resize` looks like it would fix that up, but it delegates to
+`balancePaddingIfNeeded`, whose first line returns when the padding is
+unbalanced, which is the default.
+
+So `window-padding-x` / `window-padding-y` were the settings a reload
+could not change. The value kept drawing until the surface happened to
+move to a display with a different scale, at which point it silently
+corrected itself.
+
+An embedder cannot work around it. A surface is created from the *app's*
+config, so `ghostty_surface_update_config` is the only way to give one
+its own settings, and this was the one setting that call did not carry.
+Windows Terminal pins `window-padding-x/y = 0` because it insets the
+XAML SwapChainPanel by the profile's padding itself; the pin never
+landed, so every ghostty pane drew ghostty's default 2pt on top of
+Windows Terminal's 8 DIP - 4 physical pixels of extra inset on all four
+sides at 144 DPI, measured against a cascadia pane showing identical
+text: same 738x124 ink extent, offset by exactly 4px in both axes.
+
+Recompute the padding from the new config after `setFontSize` - which is
+where the cell size that balanced padding is measured against settles -
+and force a resize when it actually changed, the same way
+`contentScaleCallback` does, so the renderer and the child both see the
+grid that the new padding leaves.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/Surface.zig | 37 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 7f921555a..8f2f674d5 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -1836,6 +1836,43 @@ pub fn updateConfig(
+         break :font_size size;
+     });
+ 
++    // Our padding is derived from the config and the DPI, and until now
++    // nothing recomputed it on a config change: `resize` delegates to
++    // `balancePaddingIfNeeded`, which returns immediately when the padding is
++    // unbalanced, and `contentScaleCallback` — the only other place that
++    // assigns `size.padding` — returns early when the DPI has not moved. So a
++    // reload that changed `window-padding-x`/`window-padding-y` did not reach
++    // the surface it was set on; it waited for a move to a display with a
++    // different scale.
++    //
++    // An embedder feels this hardest. A surface is born with the *app's*
++    // config (`Surface.init`), so `ghostty_surface_update_config` is the only
++    // way to give one its own configuration — and padding was the single
++    // setting that call could not change.
++    //
++    // This runs after `setFontSize` above because balanced padding is measured
++    // against the cell size, which that call may just have changed.
++    padding: {
++        const content_scale = try self.rt_surface.getContentScale();
++        const explicit: rendererpkg.Padding = self.config.scaledPadding(
++            content_scale.x * font.face.default_dpi,
++            content_scale.y * font.face.default_dpi,
++        );
++
++        const before = self.size.padding;
++        if (self.config.window_padding_balance == .false) {
++            self.size.padding = explicit;
++        } else {
++            self.size.balancePadding(explicit, self.config.window_padding_balance);
++        }
++        if (std.meta.eql(before, self.size.padding)) break :padding;
++
++        // The grid is measured from the pixels the padding takes away, so the
++        // renderer and the child both have to be told, exactly as they are
++        // when the DPI changes the padding underneath them.
++        try self.resize(self.size.screen);
++    }
++
+     // We need to store our configs in a heap-allocated pointer so that
+     // our messages aren't huge.
+     var renderer_message = try rendererpkg.Message.initChangeConfig(self.alloc, config);

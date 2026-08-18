@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 18 Aug 2026 15:38:54 -0700
+Subject: [PATCH] fix(control): a pane is born with zero ghostty padding
+ (KD-21)
+
+Windows Terminal insets the SwapChainPanel by the profile's `padding`
+itself, so the translator pins `window-padding-x/y = 0` to stop the two
+from stacking. The pin never took effect: libghostty computes the
+padding a surface draws with when the surface is created, from the
+*app's* config, and `ghostty_surface_update_config` - which is where the
+translator's entries arrive - did not recompute it. Every ghostty pane
+therefore drew ghostty's default 2pt on top of WT's 8 DIP.
+
+Measured on a live window at 144 DPI, a ghostty pane beside a cascadia
+one showing the identical line: the same 738x124 ink extent, offset by
+exactly 4 physical pixels in both axes - which is `floor(2 * 144/72)`.
+
+The engine side of the fix is the ghostty patch `config: window padding
+takes effect on a config update`. This is the other half: set it on the
+app config, which is what a surface is actually born with, so the
+correct value is in place before the first frame instead of arriving in
+an update. It also keeps a pane correct if the DLL is ever built from a
+pin that predates that patch.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../TerminalControl/GhosttyEngine.cpp         | 24 +++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyEngine.cpp b/src/cascadia/TerminalControl/GhosttyEngine.cpp
+index 2fd9e1b45..fd1721e66 100644
+--- a/src/cascadia/TerminalControl/GhosttyEngine.cpp
++++ b/src/cascadia/TerminalControl/GhosttyEngine.cpp
+@@ -148,6 +148,30 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // configuration comes from the WT profile, and silently mixing in
+         // ~/.config/ghostty would make two settings systems fight over the
+         // same pane. The translator in GhosttyControlCore is the only source.
++
++        // Padding is the exception, and it is here rather than only in the
++        // translator because of *when* it is read. A surface is born with the
++        // app's config - this one - and libghostty computes the padding it
++        // draws with once, at that moment. The translator's pin arrives later,
++        // on ghostty_surface_update_config, and until the fix in the `config:
++        // window padding takes effect on a config update` patch that call did
++        // not recompute it at all: every pane drew ghostty's default 2pt on
++        // top of the profile's padding, which WT has already applied as the
++        // SwapChainPanel's margin. 4 extra pixels on all four sides at 144 DPI
++        // (KD-21).
++        //
++        // Setting it on the app config closes the window rather than relying
++        // on the later call, and keeps a pane correct against a libghostty
++        // built from an older pin.
++        static constexpr std::string_view zeroPadding[]{ "window-padding-x", "window-padding-y" };
++        for (const auto& key : zeroPadding)
++        {
++            if (!ghostty_config_set_kv(config, key.data(), key.size(), "0", 1))
++            {
++                LOG_HR_MSG(E_INVALIDARG, "ghostty rejected the zero-padding entry");
++            }
++        }
++
+         ghostty_config_finalize(config);
+         return config;
+     }
