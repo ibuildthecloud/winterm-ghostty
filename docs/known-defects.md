@@ -1016,3 +1016,83 @@ alt changes nothing there on either engine. `ToggleBlockSelection` — the
 keyboard action that flips an existing selection between shapes — still returns
 false on a ghostty pane: the rectangle lives inside ghostty's `Selection` and no
 C entry point reaches it. Only the alt+drag gesture is fixed.
+
+---
+
+### KD-12 — A pane double-frees and the process dies with heap corruption — **open**
+
+**Reported** by the user, from use: the portable **v0.2.4.0** build
+(`C:\Users\darre\Downloads\winterm-ghostty-0.2.4.0-x64-portable\terminal-0.2.4.0`)
+crashed while they were using it, 2026-08-17 23:57 local.
+
+#### What is measured
+
+Windows kept a full user-mode dump, because `LocalDumps` is enabled on this
+machine. `!analyze -v` on it is unambiguous about the *kind* of fault:
+
+```
+ERROR_CODE: (NTSTATUS) 0xc0000374 - A heap has been corrupted.
+FAILURE_BUCKET_ID: HEAP_CORRUPTION_ACTIONABLE_BlockNotBusy_DOUBLE_FREE_c0000374_ntdll.dll!RtlpHpFreeHeap
+```
+
+`BlockNotBusy` is the heap saying it was handed a block that is **not currently
+allocated** — a double free, not a stray write. And the caller is ours:
+
+```
+ntdll!RtlFreeHeap+0x231
+ghostty-internal.dll + 0x8252ec      <- the free
+ghostty-internal.dll + 0x24c2a3
+```
+
+(RVAs against the module base `00007ffd`e23f0000` in that dump. The symbol names
+cdb prints for those two frames are nearest-export guesses and mean nothing —
+see below.)
+
+**A second crash the same day**, 19:32 local, same build, same DLL: an access
+violation (`0xc0000005`) at **RVA `0x1d0f17`**, with the stack unwalkable past
+the faulting frame. Whether it is the same fault seen earlier in its life — a
+use-after-free rather than the second free — is a hypothesis, not a finding.
+
+Both dumps and the exact DLL they were taken against are preserved in
+`dist/crash-0.2.4/` (gitignored), out of reach of WER's rotation.
+
+#### Where a crash is recorded at all
+
+Worth stating, because the answer is "only locally, and only by Windows":
+
+- `%LOCALAPPDATA%\CrashDumps\WindowsTerminal.exe.<pid>.dmp` — a full dump, kept
+  only because this machine has `LocalDumps` configured. Not a default.
+- `%ProgramData%\Microsoft\Windows\WER\ReportArchive\AppCrash_WindowsTerminal.*`
+  — the WER report folder.
+- Application event log, IDs **1000** (faulting module and offset) and **1001**
+  (the bucket).
+
+**Nothing is sent anywhere, and the engine records nothing itself.** ghostty's
+Sentry crash reporting is compiled out on Windows — `src/build/Config.zig`
+defaults `sentry` to true only on macOS/iOS — and this fork does not pass
+`-Dsentry`. So a user's crash is invisible to us unless they say so.
+
+#### Why the frames cannot be named yet, and the measurement that would fix it
+
+The portable ZIP ships **no PDB**, so those RVAs cannot be resolved to
+functions. That is the whole gap between "a double free somewhere in libghostty"
+and a diagnosis, and it is fixable rather than inherent:
+
+1. Have `release.yml` publish (or retain as a build artifact) the
+   `ghostty-internal.pdb` it already produces. Then `harness/pdbaddr` maps
+   `0x8252ec`, `0x24c2a3` and `0x1d0f17` to functions in one run, against the
+   binary the user actually ran.
+2. Failing that, rebuild the pin plus the patch series with the release flags
+   and map the RVAs there — weaker, since the layout is only *probably* the
+   same, and a wrong-by-one-function answer looks exactly like a right one.
+
+Until one of those happens, no cause should be asserted. What is known is the
+class of fault (double free), the module (ours), and that it has happened twice
+in one day of ordinary use.
+
+#### What is not known
+
+**What the pane was doing.** Neither dump has been correlated with an action —
+no repro, no idea whether it was output, a resize, a close, a selection, or a
+pty ending. That is the other half of the diagnosis and it has to come from the
+person who was there.
