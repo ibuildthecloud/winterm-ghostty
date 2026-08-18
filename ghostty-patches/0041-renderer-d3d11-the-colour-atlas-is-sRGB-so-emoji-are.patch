@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 18 Aug 2026 12:19:14 -0700
+Subject: [PATCH] renderer: d3d11 the colour atlas is sRGB, so emoji are not
+ washed out
+
+`cell_text` takes its colour-glyph sample as linear - "Color glyphs are
+already premultiplied linear" - and unlinearizes only when blending is
+not linear. Both other backends arrange that by asking the hardware for
+the decode: Metal creates the bgra atlas as `bgra8unorm_srgb`
+(Metal.zig:374) and OpenGL as `srgba` (OpenGL.zig:430), in each case for
+the colour atlas only, since grayscale holds coverage rather than colour.
+
+This backend created both atlases as plain UNORM. So sRGB-encoded emoji
+were read as if they were already linear and then encoded again on the
+way out, which lifts every midtone: reported from use as "washed out and
+flat", and it was. Sampled off a capture of the same glyph, the grinning
+face's fill went #FEF178 with #8B7240 features - a pale yellow and a
+muddy brown - where the font's own colours are #FDE030 and #422B0D.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/renderer/D3D11.zig | 21 ++++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/src/renderer/D3D11.zig b/src/renderer/D3D11.zig
+index bcd50cfa6..f86fcd1ae 100644
+--- a/src/renderer/D3D11.zig
++++ b/src/renderer/D3D11.zig
+@@ -494,9 +494,24 @@ pub fn initAtlasTexture(
+             .device = self.device.device,
+             .context = self.device.context,
+             .format = format,
+-            // The glyph atlas holds coverage/color data that the shader
+-            // samples directly; it must not be sRGB-decoded on read.
+-            .srgb = false,
++            // The two atlases hold different kinds of data, and only one of
++            // them is colour.
++            //
++            // Grayscale is coverage - not a colour at all - so decoding it as
++            // sRGB would be meaningless. Colour glyphs are sRGB-encoded BGRA
++            // out of the rasterizer, and `cell_text` takes its sample as
++            // *linear* ("Color glyphs are already premultiplied linear"),
++            // unlinearizing it again only when blending is not linear. The
++            // hardware does that decode for free when the view is sRGB, which
++            // is how both other backends get it: Metal asks for
++            // `bgra8unorm_srgb` and OpenGL for `srgba`, in each case for the
++            // bgra atlas only.
++            //
++            // Without it, sRGB values are read as if they were linear and then
++            // encoded on the way out, which lifts every midtone: emoji came
++            // out pale and desaturated - a washed-out yellow face where the
++            // font draws a saturated orange one.
++            .srgb = format == .bgra,
+         },
+         atlas.size,
+         atlas.size,

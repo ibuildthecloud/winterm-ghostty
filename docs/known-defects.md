@@ -1327,3 +1327,54 @@ Findings taken on a dev build before this date describe FreeType's behaviour
 unless they say otherwise. [KD-13](#kd-13--intense-text-is-neither-brightened-nor-un-emboldened--fixed-2026-08-18)'s
 ink counts are one such: the fix there is a settings translation and is backend
 independent, but the "ghostty draws a bold face" measurement was FreeType's.
+
+
+---
+
+### KD-16 — Colour emoji were washed out and flat — **fixed 2026-08-18**
+
+**Reported** by the user, from use, on the first dev build that ran the
+DirectWrite font stack ([KD-15](#kd-15--dev-builds-did-not-run-the-font-stack-that-ships--fixed-2026-08-18)):
+"our rendering of emojis looks really bad, like washed out and flat".
+
+#### What was wrong
+
+A gamma error, and the same class as [KD-14](#kd-14--the-glyph-atlas-held-a-corrected-mask-not-coverage--fixed-2026-08-18)
+but in the other direction. `cell_text` takes its colour-glyph sample as
+*linear* - "Color glyphs are already premultiplied linear" - and unlinearizes
+only when blending is not linear. Both other backends arrange that decode in
+hardware, and only for the colour atlas, since grayscale holds coverage rather
+than colour:
+
+| backend | grayscale atlas | colour atlas |
+|---|---|---|
+| Metal (`Metal.zig:374`) | `r8unorm` | `bgra8unorm_srgb` |
+| OpenGL (`OpenGL.zig:430`) | `red` | `srgba` |
+| D3D11, before | `R8_UNORM` | `B8G8R8A8_UNORM` |
+
+So sRGB-encoded emoji were read as though already linear and encoded again on
+the way out, lifting every midtone. Sampled off a capture of the grinning face:
+
+```
+before   fill #FEF178   features #8B7240     pale yellow, muddy brown
+after    fill #FDE030   features #422B0D     the font's own colours
+```
+
+#### The fix
+
+`initAtlasTexture` picks the sRGB view for the `bgra` atlas and leaves
+grayscale alone. One line, and it is the line the comment above it used to
+argue against - "must not be sRGB-decoded on read" was right for coverage and
+wrong for colour.
+
+#### Worth knowing, and not chased
+
+With the colours right, the two panes still draw *different artwork* for the
+same emoji: ghostty's grinning face is the gradient Fluent design, cascadia's
+the older flat one. Segoe UI Emoji carries both - ADR 0005 recorded the file as
+having a COLR v1 paint tree *and* a complete v0 layer set - and a gradient fill
+is something only the v1 tree can produce, so the evidence says we are drawing
+v1 where AtlasEngine draws v0. That is the outcome ADR 0005 hoped for as a later
+upgrade, arriving without being asked for: we request `GLYPH_IMAGE_COLR` and not
+`COLR_PAINT_TREE`, so *why* DirectWrite hands back the v1 rendering is not
+established. Someone should find out before this is relied on.
