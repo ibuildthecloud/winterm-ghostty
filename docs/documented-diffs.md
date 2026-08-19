@@ -45,10 +45,13 @@ What stays different:
   its scheme list, and its rules about a trailing `.` or `)` decide it
   (`config/url.zig`); cascadia has its own pattern. The two agree on ordinary
   URLs and can disagree at the edges.
-- **A detected URL previews only while ctrl is held.** ghostty reports a link
-  when it highlights one, and its default rule for a regex link is
-  `hover_mods = ctrl`. Cascadia shows its tooltip on a plain hover. OSC 8 links
-  highlight on plain hover on both, so those preview alike.
+- **A link previews only while ctrl is held, OSC 8 included.** ghostty reports a
+  link when it highlights one, and it highlights nothing without ctrl: a regex
+  link's default rule is `hover_mods = ctrl`, and an OSC 8 link is only looked
+  for when the modifiers *equal* ctrl-or-super (`Surface.zig`, `linkAtPos`) -
+  so ctrl+shift does not find one either. Cascadia shows its tooltip on a plain
+  hover, and for OSC 8 that is the bigger difference, since an application that
+  marks its own links expects them to be visible without a modifier.
 - **The underline is ghostty's**, drawn by its renderer in its own weight and
   colour rather than by WT's.
 - **`GetHyperlink` answers about the pointer, not about the position it is

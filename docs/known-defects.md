@@ -1887,8 +1887,25 @@ pane never sees ctrl and no link is ever highlighted.
 the `link-url` translation; the hover and the click need a window and are
 measured above rather than in a test.
 
+#### OSC 8 hyperlinks
+
+Covered by the same path, with no code of their own: ghostty's `linkAtPos`
+checks the cell's hyperlink data before it tries the URL regex, reports the
+URI through the same `MOUSE_OVER_LINK`, and opens it through the same
+`processLinks`. So the readback here answers with the OSC 8 *target*, not
+the text it is written under, which is what makes `ls --hyperlink` and a
+build log's clickable paths work.
+
+**Not yet measured in a pane.** The probe that would show it - an OSC 8
+sequence printed, ctrl+hovered, the tooltip read back for the target URI -
+could not take the foreground while the user was at the keyboard.
+
+One difference does bite here: ghostty only looks for an OSC 8 link when
+the modifiers *equal* ctrl-or-super, so an application's own links are
+invisible until ctrl is held, where cascadia shows them on a plain hover.
+
 #### Still ghostty's, not cascadia's
 
-Which text counts as a link, and the fact that a *detected* URL previews only
-while ctrl is held — both are ghostty's rules and are written up as
+Which text counts as a link, and the fact that every link - OSC 8 included -
+previews only while ctrl is held — both are ghostty's rules and are written up as
 [GD-01](documented-diffs.md#gd-01--hyperlinks--implemented-2026-08-18).
