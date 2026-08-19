@@ -32,6 +32,51 @@ Nothing switches engine by itself. Add `"engine": "ghostty"` to a profile — or
 
 To confirm a pane is really using it, open the search box (`Ctrl+Shift+F`): on a ghostty pane the regex and case toggles are greyed out.
 
+## New in 0.2.8
+
+The biggest release since 0.2.0, and most of it is a pane behaving like the cascadia pane beside it rather than nearly like it.
+
+### The shell's working directory now reaches the terminal
+
+Duplicating a tab, or splitting a pane, opens **where the shell actually is** instead of at the profile's `startingDirectory`. All three spellings work — `OSC 7` (a `file:` URI), ConEmu's `OSC 9;9` (a native path, which is what Windows shell integration emits), and iTerm2's `OSC 1337;CurrentDir`.
+
+The sequences were always parsed; libghostty then dropped them, because its handler returned early on Windows with "unimplemented" before storing anything. Note that **nothing emits them by default** — PowerShell needs shell integration in your profile:
+
+```powershell
+function prompt {
+  $p = $executionContext.SessionState.Path.CurrentLocation
+  "$([char]27)]9;9;`"$p`"$([char]27)\PS $p$('>' * ($nestedPromptLevel + 1)) "
+}
+```
+
+### Links
+
+Ctrl+hover underlines a URL, shows the same tooltip a cascadia pane shows, and ctrl+click opens it — for URLs found in output and for `OSC 8` hyperlinks an application marks itself. The profile's `detectURLs` is honoured, so turning it off leaves a URL as plain text on both engines.
+
+One difference worth knowing: ghostty previews a link only while ctrl is held, where cascadia underlines an `OSC 8` link on a plain hover.
+
+### Desktop notifications
+
+`OSC 777;notify;title;body` raises a toast, with the same rate limit and the same "don't notify me about the pane I'm looking at" rule as a cascadia pane. It is gated on the profile's `compatibility.allowOSC777`, which is **off by default** — a program gets to interrupt you only if you said it may.
+
+### Two settings a ghostty pane was ignoring
+
+- **`compatibility.allowOSC52`** — the switch that decides whether a program running in the pane may put text on your clipboard. It was never forwarded, so a pane wrote the clipboard even when you had turned that off. It now refuses, and refusing it does not cost you your own copy.
+- **Padding.** A pane was inset by Windows Terminal's `padding` *and* again by ghostty's own default, so ghostty panes sat 4 px further in than cascadia ones at 150% scale. Padded once now.
+
+### Text and colour
+
+- **Intense text is brightened, not emboldened.** `intenseTextStyle` is forwarded, so bold-looking output no longer draws heavier strokes than the cascadia pane under the same profile, and bright text is bright.
+- **Colour emoji are no longer washed out and flat** — the glyph atlas was not sRGB, so every colour came back lightened.
+- **Glyphs are sharper.** The atlas held a gamma-corrected mask where the shader expected coverage.
+- **A font *list* now names all its families.** `"fontFace": "Cascadia Code, Segoe UI Emoji"` was searched for as one family literally called that, found nothing, and silently fell back to the bundled font — so a profile's font was quietly ignored.
+
+### The crash reported against 0.2.7.0
+
+A ghostty pane could take the whole terminal down. It was reported from use against the 0.2.7.0 portable build, and 0.2.7's symbols are what made it readable: the dump names every frame, and it is a read of freed heap memory inside the renderer.
+
+The cause was ours, not the engine's — Windows Terminal was calling a synchronous render from the UI thread (on losing focus with an IME composition open, among others) while the render thread was already in the middle of a frame. That call has been removed outright rather than serialised, so there is no longer a second thread to race. The older heap-corruption crash that could not be symbolised is presumed to be the same bug; it has not been seen since, but "presumed" is the honest word until it has been reproduced and shown gone.
+
 ## New in 0.2.7
 
 - **The engine ships debuggable.** 0.2.6 published symbols but the engine had none: `-Dstrip` defaults to on for a fast release, and in ghostty's build it also sets `unwind_tables = .none` — so `ghostty-internal.dll` carried neither a PDB nor the tables a debugger needs to walk a stack out of it. That is why the crash dump behind [KD-11's neighbour KD-12](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/known-defects.md) showed one real frame and then nonsense. The release build now passes `-Dstrip=false`, and the packaging step **fails** rather than publishing a build whose engine cannot be debugged.
@@ -76,7 +121,7 @@ The event-log line alone is useful: it names the faulting module and the offset 
 
 ## What works
 
-Rendering, keyboard input (including IME), mouse, selection and clipboard, search, scrollback and marks, all six cursor shapes, Kitty graphics, and the terminal-size reports that image clients rely on. A pane drains its pty at roughly three quarters of cascadia's rate.
+Rendering, keyboard input (including IME), mouse, selection and clipboard, search, scrollback and marks, all six cursor shapes, Kitty graphics, links (hover, tooltip, ctrl+click), the working directory a shell reports, desktop notifications, the taskbar progress bar, and the terminal-size reports that image clients rely on. A pane drains its pty at roughly three quarters of cascadia's rate.
 
 Everything above the pane — tabs, panes, settings, command palette, search box — is unaware of which engine it is holding.
 
@@ -90,6 +135,8 @@ Its own package identity (`WintermGhostty`), its own execution alias (`wtg.exe`)
 - **x64 only.** Zig 0.16.0 cannot target `aarch64-windows-msvc` at all, so there is no ARM64 build to ship.
 - **KD-05** — the Windows cursor-blink settings are ignored, including turning blinking off. A focused ghostty pane blinks at a fixed 600 ms and presents a frame for each blink, where a cascadia pane obeys the system setting.
 - **KD-10** — a focused pane presents twice a second for its cursor blink, but the drawn cursor barely toggles: measured at ten blink wakes with the pixels unchanged. The blink is not reaching the screen, which also means those presents are buying nothing.
+- **No shell-integration marks.** `OSC 133` prompt marks are tracked by the engine but not surfaced, so the scrollbar marks, "scroll to previous command" and command history are empty on a ghostty pane. Setting a shell's working directory (new in 0.2.8) works; the rest of shell integration does not yet.
+- **Two `compatibility.*` switches are still ignored**: `allowDECNKM` (which defaults *off*, so a ghostty pane differs there for everyone) and `kittyKeyboardMode` in its off direction. Both need a setting libghostty does not have yet.
 
 Each defect in `docs/known-defects.md` records what was measured rather than what was assumed, and what would tell the remaining hypotheses apart.
 
