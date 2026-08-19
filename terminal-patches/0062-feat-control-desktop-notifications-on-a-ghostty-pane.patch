@@ -34,7 +34,7 @@ Measured with scripts/probe-notify.ps1 on a portable build, both ways round:
 allowed -> `[ghostty] notification title=11 body=14 chars`, matching the
 sequence that was sent; refused -> nothing, with the other ghostty traces
 still arriving so the silence is evidence rather than a probe that saw
-nothing. unitControl 69 -> 70.
+nothing. unitControl 68 -> 69.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 ---

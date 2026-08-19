@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 18 Aug 2026 18:39:30 -0700
+Subject: [PATCH] fix(control): a ghostty pane honours compatibility.allowOSC52
+ (KD-22)
+
+The other half of WT's compatibility switches. `compatibility.allowOSC52`
+decides whether a program running in the pane may put text on the clipboard;
+ghostty spells the same thing `clipboard-write`, and it was never forwarded.
+Both default to allowing it, which is why this stayed invisible: it bites only
+the user who deliberately turned OSC 52 off and got a ghostty pane that wrote
+the clipboard anyway.
+
+This gates OSC 52 and nothing else, which is the part worth being sure about
+rather than reasoning about. Measured through the shipped DLL with
+harness/hwnd-host, feeding `OSC 52;c;Y2xpcGJvYXJkIHByb2Jl`:
+
+  --clipboard-write=allow  ->  [clip] mime=text/plain len=15 head=clipboard probe
+  --clipboard-write=deny   ->  info(surface): application attempted to write
+                               clipboard, but 'clipboard-write' is set to deny
+
+and, in the same denied configuration, a selection plus the same
+`copy_to_clipboard` binding action GhosttyControlCore sends still delivers:
+
+  [clip] copy plain
+  [clip] mime=text/plain len=13 head=OPY THIS LINE
+
+so refusing a program's OSC 52 does not cost the user their own copy.
+
+`ask` is a third value ghostty accepts and this deliberately never sends: it
+asks the embedder to confirm through the `confirm` flag on the write callback,
+and GhosttyEngine's callback implements no prompt, so it would read as
+"confirm first" and behave as "write silently". A unit test pins that too.
+
+The read half needs nothing. WT parses an OSC 52 query and then ignores it
+unconditionally, and GhosttyEngine's read_clipboard_cb already answers
+"nothing available", so a program cannot read the clipboard on either engine
+whatever this setting says.
+
+unitControl 69 -> 70.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../GhosttySettingsTranslator.cpp             | 24 ++++++++++++++++++
+ .../GhosttySettingsTests.cpp                  | 25 +++++++++++++++++++
+ 2 files changed, 49 insertions(+)
+
+diff --git a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+index ce2410edd..cbba18e9f 100644
+--- a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
++++ b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+@@ -129,6 +129,30 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // clipboard - measured, because that was the regression to fear.
+         set("selection-trim-line", "false");
+ 
++        // --- Clipboard ----------------------------------------------------
++        // The other half of the compatibility switches: WT's
++        // `compatibility.allowOSC52` decides whether a program running in the
++        // pane may put text on the clipboard, and ghostty spells the same thing
++        // `clipboard-write`. Both default to allowing it, which is why this one
++        // was invisible - it only bites the user who deliberately turned OSC 52
++        // off and got a ghostty pane that wrote the clipboard anyway.
++        //
++        // This gates OSC 52 and nothing else. ghostty's own copy path
++        // (`copy_to_clipboard`, which is what WT's copy binding drives) does
++        // not go through it, so denying this does not cost the user their own
++        // ctrl+c.
++        //
++        // `ask` is a third value ghostty accepts and we never send: it asks the
++        // embedder to confirm through the `confirm` flag on the write callback,
++        // and GhosttyEngine's callback does not implement a prompt. Sending it
++        // would read as "confirm first" and behave as "write silently".
++        //
++        // The read half needs nothing here. WT parses an OSC 52 *query* and
++        // then ignores it unconditionally, and GhosttyEngine's
++        // read_clipboard_cb already answers "nothing available", so a program
++        // cannot read the clipboard on either engine whatever this setting says.
++        set("clipboard-write", settings.AllowVtClipboardWrite() ? "allow" : "deny");
++
+         // --- Desktop notifications ----------------------------------------
+         // WT's switch is the profile's `compatibility.allowOSC777`, and it is
+         // **off** by default: a program gets to raise a toast only if the user
+diff --git a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+index 175b406c9..cf3700f77 100644
+--- a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
++++ b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+@@ -43,6 +43,7 @@ namespace ControlUnitTests
+         TEST_METHOD(TripleClickHighlightsTheWholeLine);
+         TEST_METHOD(UrlDetectionFollowsTheProfile);
+         TEST_METHOD(DesktopNotificationsFollowTheProfile);
++        TEST_METHOD(ClipboardWriteFollowsTheProfile);
+         TEST_METHOD(CursorShapeIsForwarded);
+         TEST_METHOD(IntenseTextStyleIsForwarded);
+         TEST_METHOD(BackslashesAreDoubledForTheWordCharsFieldOnly);
+@@ -236,6 +237,30 @@ namespace ControlUnitTests
+                        L"a profile that turns URL detection off must turn ghostty's off too");
+     }
+ 
++    // WT's `compatibility.allowOSC52` decides whether a program in the pane may
++    // put text on the clipboard. Both engines default to allowing it, so this
++    // one is only visible in the "off" direction - which is exactly the
++    // direction where getting it wrong matters, because the user turned it off
++    // on purpose.
++    //
++    // It gates OSC 52 alone: ghostty's copy_to_clipboard action, which is what
++    // WT's own copy binding drives, does not consult clipboard-write. Denying
++    // this must not cost the user their ctrl+c.
++    void GhosttySettingsTests::ClipboardWriteFollowsTheProfile()
++    {
++        const auto on = Control::implementation::TranslateGhosttySettings(*_settings());
++        VERIFY_IS_TRUE(_has(on, "clipboard-write", "allow"),
++                       L"both sides allow OSC 52 by default");
++
++        auto settings = _settings();
++        settings->AllowVtClipboardWrite(false);
++        const auto off = Control::implementation::TranslateGhosttySettings(*settings);
++        VERIFY_IS_TRUE(_has(off, "clipboard-write", "deny"),
++                       L"a profile that refuses OSC 52 must refuse it on a ghostty pane too");
++        VERIFY_IS_FALSE(_has(off, "clipboard-write", "ask"),
++                        L"'ask' would promise a prompt the embedder does not implement");
++    }
++
+     // The two engines default this setting opposite ways round, which is the
+     // whole reason it has to be forwarded rather than assumed. WT's
+     // `compatibility.allowOSC777` is off unless the user turns it on;

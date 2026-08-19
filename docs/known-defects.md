@@ -2082,3 +2082,81 @@ Still absent, and each needs its own decision rather than a follow-on commit:
   a public API shape, which under PROCESS.md rule 3 is escalated, not decided
   in passing. Both are WT-proprietary protocols whose value upstream is
   questionable; a `DECISION-NEEDED` entry belongs with them if they are wanted.
+
+---
+
+### KD-23 — `compatibility.allowOSC52` was not honoured on a ghostty pane — **fixed 2026-08-18**
+
+**Found while wiring up notifications for [KD-22](#kd-22--a-ghostty-pane-never-learned-the-shells-working-directory--fixed-2026-08-18)**, and reported to
+the user rather than fixed in passing; they asked for it, so here it is.
+
+`compatibility.allowOSC52` decides whether a program running in the pane may
+put text on the clipboard. ghostty spells the same switch `clipboard-write`,
+and `GhosttySettingsTranslator` never forwarded it. Both sides default to
+allowing it, which is exactly why this stayed invisible for eight phases: it
+bites only the user who deliberately turned OSC 52 **off** and got a ghostty
+pane that wrote the clipboard anyway — a setting silently ignored, in the
+direction where ignoring it matters.
+
+`set("clipboard-write", settings.AllowVtClipboardWrite() ? "allow" : "deny")`
+is the whole fix (terminal patch 0063).
+
+#### The risk worth measuring rather than reasoning about
+
+`clipboard-write` could plausibly have gated ghostty's *own* copy as well, in
+which case a user turning OSC 52 off would have lost ctrl+c on a ghostty pane —
+a far worse bug than the one being fixed. It does not: `Surface.clipboardWrite`
+is the OSC 52 path (it base64-decodes), and `copy_to_clipboard` goes through
+`copySelectionToClipboards`, which never consults the config.
+
+Measured through the shipped DLL with `harness/hwnd-host`, feeding
+`OSC 52;c;Y2xpcGJvYXJkIHByb2Jl` ("clipboard probe"):
+
+| run | result |
+|---|---|
+| `--clipboard-write=allow` | `[clip] mime=text/plain len=15 head=clipboard probe` |
+| `--clipboard-write=deny` | `info(surface): application attempted to write clipboard, but 'clipboard-write' is set to deny` |
+| `--clipboard-write=deny`, plus a selection and the same `copy_to_clipboard` binding action `GhosttyControlCore` sends | `[clip] copy plain` / `[clip] mime=text/plain len=13 head=OPY THIS LINE` |
+
+The third row is the one that had to be run. The harness prints what would
+reach the clipboard instead of setting it, so none of this touched the real
+one.
+
+And through a real pane, off the debugger channel — `allowOSC52: false` →
+`[ghostty] set clipboard-write = deny`, `true` → `allow`.
+
+#### `ask` is a value we deliberately never send
+
+ghostty's third value asks the embedder to confirm, through the `confirm` flag
+on the write callback. `GhosttyEngine::_writeClipboard` names that parameter
+`/*confirm*/` and implements no prompt, so `ask` would read as "confirm first"
+and behave as "write silently" — worse than either honest answer. A unit test
+asserts it is not emitted.
+
+#### The read half needs nothing
+
+WT parses an OSC 52 *query* and then ignores it unconditionally
+(`_GetOscSetClipboard(...) && !queryClipboard`), and
+`GhosttyEngine::_readClipboard` already answers "nothing available" because
+paste is driven from WT's side. A program cannot read the clipboard on either
+engine whatever this setting says, so `clipboard-read` is left at ghostty's
+default rather than pinned to something that would only look load-bearing.
+
+#### The rest of the `compatibility.*` family, measured
+
+The same question asked of every switch in that family, so the answer is a
+list rather than an impression:
+
+| setting | default | on a ghostty pane |
+|---|---|---|
+| `compatibility.allowOSC52` | true | **honoured** (this fix) |
+| `compatibility.allowOSC777` | false | **honoured** ([KD-22](#kd-22--a-ghostty-pane-never-learned-the-shells-working-directory--fixed-2026-08-18)) |
+| `compatibility.allowDECRQCRA` | false | moot — ghostty does not implement DECRQCRA at all, which is what the default asks for |
+| `compatibility.allowDECNKM` | **false** | **not honoured.** ghostty implements DECNKM (mode 66 is in `modes.zig` and is not logged as unimplemented when fed), with no config to refuse it |
+| `compatibility.kittyKeyboardMode` | true | **not honoured** in the off direction; ghostty has no config to disable the protocol |
+
+The last two are open, and neither is a translator line: both need a new
+libghostty config, which is a public API shape and therefore escalated rather
+than decided in passing. `allowDECNKM` is the more interesting of the two —
+its default is *off*, so a ghostty pane differs from cascadia there for
+everyone, not only for the user who changed a setting.
