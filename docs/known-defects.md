@@ -1896,9 +1896,12 @@ URI through the same `MOUSE_OVER_LINK`, and opens it through the same
 the text it is written under, which is what makes `ls --hyperlink` and a
 build log's clickable paths work.
 
-**Not yet measured in a pane.** The probe that would show it - an OSC 8
-sequence printed, ctrl+hovered, the tooltip read back for the target URI -
-could not take the foreground while the user was at the keyboard.
+**Measured, by hand, 2026-08-18.** An OSC 8 sequence whose label is
+`CLICK THIS TEXT` and whose target is `https://example.com/osc8-target`:
+ctrl+hover underlines the label, and ctrl+click opens the target rather
+than the words - which is the part worth checking, since the two differ.
+By hand rather than by probe: `probe-link-hover.ps1` cannot take the
+foreground while someone is at the keyboard, and should not try.
 
 One difference does bite here: ghostty only looks for an OSC 8 link when
 the modifiers *equal* ctrl-or-super, so an application's own links are
