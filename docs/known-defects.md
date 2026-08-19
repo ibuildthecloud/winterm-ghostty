@@ -1912,3 +1912,160 @@ invisible until ctrl is held, where cascadia shows them on a plain hover.
 Which text counts as a link, and the fact that every link - OSC 8 included -
 previews only while ctrl is held — both are ghostty's rules and are written up as
 [GD-01](documented-diffs.md#gd-01--hyperlinks--implemented-2026-08-18).
+
+---
+
+### KD-22 — A ghostty pane never learned the shell's working directory — **fixed 2026-08-18**
+
+**Reported** by the user, from use: Windows Terminal has custom VT sequences
+"for things like setting the current working directory of the terminal", and
+they do not appear to work on a ghostty pane.
+
+They were right, and the cause was one `return` in libghostty. What follows is
+first the inventory — which sequences Windows Terminal actually implements, and
+what libghostty does with each — because the fix is only defensible against the
+whole list.
+
+#### What Windows Terminal implements
+
+`OutputStateMachineEngine::ActionOscDispatch`
+(`src/terminal/parser/OutputStateMachineEngine.cpp:763`) is the whole set. The
+non-standard ones — the ones the user was asking about — are these:
+
+| sequence | WT calls | what WT does with it |
+|---|---|---|
+| `OSC 7;<file: URI>` | `SetCurrentWorkingDirectory` | `PathCreateFromUrlW`, then `ITerminalApi::SetWorkingDirectory` |
+| `OSC 9;9;"<path>"` | `DoConEmuAction` sub 9 | same sink, native path, quotes optional |
+| `OSC 9;4;<state>;<pct>` | `DoConEmuAction` sub 4 | `SetTaskbarProgress` — the taskbar bar |
+| `OSC 9;12` | `DoConEmuAction` sub 12 | `Buffer().StartCommand()` — a prompt mark |
+| `OSC 133;A/B/C/D` | `DoFinalTermAction` | prompt / command / output / exit-code marks |
+| `OSC 1337;SetMark` | `DoITerm2Action` | `Buffer().StartPrompt()` |
+| `OSC 633;Completions;…` | `DoVsCodeAction` | the shell-completions menu |
+| `OSC 777;notify;…` | `DoUrxvtAction` | a desktop notification |
+| `OSC 9001;CmdNotFound;<cmd>` | `DoWTAction` | **WT's own**: asks WinGet what provides the command |
+
+`OSC 9;9` is the one that matters most on Windows: WT's own comment beside
+`SetCurrentWorkingDirectory` says so — *"While ConEmu's OSC 9;9 works well for
+native Windows paths, OSC 7 uses file URIs, which may not always work."*
+
+#### What libghostty does with the same bytes
+
+Measured, not read: `harness/hwnd-host` gained a `GHOSTTY_ACTION_PWD` print,
+and every sequence above was fed to the shipped DLL through
+`GHOSTTY_HARNESS_FEED` with `GHOSTTY_LOG=stderr`, which logs each action as it
+is dispatched. One run, 23 cases.
+
+| sequence | libghostty | reaches a WT ghostty pane? |
+|---|---|---|
+| `OSC 0` / `OSC 2` | `.set_title` | yes |
+| `OSC 4` / `10` / `11` / `12` | `.color_change` | yes |
+| `OSC 7` | `.pwd` | **yes, after this fix** |
+| `OSC 9;9` | `.pwd` | **yes, after this fix** |
+| `OSC 1337;CurrentDir=` | `.pwd` | **yes, after this fix** |
+| `OSC 9;4` | `.progress_report` | yes — dispatched, and `GhosttyControlCore` raises `TaskbarProgressChanged` |
+| `OSC 9;<text>` | `.desktop_notification` | no — `GhosttyControlCore` has no case for it |
+| `OSC 777;notify` | `.desktop_notification` | no — same |
+| `OSC 133;A/B/C` | marks, held internally | no — `ScrollMarks()` returns an empty vector |
+| `OSC 133;D` | `.command_finished` | no — no case for it |
+| `OSC 9;12` | *nothing* — ghostty has no ConEmu sub 12 | no |
+| `OSC 1337;SetMark` | *nothing* — `unimplemented OSC 1337: SetMark` | no |
+| `OSC 633;Completions` | *nothing* — no OSC 633 state at all | no |
+| `OSC 9001;CmdNotFound` | *nothing* — no OSC 9001 state at all | no |
+
+So the picture is not "WT's sequences are unsupported". Three of the four
+working-directory spellings were parsed correctly and thrown away one layer
+later, the taskbar-progress sequence reaches the pane already, and the genuinely
+absent ones are the shell-integration set and the two proprietary protocols.
+
+#### The cause
+
+`src/termio/stream_handler.zig`, `reportPwd`:
+
+```zig
+if (builtin.os.tag == .windows) {
+    log.warn("reportPwd unimplemented on windows", .{});
+    return;
+}
+```
+
+That return is before `terminal.setPwd` and before the `.pwd_change` surface
+message, so no `.pwd` action was ever dispatched and
+`GhosttyControlCore`'s `GHOSTTY_ACTION_PWD` case — which has existed since
+Phase 5 — never ran. `ICoreState::WorkingDirectory` stayed the empty string,
+and `Utils::IsValidDirectory("")` is false, so every consumer took its
+fallback: a duplicated tab or split opened at the profile's
+`startingDirectory` instead of where the shell was.
+
+Nothing above it was wrong. The OSC parser handles all three spellings and
+routes them to the same `report_pwd` command
+(`terminal/osc/parsers/osc9.zig` for `9;9`, `iterm2.zig` for `CurrentDir`), and
+ConPTY relays them from the child unchanged.
+
+#### The fix
+
+`termio: report the pwd on Windows, from OSC 7, OSC 9;9 or OSC 1337`
+(ghostty patch 0044). The posix path cannot simply be reused: it requires a
+`file:` or `kitty-shell-cwd:` scheme and a present host, and `OSC 9;9` and
+`OSC 1337;CurrentDir` carry a bare native path with neither. The Windows path
+takes both shapes and always stores a native path, so the embedder does not
+have to know which sequence produced it:
+
+- a `file:`/`kitty-shell-cwd:` URI is parsed, its host validated as local — with
+  an absent or empty host meaning this machine, per RFC 8089, which is the form
+  `file:///C:/src` shell integration emits — and its path percent-decoded and
+  un-rooted (`/C:/src` → `C:/src`);
+- a native path is taken as-is, with ConEmu's optional surrounding quotes
+  stripped;
+- either way `/` becomes `\`, and the result must be drive-absolute or UNC and
+  free of characters Windows forbids in a path, or it is refused with a warning
+  rather than handed on to something that will pass it to `CreateProcess`.
+
+A second, smaller thing turned up beside it and is fixed in the same release:
+`GhosttyControlCore`'s constructor seeded the pane's title from the profile the
+way cascadia does, but not its working directory (`ControlCore.cpp:112`,
+GH#8969). Terminal patch 0061.
+
+#### What was measured
+
+**Through the DLL.** The feed run above: OSC 7 `file:///C:/src/winterm-ghostty`,
+OSC 9;9 `"C:\Windows\System32"` and OSC 1337 `CurrentDir=C:\Users\darre` each
+produced exactly one `.pwd` action carrying the native path. The negative
+controls refused: `file://example.com/C:/evil` logged *OSC 7 host
+(example.com) must be local*, and `9;9;"relative\path"` logged *pwd is not an
+absolute path*.
+
+**Through Windows Terminal, without a keyboard.** The user was at the machine,
+so the SendKeys route was unavailable (it is, correctly, refused —
+see the headless-driving notes). Instead: the portable build with
+`"firstWindowPreference": "persistedWindowLayout"`, a profile whose
+`startingDirectory` is the terminal's own folder and whose command line runs
+one script that emits one OSC and idles, closed with `WM_CLOSE` to its hwnd.
+WT then writes each pane's `GetNewTerminalArgs` into `settings\state.json`, and
+that `startingDirectory` **is** `ICoreState::WorkingDirectory` when the control
+has one (`TerminalPaneContent.cpp:94`). No foreground required.
+
+| what the pane emitted | `startingDirectory` in `state.json` |
+|---|---|
+| `OSC 9;9;"…\pwd-conemu"` | `…\pwd-conemu` |
+| `OSC 7;file:///…/pwd-osc7` | `…\pwd-osc7` |
+| nothing at all | `…\terminal-0.1.0.0` — the profile's own |
+
+The first two differ from the profile's `startingDirectory`, which is what
+makes them evidence: the value can only have come from the sequence.
+
+#### What this does not fix
+
+Still absent, and each needs its own decision rather than a follow-on commit:
+
+- **Shell-integration marks.** ghostty tracks `OSC 133` prompts internally and
+  even dispatches `.command_finished`, but `GhosttyControlCore::ScrollMarks`,
+  `SelectCommand` and `CommandHistory` are stubs. This is the Phase 5 obligation
+  map's "needs a PowerShell integration script" row, not a regression.
+- **Desktop notifications.** `.desktop_notification` is dispatched and dropped;
+  wiring it is a WT-side case statement plus a decision about what a pane is
+  allowed to raise.
+- **`OSC 9001;CmdNotFound` and `OSC 633;Completions`.** libghostty has no parser
+  state for either, so these need a new OSC state *and* a new C-API action —
+  a public API shape, which under PROCESS.md rule 3 is escalated, not decided
+  in passing. Both are WT-proprietary protocols whose value upstream is
+  questionable; a `DECISION-NEEDED` entry belongs with them if they are wanted.

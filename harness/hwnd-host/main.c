@@ -86,6 +86,15 @@ static bool action_cb(ghostty_app_t app, ghostty_target_s target,
         fprintf(stderr, "[search] selected=%zd\n", (ssize_t)action.action.search_selected.selected);
         fflush(stderr);
         return true;
+    // The working directory a shell reports with OSC 7, OSC 9;9 or
+    // OSC 1337;CurrentDir. Windows Terminal turns this into
+    // ICoreState::WorkingDirectory, which is what a duplicated tab or split
+    // opens in, so a feed run can check the three sequences agree on a path
+    // without a window anyone has to look at.
+    case GHOSTTY_ACTION_PWD:
+        fprintf(stderr, "[pwd] %s\n", action.action.pwd.pwd);
+        fflush(stderr);
+        return true;
     default:
         break;
     }

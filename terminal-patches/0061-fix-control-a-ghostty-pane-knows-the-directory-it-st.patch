@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 18 Aug 2026 17:55:12 -0700
+Subject: [PATCH] fix(control): a ghostty pane knows the directory it started
+ in (KD-22)
+
+ControlCore pre-seeds the terminal's working directory from the profile's
+startingDirectory the moment it is constructed (GH#8969, ControlCore.cpp:112),
+so the pane has an answer before the shell has said anything. GhosttyControlCore
+seeded the title the same way but not the directory, leaving
+ICoreState::WorkingDirectory empty until an OSC arrived - and, before the
+libghostty patch in this release, forever.
+
+The consumers that fall back to the profile's own setting when the control has
+nothing (TerminalPage's duplicate-tab and split paths) were unaffected either
+way. The one that does not is the suggestions palette, which passes
+control.WorkingDirectory() through as the context for a recall
+(AppActionHandlers.cpp:1449).
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/cascadia/TerminalControl/GhosttyControlCore.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 5a723a2f0..b79502edc 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -42,6 +42,13 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         if (_settings)
+         {
+             _title = _settings.StartingTitle();
++
++            // GH#8969, the same pre-seed cascadia does: until the shell reports
++            // a directory the pane's is the one it was started in. Without this
++            // a duplicated tab or split off a ghostty pane opens wherever the
++            // profile says rather than where the pane actually is, and it stays
++            // wrong for as long as the shell reports nothing.
++            _workingDirectory = _settings.StartingDirectory();
+         }
+ 
+         Connection(connection);

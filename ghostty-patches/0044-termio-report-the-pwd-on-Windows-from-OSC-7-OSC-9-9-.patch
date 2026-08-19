@@ -1,0 +1,228 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 18 Aug 2026 17:55:01 -0700
+Subject: [PATCH] termio: report the pwd on Windows, from OSC 7, OSC 9;9 or OSC
+ 1337
+
+reportPwd() returned early on Windows with "unimplemented", so every sequence
+a shell uses to tell the terminal where it is was parsed and then dropped. An
+embedder therefore never saw a .pwd action, and Windows Terminal's
+ICoreState::WorkingDirectory - what a duplicated tab or split opens in -
+stayed empty for the life of the pane.
+
+Windows reports the pwd in two shapes, and all three sequences that carry it
+arrive here as the same report_pwd command: OSC 7 gives a file: URI, while
+ConEmu's OSC 9;9 and iTerm2's OSC 1337;CurrentDir give a native path, which
+the posix path would reject for having no scheme. Accept either and always
+store a native path, so an embedder can hand what it reads back to
+CreateProcess without knowing which sequence produced it.
+
+The URI's host is validated as it is on posix - anyone on the far end of an
+SSH session can send this - with the addition that RFC 8089 makes an absent or
+empty host mean the local machine, which is the form Windows shell integration
+emits. A path that is neither drive-absolute nor UNC, or that holds a
+character Windows forbids in a path, is refused rather than passed on.
+
+Measured through the shipped DLL with harness/hwnd-host's feed mode:
+OSC 7 file:///C:/src/winterm-ghostty, OSC 9;9 "C:\Windows\System32" and
+OSC 1337;CurrentDir=C:\Users\darre each produce one .pwd action carrying the
+native path; a remote host and a relative path are refused with a warning.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/termio/stream_handler.zig | 171 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 168 insertions(+), 3 deletions(-)
+
+diff --git a/src/termio/stream_handler.zig b/src/termio/stream_handler.zig
+index b8322b261..3e8f060ea 100644
+--- a/src/termio/stream_handler.zig
++++ b/src/termio/stream_handler.zig
+@@ -1046,9 +1046,8 @@ pub const StreamHandler = struct {
+             return;
+         }
+ 
+-        if (builtin.os.tag == .windows) {
+-            log.warn("reportPwd unimplemented on windows", .{});
+-            return;
++        if (comptime builtin.os.tag == .windows) {
++            return self.reportPwdWindows(url);
+         }
+ 
+         // Attempt to parse this file-style URI using options appropriate
+@@ -1118,6 +1117,43 @@ pub const StreamHandler = struct {
+         }
+     }
+ 
++    /// Windows shells report the pwd in two different shapes and both reach
++    /// us as `report_pwd`: OSC 7 carries a `file:` URI, while ConEmu's
++    /// OSC 9;9 - the sequence Windows shell integration actually emits, and
++    /// the one Windows Terminal has supported the longest - carries a native
++    /// path. OSC 1337;CurrentDir is a native path too.
++    ///
++    /// We accept either shape and always store a native path, so an embedder
++    /// can hand what it reads back to CreateProcess without knowing which
++    /// sequence produced it.
++    fn reportPwdWindows(self: *StreamHandler, url: []const u8) !void {
++        var arena: std.heap.ArenaAllocator = .init(self.alloc);
++        defer arena.deinit();
++        var stack_alloc = std.heap.stackFallback(1024, arena.allocator());
++
++        const path = (windowsPwdPath(stack_alloc.get(), url) catch |err| {
++            log.warn("error normalizing pwd err={}", .{err});
++            return;
++        }) orelse return;
++
++        log.debug("terminal pwd: {s}", .{path});
++        try self.terminal.setPwd(path);
++
++        // Report it to the surface. If creating our write request fails
++        // then we just ignore it.
++        if (apprt.surface.Message.WriteReq.init(self.alloc, path)) |req| {
++            self.surfaceMessageWriter(.{ .pwd_change = req });
++        } else |err| {
++            log.warn("error notifying surface of pwd change err={}", .{err});
++        }
++
++        // If we haven't seen a title, use our pwd as the title.
++        if (!self.seen_title) {
++            try self.windowTitle(path);
++            self.seen_title = false;
++        }
++    }
++
+     fn colorOperation(
+         self: *StreamHandler,
+         op: terminal.osc.color.Operation,
+@@ -1465,3 +1501,132 @@ pub const StreamHandler = struct {
+         self.surfaceMessageWriter(.{ .progress_report = report });
+     }
+ };
++
++/// Normalize an OSC 7 / OSC 9;9 / OSC 1337 CurrentDir payload into an absolute
++/// native Windows path. Returns null - having logged why - for a payload we
++/// should not trust. The returned slice is owned by `alloc`.
++///
++/// The two shapes we accept:
++///
++///   * A `file:` (or `kitty-shell-cwd:`) URI, whose path is rooted and
++///     percent-encoded: `file:///C:/src`, `file://host/C:/Program%20Files`.
++///   * A native path, which ConEmu documents as quoted: `"C:\src"`.
++fn windowsPwdPath(alloc: Allocator, url: []const u8) !?[]const u8 {
++    const is_kitty_uri = std.ascii.startsWithIgnoreCase(url, "kitty-shell-cwd:");
++    const is_uri = is_kitty_uri or std.ascii.startsWithIgnoreCase(url, "file:");
++
++    var path: []const u8 = path: {
++        if (!is_uri) break :path url;
++
++        const uri: std.Uri = internal_os.uri.parse(url, .{
++            .mac_address = true,
++            .raw_path = is_kitty_uri,
++        }) catch |err| {
++            log.warn("invalid url in OSC 7: {}", .{err});
++            return null;
++        };
++
++        // Anyone on the far end of an SSH session can send this, so a host
++        // that is named has to name this machine. RFC 8089 makes an absent
++        // or empty host mean the local machine, and that is the form Windows
++        // shell integration emits: `file:///C:/src`.
++        const host: []const u8 = if (uri.host) |h| try h.toRawMaybeAlloc(alloc) else "";
++        if (host.len > 0) {
++            const host_valid = internal_os.hostname.isLocal(host) catch |err| {
++                log.warn("failed to get hostname for OSC 7 validation: {}", .{err});
++                return null;
++            };
++            if (!host_valid) {
++                log.warn("OSC 7 host ({s}) must be local", .{host});
++                return null;
++            }
++        }
++
++        break :path try uri.path.toRawMaybeAlloc(alloc);
++    };
++
++    // ConEmu documents OSC 9;9's path as quoted - `9;9;"C:\src"` - but says
++    // it accepts the bare form too, and so do we.
++    if (path.len >= 2 and path[0] == '"' and path[path.len - 1] == '"') {
++        path = path[1 .. path.len - 1];
++    }
++
++    // A URI path is rooted, so a drive path arrives with a leading slash.
++    if (path.len >= 3 and path[0] == '/' and path[2] == ':') path = path[1..];
++
++    // Either shape may use forward slashes. The Win32 file APIs take those,
++    // but an embedder that displays or compares this wants the separator the
++    // rest of the system uses.
++    const native = try alloc.dupe(u8, path);
++    std.mem.replaceScalar(u8, native, '/', '\\');
++
++    // Windows forbids these characters in a path, so a pwd carrying one is
++    // a mis-parse rather than a directory. This is what stops a shell that
++    // quotes badly - ConEmu's own docs give `"C:\a path "with" quotes"` as
++    // the case its quoting cannot express - from reaching an embedder that
++    // would hand the result to CreateProcess.
++    for (native) |c| {
++        if (c >= 0x20 and std.mem.indexOfScalar(u8, "<>\"|?*", c) == null) continue;
++        log.warn("pwd holds a character a path cannot, ignoring: {s}", .{native});
++        return null;
++    }
++
++    if (!isAbsoluteWindowsPath(native)) {
++        log.warn("pwd is not an absolute path, ignoring: {s}", .{native});
++        return null;
++    }
++
++    return native;
++}
++
++/// True for a drive-absolute (`C:\...`) or UNC (`\\host\share`) path. False
++/// for the drive-relative (`C:src`) and rooted (`\src`) forms, which name a
++/// directory only together with state we do not have.
++fn isAbsoluteWindowsPath(path: []const u8) bool {
++    if (path.len >= 2 and path[0] == '\\' and path[1] == '\\') return true;
++    return path.len >= 3 and
++        std.ascii.isAlphabetic(path[0]) and
++        path[1] == ':' and
++        path[2] == '\\';
++}
++
++test "windowsPwdPath" {
++    const testing = std.testing;
++
++    const cases: []const struct {
++        url: []const u8,
++        want: ?[]const u8,
++    } = &.{
++        // OSC 7, the shape a shell integration script emits.
++        .{ .url = "file:///C:/src/winterm-ghostty", .want = "C:\\src\\winterm-ghostty" },
++        .{ .url = "file:///C:/Program%20Files", .want = "C:\\Program Files" },
++        .{ .url = "file://localhost/C:/src", .want = "C:\\src" },
++        .{ .url = "file://example.com/C:/src", .want = null },
++
++        // ConEmu OSC 9;9 and iTerm2 OSC 1337;CurrentDir, quoted or not.
++        .{ .url = "\"C:\\src\\winterm-ghostty\"", .want = "C:\\src\\winterm-ghostty" },
++        .{ .url = "C:\\src\\winterm-ghostty", .want = "C:\\src\\winterm-ghostty" },
++        .{ .url = "\"D:/\"", .want = "D:\\" },
++        .{ .url = "\\\\server\\share\\dir", .want = "\\\\server\\share\\dir" },
++
++        // Not a directory we can act on.
++        .{ .url = "src", .want = null },
++        .{ .url = "\"C:\\a path \"with\" quotes\"", .want = null },
++        .{ .url = "\\src", .want = null },
++        .{ .url = "C:src", .want = null },
++        .{ .url = "file:///", .want = null },
++    };
++
++    for (cases) |case| {
++        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
++        defer arena.deinit();
++
++        const got = try windowsPwdPath(arena.allocator(), case.url);
++        errdefer std.log.err("url={s} got={?s}", .{ case.url, got });
++        if (case.want) |want| {
++            try testing.expectEqualStrings(want, got.?);
++        } else {
++            try testing.expect(got == null);
++        }
++    }
++}
