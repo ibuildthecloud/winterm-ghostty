@@ -32,9 +32,14 @@ Nothing switches engine by itself. Add `"engine": "ghostty"` to a profile — or
 
 To confirm a pane is really using it, open the search box (`Ctrl+Shift+F`): on a ghostty pane the regex and case toggles are greyed out.
 
-## New in 0.2.8
+## New in 0.2.9
 
-The biggest release since 0.2.0, and most of it is a pane behaving like the cascadia pane beside it rather than nearly like it.
+<!-- 0.2.8 was tagged and never released: its build died on a duplicated
+     -Dfont-backend, fixed in the same commit that renumbered this. The tag
+     is left in place rather than moved, because a pushed ref is not
+     something this project rewrites. -->
+
+The biggest release since 0.2.0, and most of it is a pane behaving like the cascadia pane beside it rather than nearly like it. (There is no 0.2.8: it was tagged, its build failed before publishing anything, and the tag was left where it was rather than moved.)
 
 ### The shell's working directory now reaches the terminal
 

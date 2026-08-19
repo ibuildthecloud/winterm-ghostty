@@ -82,7 +82,16 @@ $zigArgs += "-Doptimize=$Optimize"
 if (-not $Test) { $zigArgs += '-Dapp-runtime=none' }
 if ($Target)    { $zigArgs += "-Dtarget=$Target" }
 if ($Cpu)       { $zigArgs += "-Dcpu=$Cpu" }
-if ($FontBackend) { $zigArgs += "-Dfont-backend=$FontBackend" }
+# Only supply the default if the caller has not named one through $Rest.
+# Zig reads a repeated enum option as a *list* and fails with "Expected
+# -Dfont-backend to be an enum, but received a list" - which is how v0.2.8's
+# release build died, months after release.yml and this script were last
+# edited together. Giving the parameter a default fixed the two disagreeing;
+# it also made the workflow's own copy of the flag a duplicate rather than a
+# necessity, and nothing noticed until the next tag was pushed.
+if ($FontBackend -and -not ($Rest | Where-Object { $_ -like '-Dfont-backend=*' })) {
+    $zigArgs += "-Dfont-backend=$FontBackend"
+}
 if ($Rest)      { $zigArgs += $Rest }
 
 Push-Location $GhosttyRoot

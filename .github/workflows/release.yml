@@ -129,7 +129,7 @@ jobs:
         # walk out of it. KD-12's dump showed exactly that: one real frame and
         # then nonsense. A release that cannot be debugged is one this project
         # cannot support.
-        run: ./scripts/build-ghostty.ps1 -Optimize ReleaseFast -Dfont-backend=directwrite_harfbuzz -Dstrip=false
+        run: ./scripts/build-ghostty.ps1 -Optimize ReleaseFast -Dstrip=false
 
       - name: Build the package (Release branding)
         shell: pwsh
