@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Tue, 18 Aug 2026 18:25:45 -0700
+Subject: [PATCH] feat(control): desktop notifications on a ghostty pane
+ (KD-22, GD-19)
+
+libghostty dispatched .desktop_notification for OSC 777;notify and for
+iTerm2's bare OSC 9;<text>, and GhosttyControlCore had no case for it, so a
+program asking for a toast on a ghostty pane got nothing.
+
+Raising the same ShowNotification event ControlCore raises is the whole job:
+the toast, the rate limit between toasts, the rule that a pane you are looking
+at does not notify you about itself, and clicking a toast to summon its window
+all live in TerminalPage and know nothing about which engine raised the event.
+An empty title is not papered over here either - ghostty leaves it empty for
+OSC 9, which carries only a body, and Tab.cpp fills it in with the tab's own.
+
+The user's switch is the profile's `compatibility.allowOSC777`, which is off
+by default. It is translated to ghostty's `desktop-notifications`, whose
+default is the opposite, so leaving it alone would have given a ghostty pane
+toasts that the cascadia pane beside it, under the same profile, refuses.
+The gate lives in the translator rather than in the action handler because
+Surface.zig tests that config before dispatching the action: with it off the
+pane does not do the work, and there is no second gate to disagree with the
+first. The inverted defaults are pinned by a unit test.
+
+A trace at the boundary comes with it. A notification has four places it can
+be dropped - the profile, ghostty's rate limit, WT's focus rule and the toast
+API - and only the first is visible from outside, so the line that says the
+action reached WT is what tells the four apart. Sizes, not the text: the
+debugger channel is the wrong place for what a program chose to say to a user.
+
+Measured with scripts/probe-notify.ps1 on a portable build, both ways round:
+allowed -> `[ghostty] notification title=11 body=14 chars`, matching the
+sequence that was sent; refused -> nothing, with the other ghostty traces
+still arriving so the silence is evidence rather than a probe that saw
+nothing. unitControl 69 -> 70.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 34 +++++++++++++++++++
+ .../GhosttySettingsTranslator.cpp             | 19 +++++++++++
+ .../GhosttySettingsTests.cpp                  | 20 +++++++++++
+ 3 files changed, 73 insertions(+)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index b79502edc..381aa0894 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -549,6 +549,40 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             return true;
+         }
+ 
++        // OSC 777;notify, and iTerm2's bare OSC 9;<text>. Everything a
++        // notification needs after this point is TerminalPage's and knows
++        // nothing about engines - the toast itself, the rate limit, the "do
++        // not notify about the pane you are already looking at" rule, and
++        // clicking the toast to summon the window - so raising the same event
++        // ControlCore raises is the whole job.
++        //
++        // An empty title is not a defect to paper over here: ghostty leaves it
++        // empty for OSC 9, which carries only a body, and Tab.cpp fills it in
++        // with the tab's own title.
++        //
++        // The user's switch is the profile's `compatibility.allowOSC777`,
++        // which GhosttySettingsTranslator hands to ghostty as
++        // `desktop-notifications`. A pane whose profile says no therefore
++        // never reaches this case at all - Surface.zig tests the config before
++        // dispatching the action - so there is deliberately no second gate
++        // here to disagree with the first.
++        case GHOSTTY_ACTION_DESKTOP_NOTIFICATION:
++        {
++            const auto title = til::u8u16(std::string_view{ action.action.desktop_notification.title });
++            const auto body = til::u8u16(std::string_view{ action.action.desktop_notification.body });
++            // A notification that does not appear has four places it can have
++            // been dropped - the profile, ghostty's own rate limit, WT's "you
++            // are looking at that pane already" rule, and the toast API itself -
++            // and only this one is ours. Sizes rather than the text: the
++            // debugger channel is the wrong place for what a program chose to
++            // say to the user.
++            _trace(L"notification title=%u body=%u chars", static_cast<unsigned>(title.size()), static_cast<unsigned>(body.size()));
++            _raiseOnUiThread([this, title = winrt::hstring{ title }, body = winrt::hstring{ body }]() {
++                ShowNotification.raise(*this, winrt::make<implementation::ShowNotificationEventArgs>(title, body));
++            });
++            return true;
++        }
++
+         case GHOSTTY_ACTION_PROGRESS_REPORT:
+         {
+             const auto state = static_cast<size_t>(action.action.progress_report.state);
+diff --git a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+index 6e6d709f3..ce2410edd 100644
+--- a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
++++ b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+@@ -129,6 +129,25 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // clipboard - measured, because that was the regression to fear.
+         set("selection-trim-line", "false");
+ 
++        // --- Desktop notifications ----------------------------------------
++        // WT's switch is the profile's `compatibility.allowOSC777`, and it is
++        // **off** by default: a program gets to raise a toast only if the user
++        // said it may. ghostty's `desktop-notifications` is the same switch
++        // with the opposite default, so leaving it alone would have given a
++        // ghostty pane notifications that the cascadia pane beside it, under
++        // the same profile, refuses.
++        //
++        // The gate belongs here rather than in the action handler because
++        // ghostty already has one in the right place: Surface.zig tests this
++        // config before dispatching the action, so with it off the pane does
++        // not do the work and the embedder has nothing to decline.
++        //
++        // One difference comes with turning it on, and it is a documented diff
++        // rather than a hidden one: ghostty also honours iTerm2's bare
++        // `OSC 9;<text>` as a notification, which WT's parser does not
++        // implement at all.
++        set("desktop-notifications", settings.AllowOscNotifications() ? "true" : "false");
++
+         // --- Cursor -------------------------------------------------------
+         // Found by hand: a ghostty pane drew a block where the cascadia pane
+         // beside it drew a bar, because the profile's cursorShape was never
+diff --git a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+index a62078f1c..175b406c9 100644
+--- a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
++++ b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+@@ -42,6 +42,7 @@ namespace ControlUnitTests
+         TEST_METHOD(WordDelimitersReachTheEngine);
+         TEST_METHOD(TripleClickHighlightsTheWholeLine);
+         TEST_METHOD(UrlDetectionFollowsTheProfile);
++        TEST_METHOD(DesktopNotificationsFollowTheProfile);
+         TEST_METHOD(CursorShapeIsForwarded);
+         TEST_METHOD(IntenseTextStyleIsForwarded);
+         TEST_METHOD(BackslashesAreDoubledForTheWordCharsFieldOnly);
+@@ -235,6 +236,25 @@ namespace ControlUnitTests
+                        L"a profile that turns URL detection off must turn ghostty's off too");
+     }
+ 
++    // The two engines default this setting opposite ways round, which is the
++    // whole reason it has to be forwarded rather than assumed. WT's
++    // `compatibility.allowOSC777` is off unless the user turns it on;
++    // ghostty's `desktop-notifications` is on unless it is turned off. Left
++    // alone, a ghostty pane raised toasts that the cascadia pane beside it,
++    // under the same profile, would have refused.
++    void GhosttySettingsTests::DesktopNotificationsFollowTheProfile()
++    {
++        const auto off = Control::implementation::TranslateGhosttySettings(*_settings());
++        VERIFY_IS_TRUE(_has(off, "desktop-notifications", "false"),
++                       L"WT's default is off, so ghostty's default must be turned off too");
++
++        auto settings = _settings();
++        settings->AllowOscNotifications(true);
++        const auto on = Control::implementation::TranslateGhosttySettings(*settings);
++        VERIFY_IS_TRUE(_has(on, "desktop-notifications", "true"),
++                       L"a profile that allows OSC 777 must let the engine raise one");
++    }
++
+     // Found by hand: a ghostty pane drew a block cursor beside a cascadia pane
+     // drawing a bar, because the profile's cursorShape was never forwarded.
+     //

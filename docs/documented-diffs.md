@@ -496,3 +496,38 @@ truthful answer, which it does.
   between the two panes.
 - **`IsBufferRowInViewport`** is implemented and correct, from the scrollbar
   action's own numbers.
+
+### GD-19 — A ghostty pane takes one more notification sequence than cascadia — **implemented 2026-08-18**
+
+Desktop notifications work on a ghostty pane, gated by the same profile switch
+cascadia uses — `compatibility.allowOSC777`, which is **off** by default. With
+it on, the two engines differ by one sequence.
+
+| sequence | cascadia | ghostty pane |
+|---|---|---|
+| `OSC 777;notify;title;body` | a toast | a toast |
+| `OSC 9;<text>` | *unknown sequence* | a toast, title from the tab |
+
+`OSC 9` is iTerm2's notification, and WT's parser does not implement it at all:
+`OSC 9` reaches `DoConEmuAction`, which knows sub-parameters 4, 9 and 12 and
+calls `UnknownSequence` for anything else — so `OSC 9;Build finished` is
+discarded. ghostty's `OSC 9` parser tries the ConEmu sub-parameters first and
+treats anything else as an iTerm2 notification with an empty title, which
+`Tab.cpp:1219` fills in with the tab's own.
+
+The extra sequence is not forwarded to cascadia, and it is not suppressed on a
+ghostty pane either. Suppressing it would mean a second gate in
+`GhosttyControlCore` disagreeing with the one in `Surface.zig` — and the
+payload carries no marker saying which sequence produced it, so the gate could
+only be approximate. It is one sequence more permissive under a switch the user
+has to turn on deliberately, which is the trade this records.
+
+Everything downstream is shared and unchanged: the toast itself, the rate limit
+between toasts, the rule that a pane you are looking at does not notify you
+about itself, and clicking a toast to summon its window all live in
+`TerminalPage` and know nothing about which engine raised the event.
+
+**Verify it** with `scripts/probe-notify.ps1`, which runs a portable build
+whose pane emits one `OSC 777` and watches the debugger channel for the trace
+that says the action reached WT — a suppressed notification and one that was
+never raised look identical from outside, so the trace is the observable.

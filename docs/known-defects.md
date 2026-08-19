@@ -2061,9 +2061,22 @@ Still absent, and each needs its own decision rather than a follow-on commit:
   even dispatches `.command_finished`, but `GhosttyControlCore::ScrollMarks`,
   `SelectCommand` and `CommandHistory` are stubs. This is the Phase 5 obligation
   map's "needs a PowerShell integration script" row, not a regression.
-- **Desktop notifications.** `.desktop_notification` is dispatched and dropped;
-  wiring it is a WT-side case statement plus a decision about what a pane is
-  allowed to raise.
+- ~~**Desktop notifications.**~~ **Done, 2026-08-18** (terminal patch 0062), at
+  the user's direction and in the same session. `GhosttyControlCore` raises the
+  same `ShowNotification` event `ControlCore` raises, so the toast, the rate
+  limit, the "you are looking at that pane already" rule and click-to-summon are
+  `TerminalPage`'s and unchanged. The gate is the profile's
+  `compatibility.allowOSC777` — **off by default** — translated to ghostty's
+  `desktop-notifications`, which `Surface.zig:1116` tests *before* dispatching,
+  so a pane that is not allowed to notify does not do the work. The two engines
+  default that setting opposite ways round, which is why the translation is
+  pinned by a unit test rather than assumed. One difference comes with it and is
+  written up as [GD-19](documented-diffs.md): with the switch on, a ghostty pane
+  also honours iTerm2's bare `OSC 9;<text>`, which WT's parser discards.
+  Measured with `scripts/probe-notify.ps1`, both ways round: allowed →
+  `notification title=11 body=14 chars` on the debugger channel; refused →
+  nothing, with the ghostty traces still flowing so the silence is evidence
+  rather than an absent probe.
 - **`OSC 9001;CmdNotFound` and `OSC 633;Completions`.** libghostty has no parser
   state for either, so these need a new OSC state *and* a new C-API action —
   a public API shape, which under PROCESS.md rule 3 is escalated, not decided
