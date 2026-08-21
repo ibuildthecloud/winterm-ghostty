@@ -32,6 +32,23 @@ Nothing switches engine by itself. Add `"engine": "ghostty"` to a profile — or
 
 To confirm a pane is really using it, open the search box (`Ctrl+Shift+F`): on a ghostty pane the regex and case toggles are greyed out.
 
+## New in 0.2.10
+
+### Ctrl+D and Enter answer a pane whose process has exited
+
+A pane whose child has exited prints the message it has always printed:
+
+```
+[process exited with code 56 (0x00000038)]
+You can now close this terminal with Ctrl+D, or press Enter to restart.
+```
+
+On a ghostty pane neither key did anything, so the only way out was the mouse. Both now work: **Enter restarts the pane in place**, keeping the scrollback you just read the exit code from, and **Ctrl+D closes it**.
+
+The message comes from the connection, which is shared, so it appeared on both engines and promised the same two things on both — only the cascadia pane kept the promise. Cascadia answers those keys from the *character* the key produced, a path a ghostty pane never reaches: the engine encodes Enter and Ctrl+D itself and reports the key handled, so no character event follows. A ghostty pane now answers on the key itself, before the engine sees it, and only while the connection is closed — both keys still go to the shell in a live pane ([KD-24](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/known-defects.md)).
+
+One limit worth knowing: a restarted ghostty pane does not clear terminal state the dead program left behind, because libghostty has no reset that spares the scrollback. A shell that exited normally leaves nothing behind, which is the case the message is about; a program killed while drawing full-screen could leave the new shell in a strange mode. Closing and opening the pane is the way out of that.
+
 ## New in 0.2.9
 
 <!-- 0.2.8 was tagged and never released: its build died on a duplicated
@@ -140,7 +157,7 @@ Its own package identity (`WintermGhostty`), its own execution alias (`wtg.exe`)
 - **x64 only.** Zig 0.16.0 cannot target `aarch64-windows-msvc` at all, so there is no ARM64 build to ship.
 - **KD-05** — the Windows cursor-blink settings are ignored, including turning blinking off. A focused ghostty pane blinks at a fixed 600 ms and presents a frame for each blink, where a cascadia pane obeys the system setting.
 - **KD-10** — a focused pane presents twice a second for its cursor blink, but the drawn cursor barely toggles: measured at ten blink wakes with the pixels unchanged. The blink is not reaching the screen, which also means those presents are buying nothing.
-- **No shell-integration marks.** `OSC 133` prompt marks are tracked by the engine but not surfaced, so the scrollbar marks, "scroll to previous command" and command history are empty on a ghostty pane. Setting a shell's working directory (new in 0.2.8) works; the rest of shell integration does not yet.
+- **No shell-integration marks.** `OSC 133` prompt marks are tracked by the engine but not surfaced, so the scrollbar marks, "scroll to previous command" and command history are empty on a ghostty pane. Setting a shell's working directory (new in 0.2.9) works; the rest of shell integration does not yet.
 - **Two `compatibility.*` switches are still ignored**: `allowDECNKM` (which defaults *off*, so a ghostty pane differs there for everyone) and `kittyKeyboardMode` in its off direction. Both need a setting libghostty does not have yet.
 
 Each defect in `docs/known-defects.md` records what was measured rather than what was assumed, and what would tell the remaining hypotheses apart.
