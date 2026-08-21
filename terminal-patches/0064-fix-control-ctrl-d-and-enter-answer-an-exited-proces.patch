@@ -1,0 +1,273 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Fri, 21 Aug 2026 13:07:24 -0700
+Subject: [PATCH] fix(control): ctrl+d and enter answer an exited process
+ (KD-24)
+
+Reported by the user, from use. A pane whose child has exited prints
+
+  [process exited with code 56 (0x00000038)]
+  You can now close this terminal with Ctrl+D, or press Enter to restart.
+
+and on a ghostty pane neither key does anything. The message comes from the
+connection, so it appears on both engines and promises the same two things on
+both; only cascadia keeps the promise.
+
+Both keys are the host's, not the terminal's. Cascadia answers them in
+ControlCore::SendCharEvent: with the connection at >= Closed, 0x04 raises
+CloseTerminalRequested and CR raises RestartTerminalRequested.
+
+A ghostty pane never reaches that path, which is why copying the branch into
+GhosttyControlCore::SendCharEvent alone would have looked right and changed
+nothing. On cascadia, Terminal::SendKeyEvent returns no output for a key down
+the layout maps to a character, so the key is reported unhandled and Windows
+raises CharacterReceived. ghostty_surface_key encodes Enter and ctrl+d itself
+and returns true, and TermControl suppresses the character event for a handled
+key - so SendCharEvent is never called for either key.
+
+So the answer goes on the key path, ahead of the surface. GhosttyExitKeyFor is
+a pure function - unit tested with no surface, no engine and no keyboard, like
+the other two rules in that file - and decides which promise a press is:
+
+  enter, shift+enter        restart
+  ctrl+d, ctrl+shift+d      close
+  ctrl+enter                nothing; it is LF, and cascadia does not restart
+  alt+enter, alt+d          nothing; alt+enter is WT's fullscreen binding
+  anything else             goes to the surface, as before
+
+Keyed on the virtual key rather than on the produced character because
+GhosttyKeyTextFor drops every control character on purpose, so ctrl+d and Enter
+both come back empty and there is nothing to compare. Two knowingly-small
+differences from cascadia's character rule follow: ctrl+m restarts a cascadia
+pane and not a ghostty one, and a layout that moves `d` closes on the physical
+key. Both are recorded in the code.
+
+The release is swallowed with the press, so a surface that has just been told
+to go away is not handed a lone key-up. The check sits ahead of the read-only
+guard deliberately: a read-only pane whose process is gone still has to be
+closable, which is cascadia's behaviour too. SendCharEvent gets the same two
+answers matched on the character, for the IME commit or injected VK_PACKET that
+would arrive without a key event we recognised.
+
+What restart still does not do: TerminalPage::_restartPaneConnection calls
+HardResetWithoutErase() first, and GhosttyControlCore's is a no-op because
+libghostty has no non-erasing hard reset - its `reset` binding action erases,
+which is the one thing that name forbids. A shell that exited normally leaves
+no dirty modes, so the case the message is about is fine; a client killed
+mid-alt-screen is not. That needs a new C entry point, so it is escalated
+rather than decided here, and KD-24 records it.
+
+unitControl 70 -> 71.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 54 +++++++++++++++++++
+ .../TerminalControl/GhosttyKeyTranslator.cpp  | 41 ++++++++++++++
+ .../TerminalControl/GhosttyKeyTranslator.h    | 19 +++++++
+ .../UnitTests_Control/GhosttyKeyTests.cpp     | 38 +++++++++++++
+ 4 files changed, 152 insertions(+)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 381aa0894..961d24422 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -919,6 +919,40 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+                                              const ControlKeyStates modifiers,
+                                              const bool keyDown)
+     {
++        // Once the child has exited, ctrl+d and Enter are the host's keys, not
++        // the terminal's - the connection has just printed a message promising
++        // that they close the pane and restart it. Cascadia keeps that promise
++        // in SendCharEvent, which a ghostty pane never reaches: libghostty
++        // encodes Enter and ctrl+d itself and reports the key handled, so no
++        // CharacterReceived event follows. Answered here instead, ahead of the
++        // surface, and the release is swallowed with the press so the dead
++        // surface is not handed a lone key-up. See KD-24.
++        //
++        // Before the read-only check on purpose: a read-only pane whose process
++        // is gone still has to be closable, which is cascadia's behaviour too.
++        if (_connection && _connection.State() >= TerminalConnection::ConnectionState::Closed)
++        {
++            switch (GhosttyExitKeyFor(vkey, modifiers.Value()))
++            {
++            case GhosttyExitKey::Close:
++                // Already on the UI thread - this is TermControl's key handler.
++                if (keyDown)
++                {
++                    CloseTerminalRequested.raise(*this, nullptr);
++                }
++                return true;
++            case GhosttyExitKey::Restart:
++                if (keyDown)
++                {
++                    // The host answers by handing us a fresh connection.
++                    RestartTerminalRequested.raise(*this, nullptr);
++                }
++                return true;
++            default:
++                break;
++            }
++        }
++
+         if (!_surface || _readOnly)
+         {
+             return false;
+@@ -1020,6 +1054,26 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     // connection rather than pasting it. See GD-15.
+     bool GhosttyControlCore::SendCharEvent(const wchar_t ch, const WORD /*scanCode*/, const ControlKeyStates /*modifiers*/)
+     {
++        // The same two post-exit keys as TrySendKeyEvent, matched on the
++        // character exactly as cascadia matches them. In practice the key path
++        // above answers first and nothing arrives here; this is for the char
++        // that reaches us without a key event we recognised - an IME commit, an
++        // injected VK_PACKET - so the promise does not depend on which path the
++        // character took. See KD-24.
++        if (_connection && _connection.State() >= TerminalConnection::ConnectionState::Closed)
++        {
++            if (ch == L'\x04')
++            {
++                CloseTerminalRequested.raise(*this, nullptr);
++                return true;
++            }
++            if (ch == L'\r')
++            {
++                RestartTerminalRequested.raise(*this, nullptr);
++                return true;
++            }
++        }
++
+         if (!_surface || _readOnly)
+         {
+             return false;
+diff --git a/src/cascadia/TerminalControl/GhosttyKeyTranslator.cpp b/src/cascadia/TerminalControl/GhosttyKeyTranslator.cpp
+index 6a3da9a30..22e5c0721 100644
+--- a/src/cascadia/TerminalControl/GhosttyKeyTranslator.cpp
++++ b/src/cascadia/TerminalControl/GhosttyKeyTranslator.cpp
+@@ -84,4 +84,45 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         return GhosttyKeyText(std::wstring_view{ buf, gsl::narrow_cast<size_t>(n) });
+     }
++
++    // Deliberately keyed on the virtual key rather than on the text the layout
++    // produces, which is what cascadia matches: its check lives in
++    // SendCharEvent and compares the character against 0x04 and CR.
++    //
++    // A ghostty pane cannot ask the same question that way. The text path here
++    // is GhosttyKeyTextFor, and it drops every control character on purpose -
++    // ctrl+d and Enter both come back empty - so there is nothing to compare.
++    // The vkey is what is left, and it is the more direct question anyway.
++    //
++    // Two knowingly-small differences from the character rule, both harmless:
++    // ctrl+m produces CR and restarts a cascadia pane but not a ghostty one,
++    // and a layout that puts `d` somewhere other than VK_D closes on the
++    // physical D key rather than on the letter.
++    GhosttyExitKey GhosttyExitKeyFor(const uint16_t vkey, const uint32_t modifiers) noexcept
++    {
++        const auto ctrl = (modifiers & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
++        const auto alt = (modifiers & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) != 0;
++
++        // Alt is never part of either promise, and alt+enter is WT's own
++        // fullscreen binding - it must not reach this at all.
++        if (alt)
++        {
++            return GhosttyExitKey::None;
++        }
++
++        // ctrl+enter is LF rather than CR, and cascadia does not restart on it.
++        if (vkey == VK_RETURN && !ctrl)
++        {
++            return GhosttyExitKey::Restart;
++        }
++
++        // Shift is allowed: ctrl+shift+d is still 0x04, so cascadia closes on
++        // it too.
++        if (vkey == 'D' && ctrl)
++        {
++            return GhosttyExitKey::Close;
++        }
++
++        return GhosttyExitKey::None;
++    }
+ }
+diff --git a/src/cascadia/TerminalControl/GhosttyKeyTranslator.h b/src/cascadia/TerminalControl/GhosttyKeyTranslator.h
+index e9b328d6b..5ec507ddd 100644
+--- a/src/cascadia/TerminalControl/GhosttyKeyTranslator.h
++++ b/src/cascadia/TerminalControl/GhosttyKeyTranslator.h
+@@ -54,4 +54,23 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     // Pass 0 for the modifiers to get the unshifted text, which is what key
+     // bindings match against.
+     std::string GhosttyKeyTextFor(uint32_t modifiers, uint16_t vkey, uint16_t scanCode);
++
++    // What a key press means once the child is gone.
++    enum class GhosttyExitKey
++    {
++        None,
++        Close,
++        Restart,
++    };
++
++    // The two keys the connection promises the user after the child exits:
++    //
++    //     [process exited with code 56 (0x00000038)]
++    //     You can now close this terminal with Ctrl+D, or press Enter to restart.
++    //
++    // They belong to the host, not to the terminal, and a pane whose connection
++    // is Closed has to answer them itself. See KD-24.
++    //
++    // Modifiers are a ControlKeyStates bitfield, as everywhere else here.
++    GhosttyExitKey GhosttyExitKeyFor(uint16_t vkey, uint32_t modifiers) noexcept;
+ }
+diff --git a/src/cascadia/UnitTests_Control/GhosttyKeyTests.cpp b/src/cascadia/UnitTests_Control/GhosttyKeyTests.cpp
+index 3559969e4..9138e31bf 100644
+--- a/src/cascadia/UnitTests_Control/GhosttyKeyTests.cpp
++++ b/src/cascadia/UnitTests_Control/GhosttyKeyTests.cpp
+@@ -30,6 +30,7 @@ namespace ControlUnitTests
+         TEST_METHOD(PrintableTextPassesThrough);
+         TEST_METHOD(ControlCharactersAreNotText);
+         TEST_METHOD(ShiftComesFromTheEventNotTheThread);
++        TEST_METHOD(TheKeysThatAnswerAnExitedProcess);
+     };
+ 
+     // The scan code passes through untouched. Spelled out with the values that
+@@ -127,4 +128,41 @@ namespace ControlUnitTests
+         // encoding. Proves the ctrl bit reaches ToUnicode at all.
+         VERIFY_IS_TRUE(GhosttyKeyTextFor(LEFT_CTRL_PRESSED, 'C', 0x2E).empty());
+     }
++
++    // The pane's process has exited and the connection has printed "You can now
++    // close this terminal with Ctrl+D, or press Enter to restart". Which key
++    // means which, and - as much as it matters - which keys mean neither.
++    //
++    // These are the only keys a closed connection answers itself; everything
++    // else still goes to the surface. KD-24.
++    void GhosttyKeyTests::TheKeysThatAnswerAnExitedProcess()
++    {
++        // The promise, both halves.
++        VERIFY_IS_TRUE(GhosttyExitKey::Restart == GhosttyExitKeyFor(VK_RETURN, 0));
++        VERIFY_IS_TRUE(GhosttyExitKey::Close == GhosttyExitKeyFor('D', LEFT_CTRL_PRESSED));
++        VERIFY_IS_TRUE(GhosttyExitKey::Close == GhosttyExitKeyFor('D', RIGHT_CTRL_PRESSED));
++
++        // Shift rides along with both: ctrl+shift+d is still 0x04, and
++        // shift+enter is still CR, which is what cascadia matches on.
++        VERIFY_IS_TRUE(GhosttyExitKey::Restart == GhosttyExitKeyFor(VK_RETURN, SHIFT_PRESSED));
++        VERIFY_IS_TRUE(GhosttyExitKey::Close == GhosttyExitKeyFor('D', LEFT_CTRL_PRESSED | SHIFT_PRESSED));
++
++        // ctrl+enter is LF, not CR. Cascadia does not restart on it, so neither
++        // do we - it goes to the surface like any other key.
++        VERIFY_IS_TRUE(GhosttyExitKey::None == GhosttyExitKeyFor(VK_RETURN, LEFT_CTRL_PRESSED));
++
++        // alt+enter is WT's fullscreen binding and alt+d is a readline word
++        // kill. Neither is part of the promise.
++        VERIFY_IS_TRUE(GhosttyExitKey::None == GhosttyExitKeyFor(VK_RETURN, LEFT_ALT_PRESSED));
++        VERIFY_IS_TRUE(GhosttyExitKey::None == GhosttyExitKeyFor('D', LEFT_ALT_PRESSED));
++        VERIFY_IS_TRUE(GhosttyExitKey::None == GhosttyExitKeyFor('D', LEFT_CTRL_PRESSED | LEFT_ALT_PRESSED));
++
++        // A bare `d` types a letter, even here.
++        VERIFY_IS_TRUE(GhosttyExitKey::None == GhosttyExitKeyFor('D', 0));
++
++        // And the neighbours of both keys, so a widened rule fails here.
++        VERIFY_IS_TRUE(GhosttyExitKey::None == GhosttyExitKeyFor('C', LEFT_CTRL_PRESSED));
++        VERIFY_IS_TRUE(GhosttyExitKey::None == GhosttyExitKeyFor(VK_ESCAPE, 0));
++        VERIFY_IS_TRUE(GhosttyExitKey::None == GhosttyExitKeyFor(VK_SPACE, 0));
++    }
+ }

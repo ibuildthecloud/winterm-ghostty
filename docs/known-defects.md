@@ -2160,3 +2160,103 @@ libghostty config, which is a public API shape and therefore escalated rather
 than decided in passing. `allowDECNKM` is the more interesting of the two —
 its default is *off*, so a ghostty pane differs from cascadia there for
 everyone, not only for the user who changed a setting.
+
+---
+
+### KD-24 — After the process exits, Ctrl+D and Enter do nothing — **fixed 2026-08-21**
+
+**Reported by the user, from use.** A pane whose child has exited prints the
+message the connection always prints:
+
+```
+[process exited with code 56 (0x00000038)]
+You can now close this terminal with Ctrl+D, or press Enter to restart.
+```
+
+On a ghostty pane neither key does anything. The message is the connection's,
+so it appears on both engines and promises the same two things on both; only
+cascadia keeps the promise. The pane is not wedged — it is simply deaf to the
+only two keys it has just advertised — so the way out is the mouse: the tab's
+close button, or `ctrl+shift+w`.
+
+**Both keys are the host's, not the terminal's.** Cascadia answers them in
+`ControlCore::SendCharEvent`: with the connection at `>= Closed`, `0x04` raises
+`CloseTerminalRequested` and `CR` raises `RestartTerminalRequested`, and
+`TerminalPage::_restartPaneConnection` hands the pane a fresh connection.
+
+**Why a ghostty pane never gets there.** It is not that the branch was copied
+wrong — the branch does not exist in `GhosttyControlCore`, and the path it lives
+on is unreachable anyway:
+
+- On cascadia, `Terminal::SendKeyEvent` returns *no* output for a key down that
+  the layout maps to a character (`Terminal.cpp:676`). `TrySendKeyEvent` then
+  reports the key unhandled, Windows raises `CharacterReceived`, and
+  `SendCharEvent` sees `0x04` / `CR`.
+- On ghostty, `ghostty_surface_key` encodes Enter and ctrl+d itself and returns
+  `true`. `TermControl` treats a handled key as translated and suppresses the
+  character event, so `GhosttyControlCore::SendCharEvent` is never called for
+  either key. A branch added there alone would have looked right and changed
+  nothing.
+
+So the answer belongs on the key path, ahead of the surface (terminal patch
+0064). `GhosttyControlCore::TrySendKeyEvent` checks the connection state first,
+and `GhosttyExitKeyFor` — a pure function, unit tested without a surface —
+decides which of the two promises a key press is:
+
+| key | on a closed connection |
+|---|---|
+| Enter, or shift+Enter | restart |
+| ctrl+d, ctrl+shift+d | close |
+| ctrl+Enter | nothing — it is LF, and cascadia does not restart on it either |
+| alt+Enter, alt+d | nothing — alt+enter is WT's fullscreen binding |
+| anything else | goes to the surface, as before |
+
+The key *release* is swallowed with the press, so a surface that has just been
+told to go away is not handed a lone key-up. The check sits ahead of the
+read-only guard on purpose: a read-only pane whose process is gone still has to
+be closable, which is cascadia's behaviour too. `SendCharEvent` gets the same
+two answers, matched on the character exactly as cascadia matches them — it does
+not fire for these keys today, but it is the path an IME commit or an injected
+`VK_PACKET` would take, and the promise should not depend on which path the
+character took.
+
+#### Measured, in the shipped product
+
+A Debug portable build (`package-portable.ps1`), a profile whose command line
+is `cmd.exe /c exit 56` with `closeOnExit: never` and `engine: ghostty`, driven
+by **posting `WM_KEYDOWN`/`WM_KEYUP` to the XAML input site** rather than by
+stealing focus - the user was at the keyboard, and the first attempt with
+`SendKeys` proved only that the window had lost the foreground.
+`PostMessage` to the `Windows.UI.Input.InputSite.WindowClass` child needs no
+activation at all, which makes it the better probe for anything key-shaped.
+ctrl is the one thing that cannot be posted - `_GetPressedModifierKeys` reads
+the real key state - so it is injected with `keybd_event(0xA2)` around the
+posted `d`.
+
+| step | expected | observed |
+|---|---|---|
+| pane opens, child exits 56 | the message | `[process exited with code 56 (0x00000038)]` |
+| post Enter | restart in place | a **second** run of `cmd /c exit 56`, its exit message below the first, the scrollback intact |
+| ctrl + posted `d` | close | the last pane went, and the process exited |
+
+And the same two keys against a **live** `cmd.exe` ghostty pane, because the
+cost of getting the guard wrong is breaking Enter for everyone: Enter still
+reaches the shell (a second `C:\Users\darre>` prompt), and ctrl+d still goes to
+the child rather than closing the pane.
+
+#### What restart does not do yet
+
+`TerminalPage::_restartPaneConnection` calls `HardResetWithoutErase()` before
+attaching the new connection, to drop VT state the dead client may have left on
+— bracketed paste, mouse tracking, the alternate screen, kitty keyboard flags.
+`GhosttyControlCore::HardResetWithoutErase` is a **no-op**: libghostty exposes
+no non-erasing hard reset. Its `reset` binding action is a full reset, which
+erases, and erasing is exactly what the "WithoutErase" in the name is there to
+prevent — a restart would throw away the scrollback the user just read the exit
+code from.
+
+So a ghostty pane restarts with whatever modes the previous child left behind.
+A shell that exited normally leaves none, which is the case the message is
+about; a client killed mid-alt-screen would leave a mess. That gap is a new
+libghostty C entry point, not a translator line, so it is **escalated rather
+than decided in passing**, and this entry is the record of it.
