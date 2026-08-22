@@ -2260,3 +2260,148 @@ A shell that exited normally leaves none, which is the case the message is
 about; a client killed mid-alt-screen would leave a mess. That gap is a new
 libghostty C entry point, not a translator line, so it is **escalated rather
 than decided in passing**, and this entry is the record of it.
+
+---
+
+### KD-25 — Shifted characters cannot be typed from a remote keyboard — **fixed 2026-08-21**
+
+**Reported by the user, from use**, typing into a ghostty pane through the
+Windows App on Android: `:` and `?` could not be typed at all, nor any other
+shifted character. `?` arrived as `/`, `A` as `a`. Not a regression — the same
+keys fail on **0.2.2**, checked by the reporter — and invisible at the machine's
+own keyboard, which is why it survived every session until someone typed from a
+phone.
+
+It reads like [KD-08](#kd-08), and it is neither of the two bugs that turned out
+to be here. KD-08 was `?` arriving as `/` in kitty-protocol applications only,
+because the modifiers a layout *consumes* were reported as none.
+
+**Two independent defects, and the first hypothesis about the transport was
+wrong.** Both are real, both are fixed, and only the second one is what the
+reporter was hitting. The first was found by reasoning about the code and
+reproduced synthetically; the second was found only by measuring what the
+client actually sends. The order matters, because the first explanation
+accounted for the symptom perfectly and was still not the cause.
+
+#### Defect 1 — the modifier state is a snapshot, and it is later than the key
+
+`TermControl::_KeyHandler` builds its `ControlKeyStates` from
+`_GetPressedModifierKeys()`, which asks `CoreWindow::GetKeyState` for each
+modifier when XAML raises the routed `KeyDown`. That answers *what is held now*,
+not *what was held when this key was pressed*, and those agree only if the
+modifier is still down when the handler runs.
+
+A person holds shift for something like a tenth of a second, so it is. A client
+that sends shift-down, the key, and shift-up back to back leaves the handler
+asking after the release, and `GhosttyKeyTextFor` is then given no shift: the
+layout answers with the unshifted character. A cascadia pane is correct on the
+same events because it never asks — its text arrives as `CharacterReceived`,
+which Windows generates from the message stream itself.
+
+**Fixed** by reading the stream instead of the state. `GhosttyModifiersFor`
+tracks the modifier keys from their own key events and returns the snapshot
+**unioned** with what it has seen held. The stream cannot drift the way the
+snapshot does, because it is ordered: the shift press is delivered before the
+key it modifies and the release after it.
+
+The union is in that direction on purpose. A modifier held before this pane had
+focus is in the snapshot and was never seen as an event, so the snapshot cannot
+simply be replaced. The opposite risk — a modifier believed held that is not,
+which would put every following key in the wrong case — is bounded by clearing
+the tracked set on **both** `GotFocus` and `LostFocus`, since a release that
+happens while another window owns the keyboard never arrives here.
+
+Caps Lock is deliberately not tracked: it is a state rather than a hold, it is
+reported as locked rather than pressed, and it is not subject to the race.
+
+#### Defect 2 — a VK_PACKET is a character, and its scan code is not a scan code
+
+What the Windows App on Android actually sends, measured with `harness/keylog`,
+a low-level keyboard hook that sees the injected events before any window does:
+
+```
+196381.32 ms  down LSHIFT     vk=0xA0 scan=0x2A shiftState=0
+196473.57 ms  up   LSHIFT     vk=0xA0 scan=0x2A shiftState=1
+196861.80 ms  down PACKET     vk=0xE7 scan=0x41 shiftState=0
+199713.32 ms  down PACKET     vk=0xE7 scan=0x3A shiftState=0
+203885.95 ms  down PACKET     vk=0xE7 scan=0x3F shiftState=0
+```
+
+The soft shift key is a press of its own that is **over before the character
+arrives** — 388 ms before — and the character is then injected as a `VK_PACKET`
+whose scan code is the UTF-16 code unit: `0x41` is `A`, `0x3A` is `:`, `0x3F` is
+`?`. Shift is not a modifier on this transport at all.
+
+Reading that as a scan code asks a different question. Scan code `0x41` is F7,
+`0x3F` is F5, `0x3A` is Caps Lock. So the pane sent F7's escape sequence for a
+typed `A`, nothing at all for `:` — and because it reported the key *handled*,
+the character event that would have carried the text was suppressed. Confirmed
+from the pane's own view, with `GHOSTTY_TRACE_KEYS` set:
+
+```
+[ghostty] key down vkey=0xE7 scan=0x3A mods=0x0000 held=0x0000 text=(none)
+```
+
+**Fixed** by `GhosttyPacketText`: for `VK_PACKET` the character is the event.
+The keycode handed to libghostty is 0 rather than the scan code, the text is
+that code unit as UTF-8, and every modifier is marked consumed — the client
+already accounted for them when it chose the character. A character outside the
+BMP arrives as two packets, so a high surrogate is held until its low surrogate
+lands; that state is cleared on a focus change like the modifier state.
+
+#### The measurement that told the two apart
+
+Nothing observable from outside distinguishes them: both produce a lost shift,
+and defect 1 explains the reported symptom completely. What settled it was
+instrumenting the pane itself (`GHOSTTY_TRACE_KEYS`, read with
+`scripts/probe-key-trace.ps1`) and a hook on the raw input (`harness/keylog`),
+then comparing. Two rounds of inference from the source produced a confident
+wrong answer before either instrument was built.
+
+Worth keeping: **a fix that makes the symptom go away in a synthetic
+reproduction is not evidence that the cause was found.** The synthetic
+reproduction here posted real key messages, which is a transport the reporter
+never used.
+
+#### Measured
+
+**The real transport, before the fix.** A pane running `harness/rawin`, which
+names every byte the child receives, with the reporter typing `;?A` from
+Android into the shipped 0.2.10:
+
+```
+recv[1]: ;
+recv[1]: /
+recv[1]: a
+```
+
+**Both paths, on the built fix**, driven by `scripts/probe-shift-posted.ps1`,
+which posts key messages to the XAML input site — no foreground needed, so it
+does not fight a user at the keyboard:
+
+| event posted | 0.2.10 | with patch 0065 |
+|---|---|---|
+| `;` | `;` | `;` |
+| shift+`;` (as key events) | `;` | `:` |
+| shift+`/` (as key events) | `/` | `?` |
+| shift+`a` (as key events) | `a` | `A` |
+| packet `0x3A` | nothing | `:` |
+| packet `0x3F` | `ESC O P` (F1) | `?` |
+| packet `0x41` | `ESC [ 15~` (F5) | `A` |
+
+That probe posts its own messages, so WT's pump also translates them into a
+`WM_CHAR` and each chord can land twice — once from the key path and once from
+the character path. Read the log for *which* characters appear, not for how
+many.
+
+`unitControl` 74/74, including three new pure tests: shift held only in the
+event stream still shifts, a release stops applying, and a packet carries its
+character in the scan code (surrogate pairs included).
+
+#### The gap left open
+
+`TermControl::_TryHandleKeyBinding` matches key bindings against the same stale
+snapshot, on both engines. A `ctrl+shift+f` typed from a remote client can
+therefore miss its binding — unreported, not measured here, and a change in
+shared upstream code rather than in the ghostty translator, so it is recorded
+rather than fixed in passing.

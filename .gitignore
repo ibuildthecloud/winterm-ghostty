@@ -79,6 +79,11 @@ harness/rawin/*.exe
 harness/rawin/*.obj
 harness/rawin/*.log
 
+# harness/keylog: did the client send shift as a key at all, and when? KD-25.
+harness/keylog/*.exe
+harness/keylog/*.obj
+harness/keylog/*.txt
+
 # harness/glyphmask: is the glyph atlas coverage, or has D2D corrected it?
 harness/glyphmask/*.exe
 harness/glyphmask/*.obj

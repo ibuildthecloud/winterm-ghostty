@@ -1,0 +1,1712 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Fri, 21 Aug 2026 21:06:52 -0700
+Subject: [PATCH] fix(control): a VK_PACKET carries a character, not a key
+ (KD-25)
+
+The reported bug - no shifted character could be typed into a ghostty
+pane from the Windows App on Android - had a second cause, and it is the
+one the reporter was actually hitting. The modifier-timing fix in the
+previous commit explained the symptom completely and did not fix it.
+
+What the client sends, measured with harness/keylog, a low-level hook
+that sees injected events before any window does:
+
+    down LSHIFT  vk=0xA0 scan=0x2A
+    up   LSHIFT  vk=0xA0 scan=0x2A     <- 92 ms later, 388 ms before the key
+    down PACKET  vk=0xE7 scan=0x41     <- `A`
+    down PACKET  vk=0xE7 scan=0x3A     <- `:`
+    down PACKET  vk=0xE7 scan=0x3F     <- `?`
+
+An on-screen keyboard cannot press a key on the server's layout, so it
+injects the character itself: VK_PACKET, with the UTF-16 code unit in
+the scan code. The soft shift key is a press of its own, over before the
+character arrives, and shift is not a modifier on this transport at all.
+
+Reading that scan code as a scan code asks a different question. 0x41 is
+F7's scan code, 0x3F is F5's, 0x3A is Caps Lock's - so a typed `A` sent
+F7's escape sequence and `:` sent nothing, while reporting the key
+handled suppressed the character event that would have carried the text.
+Confirmed from the pane's own view:
+
+    [ghostty] key down vkey=0xE7 scan=0x3A mods=0x0000 text=(none)
+
+GhosttyPacketText makes the character the event: keycode 0 rather than a
+scan code that means a function key, the code unit as UTF-8 for the
+text, and every modifier marked consumed, since the client already
+accounted for them when it chose the character. A character outside the
+BMP arrives as two packets, so a high surrogate is held until its low
+surrogate lands - cleared on a focus change, like the modifier state.
+
+The trace that settled it ships with the fix, behind GHOSTTY_TRACE_KEYS,
+because inferring this from outside produced a confident wrong answer
+twice: the pane's behaviour is identical under several different events,
+and only the pane can say which one arrived.
+
+Measured with harness/rawin. Posting packets for `; : ? A a`: before,
+`;` then nothing, F1, F5 and F7 escapes; after, `; : ? A a` exactly.
+
+unitControl 74/74, with the packet translation and its surrogate pairing
+covered by a pure test.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../TerminalControl/GhosttyControlCore.cpp    |  78 +-
+ .../TerminalControl/GhosttyControlCore.h      | 801 +++++++++---------
+ .../TerminalControl/GhosttyKeyTranslator.cpp  | 406 +++++----
+ .../TerminalControl/GhosttyKeyTranslator.h    | 236 +++---
+ .../UnitTests_Control/GhosttyKeyTests.cpp     |  52 ++
+ 5 files changed, 870 insertions(+), 703 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index f09f5aa7d..173081e0f 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -970,12 +970,20 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             return false;
+         }
+ 
++        // A VK_PACKET is a character the client injected, not a key: its scan
++        // code is a UTF-16 code unit. Everything below that reads the scan code
++        // as a scan code has to be told, or `A` is asked about as if it were
++        // F7's scan code - see GhosttyPacketText and KD-25.
++        const auto isPacket = (vkey == VK_PACKET);
++
+         ghostty_input_key_s ev{};
+         ev.action = keyDown ? GHOSTTY_ACTION_PRESS : GHOSTTY_ACTION_RELEASE;
+ 
+         // Native keycode, not the virtual key - see GhosttyKeyTranslator.h for
+-        // why, and what happened when it was the virtual key.
+-        ev.keycode = GhosttyNativeKeycode(scanCode, (modifiers.Value() & ENHANCED_KEY) != 0);
++        // why, and what happened when it was the virtual key. A packet has no
++        // key behind it at all, so it carries none: the text is the whole
++        // event.
++        ev.keycode = isPacket ? 0 : GhosttyNativeKeycode(scanCode, (modifiers.Value() & ENHANCED_KEY) != 0);
+         ev.composing = false;
+ 
+         const auto mods = GhosttyMods(held);
+@@ -997,15 +1005,33 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         std::string unshifted;
+         if (keyDown)
+         {
+-            // Under what was held when the key arrived, never the thread's
+-            // keyboard state - see GhosttyKeyTextFor and GhosttyModifiersFor,
+-            // and the two separate ways `?` came out as `/`.
+-            text = GhosttyKeyTextFor(held.Value(), vkey, scanCode);
++            if (isPacket)
++            {
++                // The character is in the event. There is no key to ask the
++                // layout about, and nothing for a binding to match.
++                text = GhosttyPacketText(_pendingHighSurrogate, scanCode);
++            }
++            else
++            {
++                // Under what was held when the key arrived, never the thread's
++                // keyboard state - see GhosttyKeyTextFor and
++                // GhosttyModifiersFor, and the two separate ways `?` came out
++                // as `/`.
++                text = GhosttyKeyTextFor(held.Value(), vkey, scanCode);
++
++                // What key bindings match against, so it has to ignore Shift
++                // and the lock keys - otherwise ctrl+shift+c would fail to
++                // match a binding written against `c`.
++                unshifted = GhosttyKeyTextFor(0, vkey, scanCode);
++            }
++        }
+ 
+-            // What key bindings match against, so it has to ignore Shift and
+-            // the lock keys - otherwise ctrl+shift+c would fail to match a
+-            // binding written against `c`.
+-            unshifted = GhosttyKeyTextFor(0, vkey, scanCode);
++        if (isPacket && (!keyDown || text.empty()))
++        {
++            // Nothing to send - the release half of an injected character, or
++            // the first half of a surrogate pair. Reported handled all the
++            // same, so the character event does not deliver it a second time.
++            return true;
+         }
+         // Which modifiers were *consumed* to produce that text, which is not
+         // the same question as which were held. Shift held while typing `?` is
+@@ -1048,8 +1074,38 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+                 if (held.IsAltPressed()) { consumed = static_cast<ghostty_input_mods_e>(consumed | GHOSTTY_MODS_ALT); }
+             }
+         }
++        if (isPacket)
++        {
++            // Whatever was held, the client already accounted for it when it
++            // chose the character - so all of it is consumed, and ghostty's
++            // kitty encoder sends the text as it stands rather than as a
++            // modified key.
++            consumed = mods;
++        }
+         ev.consumed_mods = consumed;
+ 
++        // What the pane was actually handed, for the cases where guessing it
++        // from outside has proved wrong twice: a remote client can deliver a
++        // character as a VK_PACKET whose scan code is the code point rather
++        // than as a key, and which of those arrived is invisible from any
++        // other vantage point. Off unless GHOSTTY_TRACE_KEYS is set, because
++        // this is one debugger round trip per keystroke.
++        static const bool traceKeys = []() {
++            wchar_t buf[8];
++            return GetEnvironmentVariableW(L"GHOSTTY_TRACE_KEYS", buf, ARRAYSIZE(buf)) > 0;
++        }();
++        if (traceKeys)
++        {
++            _trace(L"key %s vkey=0x%02X scan=0x%02X mods=0x%04X held=0x%04X text=%hs unshifted=%hs",
++                   keyDown ? L"down" : L"up",
++                   vkey,
++                   scanCode,
++                   modifiers.Value(),
++                   held.Value(),
++                   text.empty() ? "(none)" : text.c_str(),
++                   unshifted.empty() ? "(none)" : unshifted.c_str());
++        }
++
+         ev.text = text.empty() ? nullptr : text.c_str();
+         ev.unshifted_codepoint = (!unshifted.empty() && gsl::narrow_cast<unsigned char>(unshifted[0]) < 0x80) ?
+                                      gsl::narrow_cast<uint32_t>(gsl::narrow_cast<unsigned char>(unshifted[0])) :
+@@ -1171,6 +1227,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // cannot be wrong in the direction that matters - a modifier believed
+         // held that is not would put every key in the wrong case.
+         _heldMods = 0;
++        _pendingHighSurrogate = 0;
+         if (_surface)
+         {
+             ghostty_surface_set_focus(_surface, true);
+@@ -1189,6 +1246,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // never reach us at all, leaving shift stuck down here forever.
+         _keyMods = GHOSTTY_MODS_NONE;
+         _heldMods = 0;
++        _pendingHighSurrogate = 0;
+         if (_surface)
+         {
+             ghostty_surface_set_focus(_surface, false);
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.h b/src/cascadia/TerminalControl/GhosttyControlCore.h
+index 75467d63b..b46e76906 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.h
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.h
+@@ -1,398 +1,403 @@
+-// Copyright (c) Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-// Module Name:
+-// - GhosttyControlCore.h
+-//
+-// Abstract:
+-// - IControlCore over libghostty (ADR 0001, ADR 0003). This is the second
+-//   engine; ControlCore is the first. Everything above the interface -
+-//   TermControl, tabs, panes, settings - is unaware of which one it holds.
+-//
+-// - Ownership runs the other way round from ControlCore. WT keeps the
+-//   connection and therefore the pty (ADR 0006): output bytes arrive on the
+-//   connection's thread and go into libghostty through
+-//   ghostty_surface_write_pty_output, and the terminal's input comes back out
+-//   through the engine's write callback into ITerminalConnection::WriteInput.
+-//   libghostty spawns nothing.
+-//
+-// - Rendering is libghostty's, on its own thread, into a DirectComposition
+-//   swap chain we hand to the same XAML SwapChainPanel path cascadia uses
+-//   (proven in Phase 2). We never touch its pixels.
+-
+-#pragma once
+-
+-#include "GhosttyControlCore.g.h"
+-#include "GhosttyEngine.h"
+-#include "EventArgs.h"
+-
+-// For ::Microsoft::Terminal::Core::ControlKeyStates, which several IControlCore
+-// members take. We want none of TerminalCore's engine, only that type - but it
+-// is the header that declares it, and cascadia's core pulls it in the same way.
+-#include "../../cascadia/TerminalCore/ControlKeyStates.hpp"
+-
+-#include <til/u8u16convert.h>
+-
+-namespace winrt::Microsoft::Terminal::Control::implementation
+-{
+-    struct GhosttyControlCore : GhosttyControlCoreT<GhosttyControlCore>
+-    {
+-    public:
+-        GhosttyControlCore(Control::IControlSettings settings,
+-                           Control::IControlAppearance unfocusedAppearance,
+-                           TerminalConnection::ITerminalConnection connection);
+-        ~GhosttyControlCore();
+-
+-        bool Initialize(const float actualWidth, const float actualHeight, const float compositionScale);
+-        void EnablePainting();
+-        void Detach();
+-        void AttachToNewControl();
+-        void Close();
+-
+-        void UpdateSettings(const Control::IControlSettings& settings, const IControlAppearance& newAppearance);
+-        void ApplyAppearance(const bool focused);
+-        void SetHighContrastMode(const bool enabled);
+-        Control::IControlSettings Settings();
+-        Control::IControlAppearance FocusedAppearance() const;
+-        Control::IControlAppearance UnfocusedAppearance() const;
+-        bool HasUnfocusedAppearance() const;
+-
+-        void ApplyPreviewColorScheme(const Core::ICoreScheme&);
+-        void ResetPreviewColorScheme();
+-        void SetOverrideColorScheme(const Core::ICoreScheme&);
+-
+-        uint64_t SwapChainHandle() const;
+-
+-        void SizeChanged(const float width, const float height);
+-        void ScaleChanged(const float scale);
+-        void SizeOrScaleChanged(const float width, const float height, const float scale);
+-
+-        void AdjustFontSize(float fontSizeDelta);
+-        void ResetFontSize();
+-        winrt::Windows::Foundation::Size FontSizeInDips() const;
+-        winrt::Windows::Foundation::Size FontSize() const noexcept;
+-        uint16_t FontWeight() const noexcept;
+-
+-        til::color ForegroundColor() const;
+-        til::color BackgroundColor() const;
+-
+-        void SendInput(std::wstring_view wstr);
+-        void PasteText(const winrt::hstring& hstr);
+-        bool CopySelectionToClipboard(bool singleLine, bool withControlSequences, const CopyFormat formats);
+-        void SelectAll();
+-        void ClearSelection();
+-        bool ToggleBlockSelection();
+-        void ToggleMarkMode();
+-        Control::SelectionInteractionMode SelectionMode() const;
+-        bool SwitchSelectionEndpoint();
+-        bool ExpandSelectionToWord();
+-        bool TryMarkModeKeybinding(const WORD vkey, const ::Microsoft::Terminal::Core::ControlKeyStates modifiers);
+-
+-        void GotFocus();
+-        void LostFocus();
+-
+-        void ToggleShaderEffects();
+-        void AdjustOpacity(const float opacity, const bool relative);
+-        void ResumeRendering();
+-
+-        void SetHoveredCell(Core::Point terminalPosition);
+-        void ClearHoveredCell();
+-        winrt::hstring GetHyperlink(const Core::Point position) const;
+-        winrt::hstring HoveredUriText() const;
+-        Windows::Foundation::IReference<Core::Point> HoveredCell() const;
+-
+-        void ColorSelection(const Control::SelectionColor& fg, const Control::SelectionColor& bg, Core::MatchMode matchMode);
+-
+-        void PersistTo(int64_t handle) const;
+-        void RestoreFromPath(const hstring& path) const;
+-        void ClearQuickFix();
+-        void OpenCWD();
+-
+-#pragma region ICoreState
+-        const size_t TaskbarState() const noexcept;
+-        const size_t TaskbarProgress() const noexcept;
+-
+-        hstring Title();
+-        Windows::Foundation::IReference<winrt::Windows::UI::Color> TabColor() noexcept;
+-        hstring WorkingDirectory() const;
+-
+-        TerminalConnection::ConnectionState ConnectionState() const;
+-
+-        int ScrollOffset();
+-        int ViewHeight() const;
+-        int BufferHeight() const;
+-
+-        bool HasSelection() const;
+-        bool HasMultiLineSelection() const;
+-        winrt::hstring SelectedText(bool trimTrailingWhitespace) const;
+-
+-        bool BracketedPasteEnabled() const noexcept;
+-
+-        Windows::Foundation::Collections::IVector<Control::ScrollMark> ScrollMarks() const;
+-        void AddMark(const Control::ScrollMark& mark);
+-        void ClearMark();
+-        void ClearAllMarks();
+-        void ScrollToMark(const Control::ScrollToMarkDirection& direction);
+-
+-        void SelectCommand(const bool goUp);
+-        void SelectOutput(const bool goUp);
+-
+-        void ContextMenuSelectCommand();
+-        void ContextMenuSelectOutput();
+-#pragma endregion
+-
+-#pragma region ITerminalInput
+-        bool TrySendKeyEvent(const WORD vkey, const WORD scanCode, const ::Microsoft::Terminal::Core::ControlKeyStates modifiers, const bool keyDown);
+-        bool SendCharEvent(const wchar_t ch, const WORD scanCode, const ::Microsoft::Terminal::Core::ControlKeyStates modifiers);
+-        bool SendMouseEvent(const Core::Point viewportPosCore, const uint32_t uiButton, const ::Microsoft::Terminal::Core::ControlKeyStates states, const int16_t wheelDelta, const Control::MouseButtonState state);
+-        void UserScrollViewport(const int32_t viewTop);
+-        void ClearBuffer(Control::ClearBufferType clearType);
+-#pragma endregion
+-
+-        bool IsVtMouseModeEnabled() const;
+-        bool ShouldSendAlternateScroll(const uint32_t uiButton, const int32_t delta) const;
+-        Core::Point CursorPosition() const;
+-
+-        // The in-progress IME composition. Not on IControlCore: TermControl's
+-        // TSF provider reaches for it directly, the same way it reaches into
+-        // cascadia's renderer for the same purpose.
+-        void SetPreedit(const hstring& text) const;
+-        bool ForceCursorVisible() const noexcept;
+-        void ForceCursorVisible(bool force);
+-
+-        bool CopyOnSelect() const;
+-        Control::SelectionData SelectionInfo() const;
+-        void SetSelectionAnchor(const Core::Point positionCore);
+-        void SetEndSelectionPoint(const Core::Point positionCore);
+-        void AnchorContextMenu(const Core::Point viewportRelativeCharacterPositionCore);
+-
+-        SearchResults Search(const SearchRequest& request);
+-        Windows::Foundation::Collections::IVector<int32_t> SearchResultRows() const;
+-        bool IsBufferRowInViewport(int32_t bufferRow) const;
+-        void ClearSearch();
+-        // ghostty's needle is a plain byte string: no regex, no case folding.
+-        // Both toggles are disabled in the search box rather than left inert.
+-        bool SearchSupportsRegex() const noexcept { return false; }
+-        bool SearchSupportsCaseSensitivity() const noexcept { return false; }
+-
+-        void LeftClickOnTerminal(const Core::Point terminalPositionCore, const int32_t numberOfClicks, const bool altEnabled, const bool shiftEnabled, const bool isOnOriginalPosition, bool& selectionNeedsToBeCopied);
+-
+-        bool IsInReadOnlyMode() const;
+-        void ToggleReadOnlyMode();
+-        void SetReadOnlyMode(const bool readOnlyState);
+-
+-        hstring ReadEntireBuffer() const;
+-        Control::CommandHistoryContext CommandHistory() const;
+-        bool QuickFixesAvailable() const noexcept;
+-        void UpdateQuickFixes(const Windows::Foundation::Collections::IVector<hstring>& quickFixes);
+-
+-        void WindowVisibilityChanged(const bool showOrHide);
+-
+-        uint64_t OwningHwnd();
+-        void OwningHwnd(uint64_t owner);
+-
+-        TerminalConnection::ITerminalConnection Connection();
+-        void Connection(const TerminalConnection::ITerminalConnection& connection);
+-        void HardResetWithoutErase();
+-
+-        bool ShouldShowSelectCommand();
+-        bool ShouldShowSelectOutput();
+-
+-        void PreviewInput(const hstring& input);
+-
+-        float Opacity() const noexcept;
+-        bool UseAcrylic() const noexcept;
+-
+-        // ------------------------- Engine-side entry points -------------------------
+-        // Called by GhosttyEngine's runtime callbacks, on libghostty's threads.
+-        bool HandleAction(const ghostty_action_s& action) noexcept;
+-        void WriteToConnection(std::string_view utf8) noexcept;
+-        void ResizeConnection(uint16_t columns, uint16_t rows) noexcept;
+-        void RequestClose() noexcept;
+-
+-        // A copy_to_clipboard binding action, or OSC 52 from inside the
+-        // terminal. Raised as WriteToClipboard - the same event cascadia's
+-        // core raises, so TermControl needs no engine-specific handling.
+-        void WriteClipboard(std::string&& plain, std::string&& html) noexcept;
+-
+-        // -------------------------------- WinRT Events ---------------------------------
+-        // clang-format off
+-        til::typed_event<IInspectable, Control::FontSizeChangedArgs> FontSizeChanged;
+-        til::typed_event<IInspectable, Control::TitleChangedEventArgs> TitleChanged;
+-        til::typed_event<IInspectable, Control::WriteToClipboardEventArgs> WriteToClipboard;
+-        til::typed_event<> WarningBell;
+-        til::typed_event<> TabColorChanged;
+-        til::typed_event<> BackgroundColorChanged;
+-        til::typed_event<IInspectable, Control::ScrollPositionChangedArgs> ScrollPositionChanged;
+-        til::typed_event<> TaskbarProgressChanged;
+-        til::typed_event<> ConnectionStateChanged;
+-        til::typed_event<> HoveredHyperlinkChanged;
+-        til::typed_event<IInspectable, IInspectable> RendererEnteredErrorState;
+-        til::typed_event<> SwapChainChanged;
+-        til::typed_event<IInspectable, Control::RendererWarningArgs> RendererWarning;
+-        til::typed_event<IInspectable, Control::NoticeEventArgs> RaiseNotice;
+-        til::typed_event<IInspectable, Control::TransparencyChangedEventArgs> TransparencyChanged;
+-        til::typed_event<> OutputIdle;
+-        til::typed_event<IInspectable, Control::ShowWindowArgs> ShowWindowChanged;
+-        til::typed_event<IInspectable, Control::UpdateSelectionMarkersEventArgs> UpdateSelectionMarkers;
+-        til::typed_event<IInspectable, Control::OpenHyperlinkEventArgs> OpenHyperlink;
+-        til::typed_event<IInspectable, Control::CompletionsChangedEventArgs> CompletionsChanged;
+-        til::typed_event<IInspectable, Control::SearchMissingCommandEventArgs> SearchMissingCommand;
+-        til::typed_event<> SearchResultsChanged;
+-        til::typed_event<IInspectable, Control::ShowNotificationEventArgs> ShowNotification;
+-        til::typed_event<> RefreshQuickFixUI;
+-        til::typed_event<IInspectable, Control::WindowSizeChangedEventArgs> WindowSizeChanged;
+-        til::typed_event<> CloseTerminalRequested;
+-        til::typed_event<> RestartTerminalRequested;
+-        til::typed_event<> Attached;
+-        // clang-format on
+-
+-    private:
+-        void _createSurface(const float width, const float height, const float scale);
+-        void _destroySurface() noexcept;
+-        void _applySettingsToConfig(ghostty_config_t config) const;
+-        void _pushSettings();
+-        void _connectionOutputHandler(const winrt::array_view<const char16_t>& data);
+-        void _connectionStateChangedHandler();
+-        // Sizing and DPI faults here are invisible from outside - the pane just
+-        // looks wrong - and a packaged app has no stdout. Costs nothing without
+-        // a debugger attached; shows up in cdb with one.
+-        static void _trace(const wchar_t* format, ...);
+-        void _pushSize();
+-
+-        // Named binding actions are how most of libghostty is reached from an
+-        // embedder; see the definition.
+-        bool _bindingAction(std::string_view action) const;
+-
+-        // Selection is driven through ghostty's mouse handling, because that
+-        // is the only thing that both sets the selection *and* draws it.
+-        void _mouseTo(Core::Point cell, ghostty_input_mods_e mods) const;
+-        void _releaseMouseIfHeld() const;
+-
+-        // Said by the selection path when it has already driven the mouse for
+-        // the pointer event WT is delivering. See SetHoveredCell.
+-        void _selectionDroveTheMouse();
+-
+-        // The modifiers every mouse event of a selection carries - the engine
+-        // reads block-vs-linear off them, per event. See GhosttySelectionMods.h.
+-        ghostty_input_mods_e _selectionMods() const noexcept;
+-
+-        // Output has to draw itself; libghostty's wakeup coalesces. Same
+-        // reasoning as _connectionOutputHandler's render.
+-        void _raiseSwapChainChanged();
+-        void _raiseOnUiThread(std::function<void()> action);
+-
+-        Control::IControlSettings _settings{ nullptr };
+-        Control::IControlAppearance _unfocusedAppearance{ nullptr };
+-        bool _hasUnfocusedAppearance{ false };
+-        void _setUnfocusedAppearance(const IControlAppearance& newAppearance);
+-        TerminalConnection::ITerminalConnection _connection{ nullptr };
+-        TerminalConnection::ITerminalConnection::TerminalOutput_revoker _connectionOutputRevoker;
+-        TerminalConnection::ITerminalConnection::StateChanged_revoker _connectionStateRevoker;
+-
+-        GhosttyEngine* _engine{ nullptr };
+-        ghostty_surface_t _surface{ nullptr };
+-
+-        // The UTF-16 -> UTF-8 boundary. ITerminalConnection deals in UTF-16 and
+-        // ghostty parses bytes, and a surrogate pair may be split across two
+-        // TerminalOutput events - so this holds the partial across calls. WT
+-        // already ships the state machine; we just keep one per pane.
+-        // (With ConptyConnection a split pair should never arrive, because its
+-        // own til::u8state only ever emits whole codepoints. AzureConnection
+-        // makes no such promise, and this costs nothing.)
+-        ::til::u16state _u16State;
+-        std::string _utf8Scratch;
+-
+-        winrt::hstring _title;
+-        winrt::hstring _workingDirectory;
+-        std::optional<til::color> _tabColor;
+-        uint64_t _owningHwnd{ 0 };
+-        size_t _taskbarState{ 0 };
+-        size_t _taskbarProgress{ 0 };
+-        bool _initializedTerminal{ false };
+-        bool _closing{ false };
+-        bool _readOnly{ false };
+-        bool _focused{ false };
+-
+-        // Cell metrics as libghostty last reported them, in pixels. The
+-        // CELL_SIZE action is the only authority for these: our own arithmetic
+-        // and its must not diverge, or a resize tells the child a size the
+-        // terminal is not using.
+-        winrt::Windows::Foundation::Size _cellSize{ 0, 0 };
+-
+-        // The grid size libghostty last asked the pty for, re-applied when the
+-        // connection reaches Connected. See _connectionStateChangedHandler for
+-        // why remembering it is necessary rather than belt-and-braces.
+-        uint16_t _ptyColumns{ 0 };
+-        uint16_t _ptyRows{ 0 };
+-
+-        // The panel's size in DIPs, as TermControl reports it, kept separately
+-        // from the pixel size handed to libghostty - see _pushSize().
+-        float _panelWidth{ 0 };
+-        float _panelHeight{ 0 };
+-        float _compositionScale{ 1.0f };
+-
+-        // Whether ghostty believes the left button is down. WT never reports
+-        // a release outside VT mouse mode, so this tracks it - see
+-        // _releaseMouseIfHeld.
+-        mutable bool _mouseDown{ false };
+-
+-        // The modifiers the last key event carried, which is what a hover
+-        // position claims. See TrySendKeyEvent.
+-        ghostty_input_mods_e _keyMods{ GHOSTTY_MODS_NONE };
+-
+-        // The modifier keys seen pressed and not yet released, as a
+-        // ControlKeyStates bitfield. The snapshot TermControl takes can be
+-        // later than the key event it comes with, so this stream - which is
+-        // ordered - is what shift is really read from. See GhosttyModifiersFor
+-        // and KD-25. Cleared whenever focus changes.
+-        uint32_t _heldMods{ 0 };
+-
+-        // The cell the pointer was last reported at - a gate against sending a
+-        // position per pixel - and the link ghostty says is under it, empty for
+-        // none. The link is ghostty's answer, not a lookup: MOUSE_OVER_LINK.
+-        std::optional<til::point> _hoveredCell;
+-        winrt::hstring _hoveredUri;
+-
+-        // Whether the selection path drove the mouse for this pointer event.
+-        bool _selectionDrove{ false };
+-
+-        // A release WT synthesised must not open a link the pointer happens to
+-        // be over. See _releaseMouseIfHeld.
+-        mutable bool _suppressOpenUrl{ false };
+-
+-        // Whether the drag in progress is a block selection. Alt at the moment
+-        // of the click decides it, as it does on cascadia, and it holds for the
+-        // whole drag - releasing alt halfway through does not turn a block
+-        // selection back into a linear one. ghostty would happily change its
+-        // mind on the next mouse position; WT's semantics are the latch, so
+-        // every event of the drag repeats what the click said.
+-        bool _blockSelect{ false };
+-
+-        // Scroll state, from the SCROLLBAR action.
+-        int32_t _scrollOffset{ 0 };
+-        int32_t _viewHeight{ 0 };
+-        int32_t _bufferHeight{ 0 };
+-
+-        // Search state. ghostty answers a search on its own thread and reports
+-        // the counts back as actions, but IControlCore::Search is synchronous -
+-        // so Search() starts the work and returns the last counts that arrived.
+-        // -1 is not a placeholder: SearchBoxControl renders a negative total as
+-        // "Searching...", which is exactly what is true until they do.
+-        // Bounds how often pty output forces a frame; see _connectionOutputHandler.
+-
+-        std::wstring _searchNeedle;
+-        int32_t _searchTotal{ -1 };
+-        int32_t _searchSelected{ -1 };
+-        bool _selectFirstMatch{ false };
+-        int32_t _currentMatchFromTop() const noexcept;
+-        void _navigateSearch(bool goForward) const;
+-
+-        winrt::Windows::System::DispatcherQueue _dispatcher{ nullptr };
+-    };
+-}
+-
+-namespace winrt::Microsoft::Terminal::Control::factory_implementation
+-{
+-    BASIC_FACTORY(GhosttyControlCore);
+-}
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++//
++// Module Name:
++// - GhosttyControlCore.h
++//
++// Abstract:
++// - IControlCore over libghostty (ADR 0001, ADR 0003). This is the second
++//   engine; ControlCore is the first. Everything above the interface -
++//   TermControl, tabs, panes, settings - is unaware of which one it holds.
++//
++// - Ownership runs the other way round from ControlCore. WT keeps the
++//   connection and therefore the pty (ADR 0006): output bytes arrive on the
++//   connection's thread and go into libghostty through
++//   ghostty_surface_write_pty_output, and the terminal's input comes back out
++//   through the engine's write callback into ITerminalConnection::WriteInput.
++//   libghostty spawns nothing.
++//
++// - Rendering is libghostty's, on its own thread, into a DirectComposition
++//   swap chain we hand to the same XAML SwapChainPanel path cascadia uses
++//   (proven in Phase 2). We never touch its pixels.
++
++#pragma once
++
++#include "GhosttyControlCore.g.h"
++#include "GhosttyEngine.h"
++#include "EventArgs.h"
++
++// For ::Microsoft::Terminal::Core::ControlKeyStates, which several IControlCore
++// members take. We want none of TerminalCore's engine, only that type - but it
++// is the header that declares it, and cascadia's core pulls it in the same way.
++#include "../../cascadia/TerminalCore/ControlKeyStates.hpp"
++
++#include <til/u8u16convert.h>
++
++namespace winrt::Microsoft::Terminal::Control::implementation
++{
++    struct GhosttyControlCore : GhosttyControlCoreT<GhosttyControlCore>
++    {
++    public:
++        GhosttyControlCore(Control::IControlSettings settings,
++                           Control::IControlAppearance unfocusedAppearance,
++                           TerminalConnection::ITerminalConnection connection);
++        ~GhosttyControlCore();
++
++        bool Initialize(const float actualWidth, const float actualHeight, const float compositionScale);
++        void EnablePainting();
++        void Detach();
++        void AttachToNewControl();
++        void Close();
++
++        void UpdateSettings(const Control::IControlSettings& settings, const IControlAppearance& newAppearance);
++        void ApplyAppearance(const bool focused);
++        void SetHighContrastMode(const bool enabled);
++        Control::IControlSettings Settings();
++        Control::IControlAppearance FocusedAppearance() const;
++        Control::IControlAppearance UnfocusedAppearance() const;
++        bool HasUnfocusedAppearance() const;
++
++        void ApplyPreviewColorScheme(const Core::ICoreScheme&);
++        void ResetPreviewColorScheme();
++        void SetOverrideColorScheme(const Core::ICoreScheme&);
++
++        uint64_t SwapChainHandle() const;
++
++        void SizeChanged(const float width, const float height);
++        void ScaleChanged(const float scale);
++        void SizeOrScaleChanged(const float width, const float height, const float scale);
++
++        void AdjustFontSize(float fontSizeDelta);
++        void ResetFontSize();
++        winrt::Windows::Foundation::Size FontSizeInDips() const;
++        winrt::Windows::Foundation::Size FontSize() const noexcept;
++        uint16_t FontWeight() const noexcept;
++
++        til::color ForegroundColor() const;
++        til::color BackgroundColor() const;
++
++        void SendInput(std::wstring_view wstr);
++        void PasteText(const winrt::hstring& hstr);
++        bool CopySelectionToClipboard(bool singleLine, bool withControlSequences, const CopyFormat formats);
++        void SelectAll();
++        void ClearSelection();
++        bool ToggleBlockSelection();
++        void ToggleMarkMode();
++        Control::SelectionInteractionMode SelectionMode() const;
++        bool SwitchSelectionEndpoint();
++        bool ExpandSelectionToWord();
++        bool TryMarkModeKeybinding(const WORD vkey, const ::Microsoft::Terminal::Core::ControlKeyStates modifiers);
++
++        void GotFocus();
++        void LostFocus();
++
++        void ToggleShaderEffects();
++        void AdjustOpacity(const float opacity, const bool relative);
++        void ResumeRendering();
++
++        void SetHoveredCell(Core::Point terminalPosition);
++        void ClearHoveredCell();
++        winrt::hstring GetHyperlink(const Core::Point position) const;
++        winrt::hstring HoveredUriText() const;
++        Windows::Foundation::IReference<Core::Point> HoveredCell() const;
++
++        void ColorSelection(const Control::SelectionColor& fg, const Control::SelectionColor& bg, Core::MatchMode matchMode);
++
++        void PersistTo(int64_t handle) const;
++        void RestoreFromPath(const hstring& path) const;
++        void ClearQuickFix();
++        void OpenCWD();
++
++#pragma region ICoreState
++        const size_t TaskbarState() const noexcept;
++        const size_t TaskbarProgress() const noexcept;
++
++        hstring Title();
++        Windows::Foundation::IReference<winrt::Windows::UI::Color> TabColor() noexcept;
++        hstring WorkingDirectory() const;
++
++        TerminalConnection::ConnectionState ConnectionState() const;
++
++        int ScrollOffset();
++        int ViewHeight() const;
++        int BufferHeight() const;
++
++        bool HasSelection() const;
++        bool HasMultiLineSelection() const;
++        winrt::hstring SelectedText(bool trimTrailingWhitespace) const;
++
++        bool BracketedPasteEnabled() const noexcept;
++
++        Windows::Foundation::Collections::IVector<Control::ScrollMark> ScrollMarks() const;
++        void AddMark(const Control::ScrollMark& mark);
++        void ClearMark();
++        void ClearAllMarks();
++        void ScrollToMark(const Control::ScrollToMarkDirection& direction);
++
++        void SelectCommand(const bool goUp);
++        void SelectOutput(const bool goUp);
++
++        void ContextMenuSelectCommand();
++        void ContextMenuSelectOutput();
++#pragma endregion
++
++#pragma region ITerminalInput
++        bool TrySendKeyEvent(const WORD vkey, const WORD scanCode, const ::Microsoft::Terminal::Core::ControlKeyStates modifiers, const bool keyDown);
++        bool SendCharEvent(const wchar_t ch, const WORD scanCode, const ::Microsoft::Terminal::Core::ControlKeyStates modifiers);
++        bool SendMouseEvent(const Core::Point viewportPosCore, const uint32_t uiButton, const ::Microsoft::Terminal::Core::ControlKeyStates states, const int16_t wheelDelta, const Control::MouseButtonState state);
++        void UserScrollViewport(const int32_t viewTop);
++        void ClearBuffer(Control::ClearBufferType clearType);
++#pragma endregion
++
++        bool IsVtMouseModeEnabled() const;
++        bool ShouldSendAlternateScroll(const uint32_t uiButton, const int32_t delta) const;
++        Core::Point CursorPosition() const;
++
++        // The in-progress IME composition. Not on IControlCore: TermControl's
++        // TSF provider reaches for it directly, the same way it reaches into
++        // cascadia's renderer for the same purpose.
++        void SetPreedit(const hstring& text) const;
++        bool ForceCursorVisible() const noexcept;
++        void ForceCursorVisible(bool force);
++
++        bool CopyOnSelect() const;
++        Control::SelectionData SelectionInfo() const;
++        void SetSelectionAnchor(const Core::Point positionCore);
++        void SetEndSelectionPoint(const Core::Point positionCore);
++        void AnchorContextMenu(const Core::Point viewportRelativeCharacterPositionCore);
++
++        SearchResults Search(const SearchRequest& request);
++        Windows::Foundation::Collections::IVector<int32_t> SearchResultRows() const;
++        bool IsBufferRowInViewport(int32_t bufferRow) const;
++        void ClearSearch();
++        // ghostty's needle is a plain byte string: no regex, no case folding.
++        // Both toggles are disabled in the search box rather than left inert.
++        bool SearchSupportsRegex() const noexcept { return false; }
++        bool SearchSupportsCaseSensitivity() const noexcept { return false; }
++
++        void LeftClickOnTerminal(const Core::Point terminalPositionCore, const int32_t numberOfClicks, const bool altEnabled, const bool shiftEnabled, const bool isOnOriginalPosition, bool& selectionNeedsToBeCopied);
++
++        bool IsInReadOnlyMode() const;
++        void ToggleReadOnlyMode();
++        void SetReadOnlyMode(const bool readOnlyState);
++
++        hstring ReadEntireBuffer() const;
++        Control::CommandHistoryContext CommandHistory() const;
++        bool QuickFixesAvailable() const noexcept;
++        void UpdateQuickFixes(const Windows::Foundation::Collections::IVector<hstring>& quickFixes);
++
++        void WindowVisibilityChanged(const bool showOrHide);
++
++        uint64_t OwningHwnd();
++        void OwningHwnd(uint64_t owner);
++
++        TerminalConnection::ITerminalConnection Connection();
++        void Connection(const TerminalConnection::ITerminalConnection& connection);
++        void HardResetWithoutErase();
++
++        bool ShouldShowSelectCommand();
++        bool ShouldShowSelectOutput();
++
++        void PreviewInput(const hstring& input);
++
++        float Opacity() const noexcept;
++        bool UseAcrylic() const noexcept;
++
++        // ------------------------- Engine-side entry points -------------------------
++        // Called by GhosttyEngine's runtime callbacks, on libghostty's threads.
++        bool HandleAction(const ghostty_action_s& action) noexcept;
++        void WriteToConnection(std::string_view utf8) noexcept;
++        void ResizeConnection(uint16_t columns, uint16_t rows) noexcept;
++        void RequestClose() noexcept;
++
++        // A copy_to_clipboard binding action, or OSC 52 from inside the
++        // terminal. Raised as WriteToClipboard - the same event cascadia's
++        // core raises, so TermControl needs no engine-specific handling.
++        void WriteClipboard(std::string&& plain, std::string&& html) noexcept;
++
++        // -------------------------------- WinRT Events ---------------------------------
++        // clang-format off
++        til::typed_event<IInspectable, Control::FontSizeChangedArgs> FontSizeChanged;
++        til::typed_event<IInspectable, Control::TitleChangedEventArgs> TitleChanged;
++        til::typed_event<IInspectable, Control::WriteToClipboardEventArgs> WriteToClipboard;
++        til::typed_event<> WarningBell;
++        til::typed_event<> TabColorChanged;
++        til::typed_event<> BackgroundColorChanged;
++        til::typed_event<IInspectable, Control::ScrollPositionChangedArgs> ScrollPositionChanged;
++        til::typed_event<> TaskbarProgressChanged;
++        til::typed_event<> ConnectionStateChanged;
++        til::typed_event<> HoveredHyperlinkChanged;
++        til::typed_event<IInspectable, IInspectable> RendererEnteredErrorState;
++        til::typed_event<> SwapChainChanged;
++        til::typed_event<IInspectable, Control::RendererWarningArgs> RendererWarning;
++        til::typed_event<IInspectable, Control::NoticeEventArgs> RaiseNotice;
++        til::typed_event<IInspectable, Control::TransparencyChangedEventArgs> TransparencyChanged;
++        til::typed_event<> OutputIdle;
++        til::typed_event<IInspectable, Control::ShowWindowArgs> ShowWindowChanged;
++        til::typed_event<IInspectable, Control::UpdateSelectionMarkersEventArgs> UpdateSelectionMarkers;
++        til::typed_event<IInspectable, Control::OpenHyperlinkEventArgs> OpenHyperlink;
++        til::typed_event<IInspectable, Control::CompletionsChangedEventArgs> CompletionsChanged;
++        til::typed_event<IInspectable, Control::SearchMissingCommandEventArgs> SearchMissingCommand;
++        til::typed_event<> SearchResultsChanged;
++        til::typed_event<IInspectable, Control::ShowNotificationEventArgs> ShowNotification;
++        til::typed_event<> RefreshQuickFixUI;
++        til::typed_event<IInspectable, Control::WindowSizeChangedEventArgs> WindowSizeChanged;
++        til::typed_event<> CloseTerminalRequested;
++        til::typed_event<> RestartTerminalRequested;
++        til::typed_event<> Attached;
++        // clang-format on
++
++    private:
++        void _createSurface(const float width, const float height, const float scale);
++        void _destroySurface() noexcept;
++        void _applySettingsToConfig(ghostty_config_t config) const;
++        void _pushSettings();
++        void _connectionOutputHandler(const winrt::array_view<const char16_t>& data);
++        void _connectionStateChangedHandler();
++        // Sizing and DPI faults here are invisible from outside - the pane just
++        // looks wrong - and a packaged app has no stdout. Costs nothing without
++        // a debugger attached; shows up in cdb with one.
++        static void _trace(const wchar_t* format, ...);
++        void _pushSize();
++
++        // Named binding actions are how most of libghostty is reached from an
++        // embedder; see the definition.
++        bool _bindingAction(std::string_view action) const;
++
++        // Selection is driven through ghostty's mouse handling, because that
++        // is the only thing that both sets the selection *and* draws it.
++        void _mouseTo(Core::Point cell, ghostty_input_mods_e mods) const;
++        void _releaseMouseIfHeld() const;
++
++        // Said by the selection path when it has already driven the mouse for
++        // the pointer event WT is delivering. See SetHoveredCell.
++        void _selectionDroveTheMouse();
++
++        // The modifiers every mouse event of a selection carries - the engine
++        // reads block-vs-linear off them, per event. See GhosttySelectionMods.h.
++        ghostty_input_mods_e _selectionMods() const noexcept;
++
++        // Output has to draw itself; libghostty's wakeup coalesces. Same
++        // reasoning as _connectionOutputHandler's render.
++        void _raiseSwapChainChanged();
++        void _raiseOnUiThread(std::function<void()> action);
++
++        Control::IControlSettings _settings{ nullptr };
++        Control::IControlAppearance _unfocusedAppearance{ nullptr };
++        bool _hasUnfocusedAppearance{ false };
++        void _setUnfocusedAppearance(const IControlAppearance& newAppearance);
++        TerminalConnection::ITerminalConnection _connection{ nullptr };
++        TerminalConnection::ITerminalConnection::TerminalOutput_revoker _connectionOutputRevoker;
++        TerminalConnection::ITerminalConnection::StateChanged_revoker _connectionStateRevoker;
++
++        GhosttyEngine* _engine{ nullptr };
++        ghostty_surface_t _surface{ nullptr };
++
++        // The UTF-16 -> UTF-8 boundary. ITerminalConnection deals in UTF-16 and
++        // ghostty parses bytes, and a surrogate pair may be split across two
++        // TerminalOutput events - so this holds the partial across calls. WT
++        // already ships the state machine; we just keep one per pane.
++        // (With ConptyConnection a split pair should never arrive, because its
++        // own til::u8state only ever emits whole codepoints. AzureConnection
++        // makes no such promise, and this costs nothing.)
++        ::til::u16state _u16State;
++        std::string _utf8Scratch;
++
++        winrt::hstring _title;
++        winrt::hstring _workingDirectory;
++        std::optional<til::color> _tabColor;
++        uint64_t _owningHwnd{ 0 };
++        size_t _taskbarState{ 0 };
++        size_t _taskbarProgress{ 0 };
++        bool _initializedTerminal{ false };
++        bool _closing{ false };
++        bool _readOnly{ false };
++        bool _focused{ false };
++
++        // Cell metrics as libghostty last reported them, in pixels. The
++        // CELL_SIZE action is the only authority for these: our own arithmetic
++        // and its must not diverge, or a resize tells the child a size the
++        // terminal is not using.
++        winrt::Windows::Foundation::Size _cellSize{ 0, 0 };
++
++        // The grid size libghostty last asked the pty for, re-applied when the
++        // connection reaches Connected. See _connectionStateChangedHandler for
++        // why remembering it is necessary rather than belt-and-braces.
++        uint16_t _ptyColumns{ 0 };
++        uint16_t _ptyRows{ 0 };
++
++        // The panel's size in DIPs, as TermControl reports it, kept separately
++        // from the pixel size handed to libghostty - see _pushSize().
++        float _panelWidth{ 0 };
++        float _panelHeight{ 0 };
++        float _compositionScale{ 1.0f };
++
++        // Whether ghostty believes the left button is down. WT never reports
++        // a release outside VT mouse mode, so this tracks it - see
++        // _releaseMouseIfHeld.
++        mutable bool _mouseDown{ false };
++
++        // The modifiers the last key event carried, which is what a hover
++        // position claims. See TrySendKeyEvent.
++        ghostty_input_mods_e _keyMods{ GHOSTTY_MODS_NONE };
++
++        // The modifier keys seen pressed and not yet released, as a
++        // ControlKeyStates bitfield. The snapshot TermControl takes can be
++        // later than the key event it comes with, so this stream - which is
++        // ordered - is what shift is really read from. See GhosttyModifiersFor
++        // and KD-25. Cleared whenever focus changes.
++        uint32_t _heldMods{ 0 };
++
++        // The first half of a surrogate pair, when a client has injected a
++        // character outside the BMP as two VK_PACKET events. See
++        // GhosttyPacketText. Cleared with _heldMods on a focus change.
++        uint16_t _pendingHighSurrogate{ 0 };
++
++        // The cell the pointer was last reported at - a gate against sending a
++        // position per pixel - and the link ghostty says is under it, empty for
++        // none. The link is ghostty's answer, not a lookup: MOUSE_OVER_LINK.
++        std::optional<til::point> _hoveredCell;
++        winrt::hstring _hoveredUri;
++
++        // Whether the selection path drove the mouse for this pointer event.
++        bool _selectionDrove{ false };
++
++        // A release WT synthesised must not open a link the pointer happens to
++        // be over. See _releaseMouseIfHeld.
++        mutable bool _suppressOpenUrl{ false };
++
++        // Whether the drag in progress is a block selection. Alt at the moment
++        // of the click decides it, as it does on cascadia, and it holds for the
++        // whole drag - releasing alt halfway through does not turn a block
++        // selection back into a linear one. ghostty would happily change its
++        // mind on the next mouse position; WT's semantics are the latch, so
++        // every event of the drag repeats what the click said.
++        bool _blockSelect{ false };
++
++        // Scroll state, from the SCROLLBAR action.
++        int32_t _scrollOffset{ 0 };
++        int32_t _viewHeight{ 0 };
++        int32_t _bufferHeight{ 0 };
++
++        // Search state. ghostty answers a search on its own thread and reports
++        // the counts back as actions, but IControlCore::Search is synchronous -
++        // so Search() starts the work and returns the last counts that arrived.
++        // -1 is not a placeholder: SearchBoxControl renders a negative total as
++        // "Searching...", which is exactly what is true until they do.
++        // Bounds how often pty output forces a frame; see _connectionOutputHandler.
++
++        std::wstring _searchNeedle;
++        int32_t _searchTotal{ -1 };
++        int32_t _searchSelected{ -1 };
++        bool _selectFirstMatch{ false };
++        int32_t _currentMatchFromTop() const noexcept;
++        void _navigateSearch(bool goForward) const;
++
++        winrt::Windows::System::DispatcherQueue _dispatcher{ nullptr };
++    };
++}
++
++namespace winrt::Microsoft::Terminal::Control::factory_implementation
++{
++    BASIC_FACTORY(GhosttyControlCore);
++}
+diff --git a/src/cascadia/TerminalControl/GhosttyKeyTranslator.cpp b/src/cascadia/TerminalControl/GhosttyKeyTranslator.cpp
+index 3f63a4646..b40549086 100644
+--- a/src/cascadia/TerminalControl/GhosttyKeyTranslator.cpp
++++ b/src/cascadia/TerminalControl/GhosttyKeyTranslator.cpp
+@@ -1,187 +1,219 @@
+-// Copyright (c) Microsoft Corporation.
+-// Licensed under the MIT license.
+-
+-#include "pch.h"
+-#include "GhosttyKeyTranslator.h"
+-
+-namespace winrt::Microsoft::Terminal::Control::implementation
+-{
+-    std::string GhosttyKeyText(const std::wstring_view translated)
+-    {
+-        if (translated.empty())
+-        {
+-            return {};
+-        }
+-
+-        // Control characters are not text. Backspace, Tab, Enter, Escape and
+-        // ctrl+letter all come back from the keyboard layout as
+-        // 0x01-0x1A/0x1B/0x7F, but they are keys whose terminal encoding
+-        // ghostty owns, and which depend on modes nothing here knows about -
+-        // backspace-is-delete, the kitty keyboard protocol, application cursor
+-        // keys.
+-        //
+-        // Forwarding them is destructive rather than merely redundant:
+-        // ghostty's key_encode short circuits on a non-empty utf8 field
+-        // (`if (event.utf8.len > 0) return try writer.writeAll(event.utf8);`),
+-        // so a control character here would *replace* ghostty's own encoding
+-        // of the key. ghostty guards the same hazard internally with
+-        // isControlUtf8.
+-        for (const auto c : translated)
+-        {
+-            if (c < 0x20 || c == 0x7F)
+-            {
+-                return {};
+-            }
+-        }
+-
+-        return til::u16u8(translated);
+-    }
+-
+-    std::string GhosttyKeyTextFor(const uint32_t modifiers, const uint16_t vkey, const uint16_t scanCode)
+-    {
+-        constexpr BYTE down = 0x80;
+-        constexpr BYTE locked = 0x01;
+-
+-        BYTE keyboard[256]{};
+-        if (modifiers & SHIFT_PRESSED)
+-        {
+-            keyboard[VK_SHIFT] = keyboard[VK_LSHIFT] = down;
+-        }
+-        // Left and right are kept apart because AltGr is reported as left ctrl
+-        // plus right alt, and a layout with an AltGr mapping for a key looks at
+-        // exactly that pair.
+-        if (modifiers & LEFT_CTRL_PRESSED)
+-        {
+-            keyboard[VK_CONTROL] = keyboard[VK_LCONTROL] = down;
+-        }
+-        if (modifiers & RIGHT_CTRL_PRESSED)
+-        {
+-            keyboard[VK_CONTROL] = keyboard[VK_RCONTROL] = down;
+-        }
+-        if (modifiers & LEFT_ALT_PRESSED)
+-        {
+-            keyboard[VK_MENU] = keyboard[VK_LMENU] = down;
+-        }
+-        if (modifiers & RIGHT_ALT_PRESSED)
+-        {
+-            keyboard[VK_MENU] = keyboard[VK_RMENU] = down;
+-        }
+-        if (modifiers & CAPSLOCK_ON)
+-        {
+-            keyboard[VK_CAPITAL] = locked;
+-        }
+-
+-        // The 1<<2 flag is load-bearing: it tells ToUnicode not to modify
+-        // kernel-side keyboard state. Without it, translating a dead key here
+-        // consumes it and the next key silently loses its accent.
+-        wchar_t buf[8]{};
+-        const auto n = ToUnicode(vkey, scanCode, keyboard, buf, ARRAYSIZE(buf), 1 << 2);
+-        if (n <= 0)
+-        {
+-            // 0 is "no translation"; negative is a dead key.
+-            return {};
+-        }
+-
+-        return GhosttyKeyText(std::wstring_view{ buf, gsl::narrow_cast<size_t>(n) });
+-    }
+-
+-    namespace
+-    {
+-        // The bit a modifier key press sets, or 0 for a key that is not a
+-        // modifier.
+-        //
+-        // Left and right are kept apart because AltGr arrives as left ctrl plus
+-        // right alt and the layout looks at exactly that pair. XAML reports the
+-        // sided virtual key for a modifier (OriginalKey), but the generic one
+-        // still turns up - from an injected event, or from a client that sends
+-        // VK_SHIFT rather than VK_LSHIFT - so both are handled, with the
+-        // extended-key flag standing in for the side when it has to.
+-        uint32_t ModifierBitFor(const uint16_t vkey, const bool extended) noexcept
+-        {
+-            switch (vkey)
+-            {
+-            case VK_SHIFT:
+-            case VK_LSHIFT:
+-            case VK_RSHIFT:
+-                // ControlKeyStates has one shift bit, not two.
+-                return SHIFT_PRESSED;
+-            case VK_LCONTROL:
+-                return LEFT_CTRL_PRESSED;
+-            case VK_RCONTROL:
+-                return RIGHT_CTRL_PRESSED;
+-            case VK_CONTROL:
+-                return extended ? RIGHT_CTRL_PRESSED : LEFT_CTRL_PRESSED;
+-            case VK_LMENU:
+-                return LEFT_ALT_PRESSED;
+-            case VK_RMENU:
+-                return RIGHT_ALT_PRESSED;
+-            case VK_MENU:
+-                return extended ? RIGHT_ALT_PRESSED : LEFT_ALT_PRESSED;
+-            default:
+-                return 0;
+-            }
+-        }
+-    }
+-
+-    uint32_t GhosttyModifiersFor(uint32_t& held,
+-                                 const uint32_t snapshot,
+-                                 const uint16_t vkey,
+-                                 const bool extended,
+-                                 const bool keyDown) noexcept
+-    {
+-        if (const auto bit = ModifierBitFor(vkey, extended))
+-        {
+-            if (keyDown)
+-            {
+-                held |= bit;
+-            }
+-            else
+-            {
+-                held &= ~bit;
+-            }
+-        }
+-
+-        return snapshot | held;
+-    }
+-
+-    // Deliberately keyed on the virtual key rather than on the text the layout
+-    // produces, which is what cascadia matches: its check lives in
+-    // SendCharEvent and compares the character against 0x04 and CR.
+-    //
+-    // A ghostty pane cannot ask the same question that way. The text path here
+-    // is GhosttyKeyTextFor, and it drops every control character on purpose -
+-    // ctrl+d and Enter both come back empty - so there is nothing to compare.
+-    // The vkey is what is left, and it is the more direct question anyway.
+-    //
+-    // Two knowingly-small differences from the character rule, both harmless:
+-    // ctrl+m produces CR and restarts a cascadia pane but not a ghostty one,
+-    // and a layout that puts `d` somewhere other than VK_D closes on the
+-    // physical D key rather than on the letter.
+-    GhosttyExitKey GhosttyExitKeyFor(const uint16_t vkey, const uint32_t modifiers) noexcept
+-    {
+-        const auto ctrl = (modifiers & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
+-        const auto alt = (modifiers & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) != 0;
+-
+-        // Alt is never part of either promise, and alt+enter is WT's own
+-        // fullscreen binding - it must not reach this at all.
+-        if (alt)
+-        {
+-            return GhosttyExitKey::None;
+-        }
+-
+-        // ctrl+enter is LF rather than CR, and cascadia does not restart on it.
+-        if (vkey == VK_RETURN && !ctrl)
+-        {
+-            return GhosttyExitKey::Restart;
+-        }
+-
+-        // Shift is allowed: ctrl+shift+d is still 0x04, so cascadia closes on
+-        // it too.
+-        if (vkey == 'D' && ctrl)
+-        {
+-            return GhosttyExitKey::Close;
+-        }
+-
+-        return GhosttyExitKey::None;
+-    }
+-}
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++
++#include "pch.h"
++#include "GhosttyKeyTranslator.h"
++
++namespace winrt::Microsoft::Terminal::Control::implementation
++{
++    std::string GhosttyKeyText(const std::wstring_view translated)
++    {
++        if (translated.empty())
++        {
++            return {};
++        }
++
++        // Control characters are not text. Backspace, Tab, Enter, Escape and
++        // ctrl+letter all come back from the keyboard layout as
++        // 0x01-0x1A/0x1B/0x7F, but they are keys whose terminal encoding
++        // ghostty owns, and which depend on modes nothing here knows about -
++        // backspace-is-delete, the kitty keyboard protocol, application cursor
++        // keys.
++        //
++        // Forwarding them is destructive rather than merely redundant:
++        // ghostty's key_encode short circuits on a non-empty utf8 field
++        // (`if (event.utf8.len > 0) return try writer.writeAll(event.utf8);`),
++        // so a control character here would *replace* ghostty's own encoding
++        // of the key. ghostty guards the same hazard internally with
++        // isControlUtf8.
++        for (const auto c : translated)
++        {
++            if (c < 0x20 || c == 0x7F)
++            {
++                return {};
++            }
++        }
++
++        return til::u16u8(translated);
++    }
++
++    std::string GhosttyKeyTextFor(const uint32_t modifiers, const uint16_t vkey, const uint16_t scanCode)
++    {
++        constexpr BYTE down = 0x80;
++        constexpr BYTE locked = 0x01;
++
++        BYTE keyboard[256]{};
++        if (modifiers & SHIFT_PRESSED)
++        {
++            keyboard[VK_SHIFT] = keyboard[VK_LSHIFT] = down;
++        }
++        // Left and right are kept apart because AltGr is reported as left ctrl
++        // plus right alt, and a layout with an AltGr mapping for a key looks at
++        // exactly that pair.
++        if (modifiers & LEFT_CTRL_PRESSED)
++        {
++            keyboard[VK_CONTROL] = keyboard[VK_LCONTROL] = down;
++        }
++        if (modifiers & RIGHT_CTRL_PRESSED)
++        {
++            keyboard[VK_CONTROL] = keyboard[VK_RCONTROL] = down;
++        }
++        if (modifiers & LEFT_ALT_PRESSED)
++        {
++            keyboard[VK_MENU] = keyboard[VK_LMENU] = down;
++        }
++        if (modifiers & RIGHT_ALT_PRESSED)
++        {
++            keyboard[VK_MENU] = keyboard[VK_RMENU] = down;
++        }
++        if (modifiers & CAPSLOCK_ON)
++        {
++            keyboard[VK_CAPITAL] = locked;
++        }
++
++        // The 1<<2 flag is load-bearing: it tells ToUnicode not to modify
++        // kernel-side keyboard state. Without it, translating a dead key here
++        // consumes it and the next key silently loses its accent.
++        wchar_t buf[8]{};
++        const auto n = ToUnicode(vkey, scanCode, keyboard, buf, ARRAYSIZE(buf), 1 << 2);
++        if (n <= 0)
++        {
++            // 0 is "no translation"; negative is a dead key.
++            return {};
++        }
++
++        return GhosttyKeyText(std::wstring_view{ buf, gsl::narrow_cast<size_t>(n) });
++    }
++
++    namespace
++    {
++        // The bit a modifier key press sets, or 0 for a key that is not a
++        // modifier.
++        //
++        // Left and right are kept apart because AltGr arrives as left ctrl plus
++        // right alt and the layout looks at exactly that pair. XAML reports the
++        // sided virtual key for a modifier (OriginalKey), but the generic one
++        // still turns up - from an injected event, or from a client that sends
++        // VK_SHIFT rather than VK_LSHIFT - so both are handled, with the
++        // extended-key flag standing in for the side when it has to.
++        uint32_t ModifierBitFor(const uint16_t vkey, const bool extended) noexcept
++        {
++            switch (vkey)
++            {
++            case VK_SHIFT:
++            case VK_LSHIFT:
++            case VK_RSHIFT:
++                // ControlKeyStates has one shift bit, not two.
++                return SHIFT_PRESSED;
++            case VK_LCONTROL:
++                return LEFT_CTRL_PRESSED;
++            case VK_RCONTROL:
++                return RIGHT_CTRL_PRESSED;
++            case VK_CONTROL:
++                return extended ? RIGHT_CTRL_PRESSED : LEFT_CTRL_PRESSED;
++            case VK_LMENU:
++                return LEFT_ALT_PRESSED;
++            case VK_RMENU:
++                return RIGHT_ALT_PRESSED;
++            case VK_MENU:
++                return extended ? RIGHT_ALT_PRESSED : LEFT_ALT_PRESSED;
++            default:
++                return 0;
++            }
++        }
++    }
++
++    uint32_t GhosttyModifiersFor(uint32_t& held,
++                                 const uint32_t snapshot,
++                                 const uint16_t vkey,
++                                 const bool extended,
++                                 const bool keyDown) noexcept
++    {
++        if (const auto bit = ModifierBitFor(vkey, extended))
++        {
++            if (keyDown)
++            {
++                held |= bit;
++            }
++            else
++            {
++                held &= ~bit;
++            }
++        }
++
++        return snapshot | held;
++    }
++
++    std::string GhosttyPacketText(uint16_t& pendingHighSurrogate, const uint16_t scanCode)
++    {
++        const auto unit = scanCode;
++
++        if (unit >= 0xD800 && unit <= 0xDBFF)
++        {
++            // First half of a surrogate pair. Nothing to send yet, and the
++            // second half is the next packet.
++            pendingHighSurrogate = unit;
++            return {};
++        }
++
++        if (pendingHighSurrogate != 0)
++        {
++            const auto high = pendingHighSurrogate;
++            pendingHighSurrogate = 0;
++
++            if (unit >= 0xDC00 && unit <= 0xDFFF)
++            {
++                const wchar_t pair[2]{ static_cast<wchar_t>(high), static_cast<wchar_t>(unit) };
++                return GhosttyKeyText(std::wstring_view{ pair, 2 });
++            }
++
++            // A high surrogate not followed by a low one is not a character.
++            // Dropping it and carrying on with this unit is the only reading
++            // that does not corrupt what follows.
++        }
++
++        const auto ch = static_cast<wchar_t>(unit);
++        return GhosttyKeyText(std::wstring_view{ &ch, 1 });
++    }
++
++    // Deliberately keyed on the virtual key rather than on the text the layout
++    // produces, which is what cascadia matches: its check lives in
++    // SendCharEvent and compares the character against 0x04 and CR.
++    //
++    // A ghostty pane cannot ask the same question that way. The text path here
++    // is GhosttyKeyTextFor, and it drops every control character on purpose -
++    // ctrl+d and Enter both come back empty - so there is nothing to compare.
++    // The vkey is what is left, and it is the more direct question anyway.
++    //
++    // Two knowingly-small differences from the character rule, both harmless:
++    // ctrl+m produces CR and restarts a cascadia pane but not a ghostty one,
++    // and a layout that puts `d` somewhere other than VK_D closes on the
++    // physical D key rather than on the letter.
++    GhosttyExitKey GhosttyExitKeyFor(const uint16_t vkey, const uint32_t modifiers) noexcept
++    {
++        const auto ctrl = (modifiers & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
++        const auto alt = (modifiers & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) != 0;
++
++        // Alt is never part of either promise, and alt+enter is WT's own
++        // fullscreen binding - it must not reach this at all.
++        if (alt)
++        {
++            return GhosttyExitKey::None;
++        }
++
++        // ctrl+enter is LF rather than CR, and cascadia does not restart on it.
++        if (vkey == VK_RETURN && !ctrl)
++        {
++            return GhosttyExitKey::Restart;
++        }
++
++        // Shift is allowed: ctrl+shift+d is still 0x04, so cascadia closes on
++        // it too.
++        if (vkey == 'D' && ctrl)
++        {
++            return GhosttyExitKey::Close;
++        }
++
++        return GhosttyExitKey::None;
++    }
++}
+diff --git a/src/cascadia/TerminalControl/GhosttyKeyTranslator.h b/src/cascadia/TerminalControl/GhosttyKeyTranslator.h
+index f85c3a5bb..42f869ec7 100644
+--- a/src/cascadia/TerminalControl/GhosttyKeyTranslator.h
++++ b/src/cascadia/TerminalControl/GhosttyKeyTranslator.h
+@@ -1,108 +1,128 @@
+-// Copyright (c) Microsoft Corporation.
+-// Licensed under the MIT license.
+-//
+-// Module Name:
+-// - GhosttyKeyTranslator.h
+-//
+-// Abstract:
+-// - The rules a Windows key event has to satisfy before libghostty will make
+-//   sense of it. Each was learned from a bug; each is a pure function so it can
+-//   be unit tested without an engine, a surface or a keyboard.
+-
+-#pragma once
+-
+-#include <string>
+-#include <string_view>
+-
+-namespace winrt::Microsoft::Terminal::Control::implementation
+-{
+-    // ghostty_input_key_s::keycode is the *native* platform keycode - not a
+-    // virtual key, and not a value from ghostty_input_key_e. On Windows its
+-    // table (ghostty's src/input/keycodes.zig) stores the scan code, with
+-    // 0xE000 set for the extended keys:
+-    //
+-    //     //   USB     evdev    XKB     Win     Mac   Code
+-    //     .{ 0x070004, 0x001e, 0x0026, 0x001e, 0x0000, "KeyA" },
+-    //     .{ 0x07004a, 0x0066, 0x006e, 0xe047, 0x0073, "Home" },
+-    //
+-    // Passing the virtual key instead resolves to whatever unrelated key
+-    // shares that number, which is how `d` came to behave like Delete.
+-    constexpr uint32_t GhosttyNativeKeycode(const uint16_t scanCode, const bool extended) noexcept
+-    {
+-        return extended ? (0xE000u | scanCode) : scanCode;
+-    }
+-
+-    // The text to hand to libghostty with a key, given what the keyboard
+-    // layout translated it to. Empty means "this key produces no text".
+-    std::string GhosttyKeyText(std::wstring_view translated);
+-
+-    // The text a key produces under a given set of modifiers, as UTF-8.
+-    //
+-    // `modifiers` is a ControlKeyStates value - the console-style bitfield from
+-    // <wincon.h> - taken *from the key event*. That is the whole point: the
+-    // obvious implementation asks GetKeyboardState() instead, and it is wrong.
+-    // GetKeyboardState reports the state as of the last message the calling
+-    // thread retrieved, while XAML raises KeyDown as a routed event some way
+-    // behind its message pump, so under real typing speed the snapshot has
+-    // already moved on. Shift arriving early or leaving late is enough to turn
+-    // `?` into `/`: typing "echo A?B/C" quickly into a ghostty pane produced
+-    // "????ECH?O A??B?C", and the same keys 200ms apart came out right. A
+-    // cascadia pane is immune only because it never calls ToUnicode - its text
+-    // arrives as CharacterReceived, which Windows generated with the right
+-    // state.
+-    //
+-    // Pass 0 for the modifiers to get the unshifted text, which is what key
+-    // bindings match against.
+-    std::string GhosttyKeyTextFor(uint32_t modifiers, uint16_t vkey, uint16_t scanCode);
+-
+-    // The modifiers a key event actually happened under, which is not the same
+-    // question as what a snapshot says is held *now*.
+-    //
+-    // TermControl samples the modifier keys with CoreWindow::GetKeyState when
+-    // XAML raises KeyDown, and that answer is "now" - some way behind the
+-    // message that carried the key. A person holds shift for around a tenth of
+-    // a second, so the two agree and nothing shows. A remote desktop client
+-    // sends shift-down, the key, and shift-up back to back, and by the time the
+-    // handler asks, shift is up again: `?` arrives as `/` and `A` as `a`.
+-    // See KD-25.
+-    //
+-    // The event stream cannot drift the same way, because it is ordered: the
+-    // shift press is delivered before the key it modifies and the release
+-    // after it. So the modifier keys are tracked as they arrive, in `held`,
+-    // and the snapshot is treated as a floor rather than as the truth - a
+-    // modifier held before this pane had focus is in the snapshot but was
+-    // never seen as an event.
+-    //
+-    // `held` is the caller's state across events, and this updates it. Reset it
+-    // when focus changes: a release that happens while another window owns the
+-    // keyboard is never delivered here, and a modifier stuck down would put
+-    // every subsequent key in the wrong case.
+-    //
+-    // The lock keys are deliberately not tracked. Caps Lock is a state rather
+-    // than a hold, it is reported as locked rather than pressed, and it is not
+-    // subject to the race.
+-    uint32_t GhosttyModifiersFor(uint32_t& held,
+-                                 uint32_t snapshot,
+-                                 uint16_t vkey,
+-                                 bool extended,
+-                                 bool keyDown) noexcept;
+-
+-    // What a key press means once the child is gone.
+-    enum class GhosttyExitKey
+-    {
+-        None,
+-        Close,
+-        Restart,
+-    };
+-
+-    // The two keys the connection promises the user after the child exits:
+-    //
+-    //     [process exited with code 56 (0x00000038)]
+-    //     You can now close this terminal with Ctrl+D, or press Enter to restart.
+-    //
+-    // They belong to the host, not to the terminal, and a pane whose connection
+-    // is Closed has to answer them itself. See KD-24.
+-    //
+-    // Modifiers are a ControlKeyStates bitfield, as everywhere else here.
+-    GhosttyExitKey GhosttyExitKeyFor(uint16_t vkey, uint32_t modifiers) noexcept;
+-}
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++//
++// Module Name:
++// - GhosttyKeyTranslator.h
++//
++// Abstract:
++// - The rules a Windows key event has to satisfy before libghostty will make
++//   sense of it. Each was learned from a bug; each is a pure function so it can
++//   be unit tested without an engine, a surface or a keyboard.
++
++#pragma once
++
++#include <string>
++#include <string_view>
++
++namespace winrt::Microsoft::Terminal::Control::implementation
++{
++    // ghostty_input_key_s::keycode is the *native* platform keycode - not a
++    // virtual key, and not a value from ghostty_input_key_e. On Windows its
++    // table (ghostty's src/input/keycodes.zig) stores the scan code, with
++    // 0xE000 set for the extended keys:
++    //
++    //     //   USB     evdev    XKB     Win     Mac   Code
++    //     .{ 0x070004, 0x001e, 0x0026, 0x001e, 0x0000, "KeyA" },
++    //     .{ 0x07004a, 0x0066, 0x006e, 0xe047, 0x0073, "Home" },
++    //
++    // Passing the virtual key instead resolves to whatever unrelated key
++    // shares that number, which is how `d` came to behave like Delete.
++    constexpr uint32_t GhosttyNativeKeycode(const uint16_t scanCode, const bool extended) noexcept
++    {
++        return extended ? (0xE000u | scanCode) : scanCode;
++    }
++
++    // The text to hand to libghostty with a key, given what the keyboard
++    // layout translated it to. Empty means "this key produces no text".
++    std::string GhosttyKeyText(std::wstring_view translated);
++
++    // The text a key produces under a given set of modifiers, as UTF-8.
++    //
++    // `modifiers` is a ControlKeyStates value - the console-style bitfield from
++    // <wincon.h> - taken *from the key event*. That is the whole point: the
++    // obvious implementation asks GetKeyboardState() instead, and it is wrong.
++    // GetKeyboardState reports the state as of the last message the calling
++    // thread retrieved, while XAML raises KeyDown as a routed event some way
++    // behind its message pump, so under real typing speed the snapshot has
++    // already moved on. Shift arriving early or leaving late is enough to turn
++    // `?` into `/`: typing "echo A?B/C" quickly into a ghostty pane produced
++    // "????ECH?O A??B?C", and the same keys 200ms apart came out right. A
++    // cascadia pane is immune only because it never calls ToUnicode - its text
++    // arrives as CharacterReceived, which Windows generated with the right
++    // state.
++    //
++    // Pass 0 for the modifiers to get the unshifted text, which is what key
++    // bindings match against.
++    std::string GhosttyKeyTextFor(uint32_t modifiers, uint16_t vkey, uint16_t scanCode);
++
++    // The modifiers a key event actually happened under, which is not the same
++    // question as what a snapshot says is held *now*.
++    //
++    // TermControl samples the modifier keys with CoreWindow::GetKeyState when
++    // XAML raises KeyDown, and that answer is "now" - some way behind the
++    // message that carried the key. A person holds shift for around a tenth of
++    // a second, so the two agree and nothing shows. A remote desktop client
++    // sends shift-down, the key, and shift-up back to back, and by the time the
++    // handler asks, shift is up again: `?` arrives as `/` and `A` as `a`.
++    // See KD-25.
++    //
++    // The event stream cannot drift the same way, because it is ordered: the
++    // shift press is delivered before the key it modifies and the release
++    // after it. So the modifier keys are tracked as they arrive, in `held`,
++    // and the snapshot is treated as a floor rather than as the truth - a
++    // modifier held before this pane had focus is in the snapshot but was
++    // never seen as an event.
++    //
++    // `held` is the caller's state across events, and this updates it. Reset it
++    // when focus changes: a release that happens while another window owns the
++    // keyboard is never delivered here, and a modifier stuck down would put
++    // every subsequent key in the wrong case.
++    //
++    // The lock keys are deliberately not tracked. Caps Lock is a state rather
++    // than a hold, it is reported as locked rather than pressed, and it is not
++    // subject to the race.
++    uint32_t GhosttyModifiersFor(uint32_t& held,
++                                 uint32_t snapshot,
++                                 uint16_t vkey,
++                                 bool extended,
++                                 bool keyDown) noexcept;
++
++    // The text a VK_PACKET event carries.
++    //
++    // A VK_PACKET is not a key at all. A client that cannot express a character
++    // as a key press on the server's layout - which is every remote desktop
++    // client whose keyboard is an on-screen one - injects the character itself,
++    // and Windows carries it in the *scan code* as a UTF-16 code unit.
++    //
++    // Reading that as a scan code asks the wrong question entirely: "what key
++    // is scan code 0x41" is F7, where "what character is 0x41" is `A`. Typed
++    // from the Windows App on Android, `:` (0x3A, the Caps Lock scan code)
++    // reached the pane as nothing at all and `A` as F7's escape sequence, with
++    // the character event that would have carried the text suppressed because
++    // the key was reported handled. See KD-25.
++    //
++    // A character outside the BMP arrives as two packets, a high surrogate then
++    // a low one. `pendingHighSurrogate` is the caller's state between the two:
++    // this returns empty text for the first and the whole character for the
++    // second. Reset it when focus changes, like the modifier state.
++    std::string GhosttyPacketText(uint16_t& pendingHighSurrogate, uint16_t scanCode);
++
++    // What a key press means once the child is gone.
++    enum class GhosttyExitKey
++    {
++        None,
++        Close,
++        Restart,
++    };
++
++    // The two keys the connection promises the user after the child exits:
++    //
++    //     [process exited with code 56 (0x00000038)]
++    //     You can now close this terminal with Ctrl+D, or press Enter to restart.
++    //
++    // They belong to the host, not to the terminal, and a pane whose connection
++    // is Closed has to answer them itself. See KD-24.
++    //
++    // Modifiers are a ControlKeyStates bitfield, as everywhere else here.
++    GhosttyExitKey GhosttyExitKeyFor(uint16_t vkey, uint32_t modifiers) noexcept;
++}
+diff --git a/src/cascadia/UnitTests_Control/GhosttyKeyTests.cpp b/src/cascadia/UnitTests_Control/GhosttyKeyTests.cpp
+index da93819bf..09f746b26 100644
+--- a/src/cascadia/UnitTests_Control/GhosttyKeyTests.cpp
++++ b/src/cascadia/UnitTests_Control/GhosttyKeyTests.cpp
+@@ -32,6 +32,7 @@ namespace ControlUnitTests
+         TEST_METHOD(ShiftComesFromTheEventNotTheThread);
+         TEST_METHOD(ShiftHeldOnlyInTheEventStreamStillShifts);
+         TEST_METHOD(AModifierReleaseStopsApplying);
++        TEST_METHOD(APacketCarriesItsCharacterInTheScanCode);
+         TEST_METHOD(TheKeysThatAnswerAnExitedProcess);
+     };
+ 
+@@ -201,6 +202,57 @@ namespace ControlUnitTests
+                          GhosttyModifiersFor(held, SHIFT_PRESSED, 'Q', false, true) & SHIFT_PRESSED);
+     }
+ 
++    // What the Windows App on Android actually sends, measured with
++    // harness/keylog and confirmed by the pane's own trace: not a key, but the
++    // character in a VK_PACKET whose scan code is a UTF-16 unit.
++    //
++    // The values are the ones from that trace. Read as scan codes - which is
++    // what the pane did - 0x3A is Caps Lock, 0x3F is F5 and 0x41 is F7, so `:`
++    // vanished and `A` sent an escape sequence. KD-25.
++    void GhosttyKeyTests::APacketCarriesItsCharacterInTheScanCode()
++    {
++        uint16_t pending = 0;
++
++        VERIFY_ARE_EQUAL(":", GhosttyPacketText(pending, 0x3A));
++        VERIFY_ARE_EQUAL("?", GhosttyPacketText(pending, 0x3F));
++        VERIFY_ARE_EQUAL("A", GhosttyPacketText(pending, 0x41));
++        VERIFY_ARE_EQUAL("a", GhosttyPacketText(pending, 0x61));
++
++        // Non-ASCII goes through as UTF-8 - a packet is how a remote client
++        // sends anything its layout cannot express as a key. Asserted as bytes
++        // rather than as a literal, because a literal here is only as reliable
++        // as the source file's encoding and the test harness's idea of it.
++        const auto eAcute = GhosttyPacketText(pending, 0x00E9);
++        VERIFY_ARE_EQUAL(size_t{ 2 }, eAcute.size());
++        VERIFY_ARE_EQUAL(0xC3u, static_cast<unsigned>(static_cast<unsigned char>(eAcute[0])));
++        VERIFY_ARE_EQUAL(0xA9u, static_cast<unsigned>(static_cast<unsigned char>(eAcute[1])));
++
++        // A character outside the BMP arrives as two packets. The first
++        // produces nothing and is remembered; the second produces the whole
++        // character - U+1F600, four bytes of UTF-8.
++        VERIFY_IS_TRUE(GhosttyPacketText(pending, 0xD83D).empty());
++        VERIFY_ARE_EQUAL(static_cast<uint16_t>(0xD83D), pending);
++        const auto grin = GhosttyPacketText(pending, 0xDE00);
++        VERIFY_ARE_EQUAL(size_t{ 4 }, grin.size());
++        VERIFY_ARE_EQUAL(0xF0u, static_cast<unsigned>(static_cast<unsigned char>(grin[0])));
++        VERIFY_ARE_EQUAL(0x9Fu, static_cast<unsigned>(static_cast<unsigned char>(grin[1])));
++        VERIFY_ARE_EQUAL(0x98u, static_cast<unsigned>(static_cast<unsigned char>(grin[2])));
++        VERIFY_ARE_EQUAL(0x80u, static_cast<unsigned>(static_cast<unsigned char>(grin[3])));
++        VERIFY_ARE_EQUAL(static_cast<uint16_t>(0), pending);
++
++        // A high surrogate followed by something that is not a low one is not
++        // a character: it is dropped, and the unit that followed it still
++        // arrives rather than being swallowed with it.
++        GhosttyPacketText(pending, 0xD83D);
++        VERIFY_ARE_EQUAL("A", GhosttyPacketText(pending, 0x41));
++        VERIFY_ARE_EQUAL(static_cast<uint16_t>(0), pending);
++
++        // Control characters are not text here either - ghostty owns those
++        // encodings, and an empty answer is what tells the caller to send
++        // nothing rather than to overwrite ghostty's own.
++        VERIFY_IS_TRUE(GhosttyPacketText(pending, 0x0D).empty());
++    }
++
+     // The pane's process has exited and the connection has printed "You can now
+     // close this terminal with Ctrl+D, or press Enter to restart". Which key
+     // means which, and - as much as it matters - which keys mean neither.
