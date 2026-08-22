@@ -2263,7 +2263,7 @@ than decided in passing**, and this entry is the record of it.
 
 ---
 
-### KD-25 — Shifted characters cannot be typed from a remote keyboard — **fixed 2026-08-21**
+### KD-25 — Shifted characters cannot be typed from a remote keyboard — **two defects fixed 2026-08-21; the report that found them is NOT resolved**
 
 **Reported by the user, from use**, typing into a ghostty pane through the
 Windows App on Android: `:` and `?` could not be typed at all, nor any other
@@ -2276,12 +2276,12 @@ It reads like [KD-08](#kd-08), and it is neither of the two bugs that turned out
 to be here. KD-08 was `?` arriving as `/` in kitty-protocol applications only,
 because the modifiers a layout *consumes* were reported as none.
 
-**Two independent defects, and the first hypothesis about the transport was
-wrong.** Both are real, both are fixed, and only the second one is what the
-reporter was hitting. The first was found by reasoning about the code and
-reproduced synthetically; the second was found only by measuring what the
-client actually sends. The order matters, because the first explanation
-accounted for the symptom perfectly and was still not the cause.
+**Two independent defects were found and fixed here, and neither of them is
+what the reporter is hitting.** Both are real - measured, reproduced, and worth
+fixing for other remote clients - but the reported symptom survives both fixes.
+See "Still not fixed, and probably not ours" below, which is the state this
+entry is really in. What follows is recorded because the reasoning was wrong
+twice in instructive ways, not because it closed the report.
 
 #### Defect 1 — the modifier state is a snapshot, and it is later than the key
 
@@ -2397,6 +2397,54 @@ many.
 `unitControl` 74/74, including three new pure tests: shift held only in the
 event stream still shifts, a release stops applying, and a packet carries its
 character in the scan code (surrogate pairs included).
+
+#### Still not fixed, and probably not ours
+
+**2026-08-21, after both fixes shipped.** The reporter typed `A?:` from Android
+into a patched build, in three panes side by side. The ghostty pane running
+`harness/rawin` received:
+
+```
+recv[1]: a
+recv[1]: /
+recv[1]: ;
+```
+
+The unshifted characters, cleanly - which neither defect above can produce. A
+mishandled packet produced an F-key escape or nothing at all, never a tidy
+lowercase letter. A clean `a` can only mean the client delivered the *base*
+character.
+
+**And the control finally exists.** The reporter reports the same result in a
+**cascadia** pane in the same window, on the same keystrokes. That is stock
+Windows Terminal code with no ghostty in it, so it clears both engines: whatever
+loses the shift is upstream of the pane. An ordinary desktop RDP client, where
+shift is a real key genuinely held down across the keypress, is correct on the
+same build.
+
+**The leading hypothesis, unconfirmed.** The earlier `harness/keylog` capture
+shows the on-screen shift as a *latching* key - pressed and released 388 ms
+before the character, with no key in between. A latch has to be applied by
+whoever composes the character, and the evidence is that the client is not
+applying it: it sends the plain key, or a packet carrying the plain character.
+Nothing at the server can recover the intent, because by the time the letter
+arrives nothing anywhere says shift was meant.
+
+**The measurement that would settle it**, not yet taken: `harness/keylog` while
+a single capital `A` is typed from the phone. Either a bare key event for `A`'s
+own virtual key with no shift anywhere (client bug, nothing to fix here), or a
+`VK_PACKET` carrying `0x61` rather than `0x41` (client composed the wrong
+character, same conclusion), or something neither fix covers.
+
+**Worth trying first, and it needs no build:** Windows **StickyKeys** exists for
+exactly this sequence - a modifier pressed and released, then the key - and
+applies the latch system-wide rather than per-application.
+
+**The lesson, again, and more expensively this time.** The control run - the
+same keystrokes into a cascadia pane on the same transport - was asked for at
+the very start of the session and never obtained until after two fixes were
+built, measured, documented and committed. Both fixes are sound. Neither
+addresses the report, and one cascadia pane at the beginning would have said so.
 
 #### The gap left open
 
