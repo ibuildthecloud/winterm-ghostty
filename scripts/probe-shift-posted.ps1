@@ -32,9 +32,15 @@ param(
     # Profile to open. Its commandline must be rawin.exe writing to -Log.
     [string]$Profile = 'gh',
     [string]$Log,
-    # Send the characters as VK_PACKET unicode events - the transport the
-    # Windows App on Android uses - instead of as key presses.
+    # Send the characters as VK_PACKET unicode events - what the client puts on
+    # the wire - instead of as key presses.
     [switch]$Packet,
+    # Send what Windows hands the *window* for one of those: the packet already
+    # resolved to a bare virtual key with no scan code, followed by the
+    # character message carrying the character the client really meant. This is
+    # the pair a pane actually sees over Remote Desktop, measured from the
+    # reporter's own session - see KD-25.
+    [switch]$Resolved,
     [switch]$KeepOpen
 )
 
@@ -105,7 +111,16 @@ $packetChords = @(
     @{ Name = 'packet A'; Vk = $VK_PACKET; Scan = 0x41; Shift = $false; Want = 'A' },
     @{ Name = 'packet a'; Vk = $VK_PACKET; Scan = 0x61; Shift = $false; Want = 'a' }
 )
-$chords = if ($Packet) { $packetChords } else { $keyChords }
+# vkey, and the character the accompanying WM_CHAR carries. Scan code is always
+# zero: that is the signature of an injected event.
+$resolvedChords = @(
+    @{ Name = 'resolved ;'; Vk = 0xBA; Char = ';'; Want = ';' },
+    @{ Name = 'resolved :'; Vk = 0xBA; Char = ':'; Want = ':' },
+    @{ Name = 'resolved ?'; Vk = 0xBF; Char = '?'; Want = '?' },
+    @{ Name = 'resolved A'; Vk = 0x41; Char = 'A'; Want = 'A' },
+    @{ Name = 'resolved a'; Vk = 0x41; Char = 'a'; Want = 'a' }
+)
+$chords = if ($Resolved) { $resolvedChords } elseif ($Packet) { $packetChords } else { $keyChords }
 
 if ($Hwnd -ne 0)
 {
@@ -131,8 +146,24 @@ $site = Find-InputSite $hwnd
 if ($site -eq [IntPtr]::Zero) { throw 'no InputSite child window - nothing to post to' }
 Write-Host "window: hwnd $hwnd  inputSite $site"
 
+$WM_CHAR = 0x0102
+
 foreach ($c in $chords)
 {
+    if ($Resolved)
+    {
+        # The key, with no scan code, then the character. Posting the character
+        # explicitly rather than letting TranslateMessage produce one is the
+        # whole point: Windows composes it from the packet the client sent, so
+        # it carries the shift the key event does not.
+        [void][Posted.Win]::PostMessageW($site, $WM_KEYDOWN, [IntPtr]$c.Vk, (Key-LParam 0 $false))
+        [void][Posted.Win]::PostMessageW($site, $WM_CHAR, [IntPtr][int][char]$c.Char, (Key-LParam 0 $false))
+        [void][Posted.Win]::PostMessageW($site, $WM_KEYUP, [IntPtr]$c.Vk, (Key-LParam 0 $true))
+        Write-Host "  posted $($c.Name) (want $($c.Want))"
+        Start-Sleep -Milliseconds 400
+        continue
+    }
+
     if ($c.Shift)
     {
         [void][Posted.Win]::PostMessageW($site, $WM_KEYDOWN, [IntPtr]$VK_LSHIFT, (Key-LParam 0x2A $false))

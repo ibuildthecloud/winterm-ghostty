@@ -1,3 +1,66 @@
+#### Defect 3 — an injected character key is not ours to translate
+
+**The one that mattered.** What the pane is handed while `A?:` is typed from the
+Windows App on Android, from its own trace (`GHOSTTY_TRACE_KEYS`):
+
+```
+key down vkey=0x10 scan=0x2A mods=0x0010   <- shift, a press of its own
+key up   vkey=0x10 scan=0x2A mods=0x0000   <- released before the letter
+key down vkey=0x41 scan=0x00 mods=0x0000   <- `A`, with no scan code
+```
+
+The client injects the character as a unicode event, as defect 2 describes. But
+the pane never sees a `VK_PACKET`: `A` is producible on the current layout, so
+**Windows resolves the packet back into a virtual key** and hands the window a
+bare `0x41` with **no scan code** and no modifier — the shift that would explain
+it having been released two events earlier. `?` arrives as `VK_OEM_2` and `:` as
+`VK_OEM_1`, the same way.
+
+Asking the layout what key `0x41` produces cannot answer the question: it is the
+`A` key whether or not shift was meant. The answer is `a`, which is what the
+pane typed.
+
+Windows still composes the character the client meant for the character message
+that follows, and that is where a **cascadia** pane takes its text from — which
+is why a cascadia pane in the same window, given the identical events, is
+correct. That contrast is the whole diagnosis, and it was available from the
+first minute of the session.
+
+**Fixed** by `GhosttyKeyIsInjectedCharacter`: scan code zero means the event was
+synthesized, so the key is reported unhandled and the character event delivers
+it, exactly as cascadia does. A key pressed on a keyboard always carries a scan
+code, so this is inert for everyone typing on one.
+
+Narrowed to keys that produce text. An injected arrow key, function key or Enter
+has no character behind it and no character event will follow, so those still go
+to the surface as keys and keep the engine's encoding. The [KD-24](#kd-24) exit
+keys are answered ahead of this and are unaffected.
+
+#### What told the three apart
+
+Nothing observable from outside distinguishes them: all three produce a lost
+shift, and each explanation accounted for the reported symptom completely.
+
+- Defect 1 was reasoned from the source and reproduced synthetically.
+- Defect 2 needed `harness/keylog`, a hook on the raw input, to see what the
+  client puts on the wire.
+- Defect 3 needed `GHOSTTY_TRACE_KEYS` — the pane's own view — because what the
+  client sends and what the window receives are **not the same event**. The OS
+  rewrites it in between, and no instrument outside the pane can see that.
+
+**The measurement that would have found it first was never taken.** A cascadia
+pane and a ghostty pane in one window, the same keystrokes from the reporter's
+own transport, compared. It was asked for at the start of the session, not
+obtained, and worked around; two fixes were shipped before the reporter supplied
+the answer himself — *cascadia works, only ghostty windows do not* — which
+inverts the conclusion the session had reached ("the client is broken") and
+points straight at defect 3.
+
+Worth keeping: **a fix that makes a synthetic reproduction pass is not evidence
+that the cause was found**, and *the control run is not optional*. Both
+synthetic reproductions here were faithful to a transport the reporter never
+used.
+
 # Known defects
 
 Things a ghostty pane gets **wrong**, as opposed to things it deliberately does
@@ -2263,7 +2326,7 @@ than decided in passing**, and this entry is the record of it.
 
 ---
 
-### KD-25 — Shifted characters cannot be typed from a remote keyboard — **two defects fixed 2026-08-21; the report that found them is NOT resolved**
+### KD-25 — Shifted characters cannot be typed from a remote keyboard — **fixed 2026-08-21, confirmed by the reporter**
 
 **Reported by the user, from use**, typing into a ghostty pane through the
 Windows App on Android: `:` and `?` could not be typed at all, nor any other
@@ -2276,12 +2339,10 @@ It reads like [KD-08](#kd-08), and it is neither of the two bugs that turned out
 to be here. KD-08 was `?` arriving as `/` in kitty-protocol applications only,
 because the modifiers a layout *consumes* were reported as none.
 
-**Two independent defects were found and fixed here, and neither of them is
-what the reporter is hitting.** Both are real - measured, reproduced, and worth
-fixing for other remote clients - but the reported symptom survives both fixes.
-See "Still not fixed, and probably not ours" below, which is the state this
-entry is really in. What follows is recorded because the reasoning was wrong
-twice in instructive ways, not because it closed the report.
+**Three independent defects, and only the third one was the report.** All three
+are real and all three are fixed; the first two were built, measured, documented
+and committed while the reported symptom carried on exactly as before. They are
+kept here in the order they were found, because the order is the lesson.
 
 #### Defect 1 — the modifier state is a snapshot, and it is later than the key
 
@@ -2365,9 +2426,9 @@ never used.
 
 #### Measured
 
-**The real transport, before the fix.** A pane running `harness/rawin`, which
-names every byte the child receives, with the reporter typing `;?A` from
-Android into the shipped 0.2.10:
+**The real transport, before.** A pane running `harness/rawin`, which names every
+byte the child receives, with the reporter typing `;?A` from Android into the
+shipped 0.2.10:
 
 ```
 recv[1]: ;
@@ -2375,76 +2436,41 @@ recv[1]: /
 recv[1]: a
 ```
 
-**Both paths, on the built fix**, driven by `scripts/probe-shift-posted.ps1`,
-which posts key messages to the XAML input site — no foreground needed, so it
-does not fight a user at the keyboard:
+**The real transport, after**, same instrument, the reporter typing `A?:` from
+Android into a build carrying all three fixes:
 
-| event posted | 0.2.10 | with patch 0065 |
+```
+recv[1]: A
+recv[1]: ?
+recv[1]: :
+```
+
+**Reproduced without a phone**, by `scripts/probe-shift-posted.ps1`, which posts
+messages to the XAML input site and so never fights a user at the keyboard. Its
+`-Resolved` mode posts the pair Windows really delivers — the scan-code-less key,
+then the character message:
+
+| event posted | before | after |
 |---|---|---|
 | `;` | `;` | `;` |
-| shift+`;` (as key events) | `;` | `:` |
-| shift+`/` (as key events) | `/` | `?` |
-| shift+`a` (as key events) | `a` | `A` |
-| packet `0x3A` | nothing | `:` |
-| packet `0x3F` | `ESC O P` (F1) | `?` |
-| packet `0x41` | `ESC [ 15~` (F5) | `A` |
+| `:` | `;` | `:` |
+| `?` | `/` | `?` |
+| `A` | `a` | `A` |
 
-That probe posts its own messages, so WT's pump also translates them into a
-`WM_CHAR` and each chord can land twice — once from the key path and once from
-the character path. Read the log for *which* characters appear, not for how
-many.
+Its other two modes cover the paths the other two defects live on: `-Packet`
+posts `VK_PACKET` events (`0x3A` gave nothing and `0x41` gave F7's escape
+sequence before defect 2 was fixed), and the default posts shift as ordinary key
+events for defect 1.
 
-`unitControl` 74/74, including three new pure tests: shift held only in the
-event stream still shifts, a release stops applying, and a packet carries its
-character in the scan code (surrogate pairs included).
+One artifact worth knowing: in `-Resolved` mode the pump *also* translates the
+posted key into a character of its own, so each chord can land twice. Real
+injected input carries exactly one character — the reporter's own capture above
+shows `A` alone, not `aA`.
 
-#### Still not fixed, and probably not ours
-
-**2026-08-21, after both fixes shipped.** The reporter typed `A?:` from Android
-into a patched build, in three panes side by side. The ghostty pane running
-`harness/rawin` received:
-
-```
-recv[1]: a
-recv[1]: /
-recv[1]: ;
-```
-
-The unshifted characters, cleanly - which neither defect above can produce. A
-mishandled packet produced an F-key escape or nothing at all, never a tidy
-lowercase letter. A clean `a` can only mean the client delivered the *base*
-character.
-
-**And the control finally exists.** The reporter reports the same result in a
-**cascadia** pane in the same window, on the same keystrokes. That is stock
-Windows Terminal code with no ghostty in it, so it clears both engines: whatever
-loses the shift is upstream of the pane. An ordinary desktop RDP client, where
-shift is a real key genuinely held down across the keypress, is correct on the
-same build.
-
-**The leading hypothesis, unconfirmed.** The earlier `harness/keylog` capture
-shows the on-screen shift as a *latching* key - pressed and released 388 ms
-before the character, with no key in between. A latch has to be applied by
-whoever composes the character, and the evidence is that the client is not
-applying it: it sends the plain key, or a packet carrying the plain character.
-Nothing at the server can recover the intent, because by the time the letter
-arrives nothing anywhere says shift was meant.
-
-**The measurement that would settle it**, not yet taken: `harness/keylog` while
-a single capital `A` is typed from the phone. Either a bare key event for `A`'s
-own virtual key with no shift anywhere (client bug, nothing to fix here), or a
-`VK_PACKET` carrying `0x61` rather than `0x41` (client composed the wrong
-character, same conclusion), or something neither fix covers.
-
-**Worth trying first, and it needs no build:** Windows **StickyKeys** exists for
-exactly this sequence - a modifier pressed and released, then the key - and
-applies the latch system-wide rather than per-application.
-
-**The lesson, again, and more expensively this time.** The control run - the
-same keystrokes into a cascadia pane on the same transport - was asked for at
-the very start of the session and never obtained until after two fixes were
-built, measured, documented and committed. Both fixes are sound. Neither
-addresses the report, and one cascadia pane at the beginning would have said so.
+`unitControl` 71 → **75/75**, with four new pure tests: shift held only in the
+event stream still shifts, a release stops applying, a packet carries its
+character in the scan code (surrogate pairs included), and an injected character
+key is not ours to translate.
 
 #### The gap left open
 

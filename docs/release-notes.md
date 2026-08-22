@@ -34,15 +34,17 @@ To confirm a pane is really using it, open the search box (`Ctrl+Shift+F`): on a
 
 ## New in 0.2.11
 
-### Two ways a remote keyboard could lose its shift key
+### Typing from a phone or tablet over Remote Desktop
 
-Both found while chasing a report of shifted characters being untypeable over Remote Desktop, and both fixed ([KD-25](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/known-defects.md)). Neither turned out to be what that report was about — see below — but both are real, and both would bite a client that types this way.
+Shifted characters could not be typed into a ghostty pane from the Windows App on Android: `?` arrived as `/`, `A` as `a`, and `:` could not be produced at all. Every application, and every release — 0.2.2 does the same. A cascadia pane in the same window was correct on the identical keystrokes, which is what eventually located the fault ([KD-25](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/known-defects.md)).
 
-**A remote client that sends the character rather than the keystroke.** An on-screen keyboard cannot press a key on the machine's layout, so it injects the character itself. A ghostty pane read that character's code as if it were a physical key position, so a typed `A` sent what pressing F7 sends and `:` sent nothing at all. Those events now carry their character through as text, emoji and other non-Latin characters included.
+An on-screen keyboard cannot press a key on the machine's layout, so it sends the character itself, and its shift key is a separate tap that ends before the letter is sent. Windows turns that character back into a plain key press — `A` becomes "the A key", with nothing left to say that shift was meant — and puts the real character in the message that follows. A ghostty pane was reading the key and asking the layout what it produces, so it answered `a`. It now recognises an injected key by its missing scan code and takes the character from where Windows put it, which is what a cascadia pane has always done.
 
-**Modifiers read a moment too late.** Windows Terminal asks which modifiers are held when the key event surfaces, which is slightly after the key itself. A person holds shift long enough that this never shows; a client that presses and releases shift around the key in one burst does not. A ghostty pane now tracks the modifier keys from the key events themselves, which arrive in order, and treats the system's answer as a floor rather than the truth.
+Confirmed by the reporter, from the phone that found it.
 
-**Still open:** the report that started this — no shifted character typable from the Windows App on Android — is **not** fixed by either change. A stock cascadia pane fails identically on the same keystrokes, which puts the fault upstream of the pane rather than in the ghostty engine. The evidence so far says that client releases its on-screen shift before sending the key and then sends the unshifted character, which nothing at this end can undo. Windows StickyKeys is the workaround to try.
+Two further defects on the same path were found and fixed while chasing this, both of which would bite other remote clients: characters injected as unicode events had their code point read as a physical key position (so a typed `A` sent what F7 sends), and modifiers were read from a snapshot taken a moment after the key, which loses a shift that a client presses and releases in one burst.
+
+Typing on a physical keyboard is unaffected by all three.
 
 ## New in 0.2.10
 

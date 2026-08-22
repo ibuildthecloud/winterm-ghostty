@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Fri, 21 Aug 2026 23:19:52 -0700
+Subject: [PATCH] fix(control): an injected character key is not ours to
+ translate (KD-25)
+
+The third cause, and the one the reporter was actually hitting. The two
+previous fixes were both real defects and neither changed what he saw.
+
+What the pane is handed while `A?:` is typed from the Windows App on
+Android, from its own trace:
+
+    key down vkey=0x10 scan=0x2A mods=0x0010   <- shift, a press of its own
+    key up   vkey=0x10 scan=0x2A mods=0x0000   <- released before the letter
+    key down vkey=0x41 scan=0x00 mods=0x0000   <- `A`, with no scan code
+
+The client injects the character as a unicode event; Windows resolves it
+to a virtual key because the character is producible on the current
+layout, and hands the window a bare key with **no scan code** and no
+modifier - the shift that would explain it having been released two
+events earlier. So the layout is asked what key 0x41 produces, and
+answers `a`. The same for `?` (arrives as VK_OEM_2) and `:` (VK_OEM_1).
+
+Windows still composes the character the client meant for the character
+message that follows, which is where a cascadia pane takes its text from
+- and why a cascadia pane in the same window, on the identical events, is
+correct. That contrast is what identified this: it is the measurement
+that was missing all evening.
+
+GhosttyKeyIsInjectedCharacter reports the key unhandled so the character
+event delivers it, exactly as cascadia does. Scan code zero is the
+signature - a key pressed on a keyboard always has one - so this is inert
+for anyone typing on a physical keyboard.
+
+Narrowed to keys that produce text. An injected arrow key, function key
+or Enter has no character behind it and no character event will follow,
+so those still go to the surface as keys and keep the engine's encoding.
+The KD-24 exit keys are answered ahead of this and are unaffected.
+
+Reproduced by posting the pair Windows really delivers - the scan-code-
+less key, then the character message - measured with harness/rawin.
+Before: `; : ? A a` typed gives `; ; / a a`, which is the reported bug
+exactly. After: each character arrives.
+
+unitControl 74/75 -> 75/75.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 14 +++++++
+ .../TerminalControl/GhosttyKeyTranslator.cpp  | 12 ++++++
+ .../TerminalControl/GhosttyKeyTranslator.h    | 25 ++++++++++++
+ .../UnitTests_Control/GhosttyKeyTests.cpp     | 40 +++++++++++++++++++
+ 4 files changed, 91 insertions(+)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 173081e0f..fcb89f8a0 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -970,6 +970,20 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             return false;
+         }
+ 
++        // An event with no scan code was injected rather than typed, and its
++        // virtual key cannot say which character was meant - see
++        // GhosttyKeyIsInjectedCharacter. Windows composes the right character
++        // for the message that follows, which is where a cascadia pane takes
++        // its text from and why it is correct on the identical event. Defer to
++        // it the same way: unhandled here, delivered by SendCharEvent.
++        //
++        // The modifier tracking above has already run, so a shift that arrives
++        // this way is still accounted for. This is only about the text.
++        if (GhosttyKeyIsInjectedCharacter(vkey, scanCode))
++        {
++            return false;
++        }
++
+         // A VK_PACKET is a character the client injected, not a key: its scan
+         // code is a UTF-16 code unit. Everything below that reads the scan code
+         // as a scan code has to be told, or `A` is asked about as if it were
+diff --git a/src/cascadia/TerminalControl/GhosttyKeyTranslator.cpp b/src/cascadia/TerminalControl/GhosttyKeyTranslator.cpp
+index b40549086..c1e7db601 100644
+--- a/src/cascadia/TerminalControl/GhosttyKeyTranslator.cpp
++++ b/src/cascadia/TerminalControl/GhosttyKeyTranslator.cpp
+@@ -176,6 +176,18 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         return GhosttyKeyText(std::wstring_view{ &ch, 1 });
+     }
+ 
++    bool GhosttyKeyIsInjectedCharacter(const uint16_t vkey, const uint16_t scanCode)
++    {
++        if (scanCode != 0)
++        {
++            return false;
++        }
++
++        // "Does this key produce text at all" - asked with no modifiers, since
++        // the modifiers are precisely what is missing from an injected event.
++        return !GhosttyKeyTextFor(0, vkey, 0).empty();
++    }
++
+     // Deliberately keyed on the virtual key rather than on the text the layout
+     // produces, which is what cascadia matches: its check lives in
+     // SendCharEvent and compares the character against 0x04 and CR.
+diff --git a/src/cascadia/TerminalControl/GhosttyKeyTranslator.h b/src/cascadia/TerminalControl/GhosttyKeyTranslator.h
+index 42f869ec7..e0cc3820c 100644
+--- a/src/cascadia/TerminalControl/GhosttyKeyTranslator.h
++++ b/src/cascadia/TerminalControl/GhosttyKeyTranslator.h
+@@ -107,6 +107,31 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     // second. Reset it when focus changes, like the modifier state.
+     std::string GhosttyPacketText(uint16_t& pendingHighSurrogate, uint16_t scanCode);
+ 
++    // Whether this event was injected rather than typed, and carries a
++    // character that its virtual key cannot identify.
++    //
++    // A key pressed on a keyboard always has a scan code. Zero means the event
++    // was synthesized - and the Windows App on Android produces exactly that
++    // for every character: the on-screen shift is a press of its own that ends
++    // before the letter, and the letter then arrives as a bare virtual key with
++    // no scan code and no modifier held.
++    //
++    // Asking the layout what that key produces cannot answer the question.
++    // Virtual key 0x41 is the `A` key whether or not shift was meant, so the
++    // answer is `a` for a typed `A` - which is what the pane wrote, through two
++    // releases and two fixes. Windows itself knows, because it composes the
++    // character message from what the client actually sent, and that is where a
++    // cascadia pane takes its text from: which is why a cascadia pane is
++    // correct on the identical event.
++    //
++    // So a caller that gets true here should report the key **unhandled** and
++    // let the character event carry it, exactly as cascadia does.
++    //
++    // Only true for keys that produce text. An injected arrow key, function key
++    // or Enter has no character behind it and no character event will follow,
++    // so those are still keys and still belong to the engine. See KD-25.
++    bool GhosttyKeyIsInjectedCharacter(uint16_t vkey, uint16_t scanCode);
++
+     // What a key press means once the child is gone.
+     enum class GhosttyExitKey
+     {
+diff --git a/src/cascadia/UnitTests_Control/GhosttyKeyTests.cpp b/src/cascadia/UnitTests_Control/GhosttyKeyTests.cpp
+index 09f746b26..92d70e72a 100644
+--- a/src/cascadia/UnitTests_Control/GhosttyKeyTests.cpp
++++ b/src/cascadia/UnitTests_Control/GhosttyKeyTests.cpp
+@@ -33,6 +33,7 @@ namespace ControlUnitTests
+         TEST_METHOD(ShiftHeldOnlyInTheEventStreamStillShifts);
+         TEST_METHOD(AModifierReleaseStopsApplying);
+         TEST_METHOD(APacketCarriesItsCharacterInTheScanCode);
++        TEST_METHOD(AnInjectedCharacterKeyIsNotOursToTranslate);
+         TEST_METHOD(TheKeysThatAnswerAnExitedProcess);
+     };
+ 
+@@ -253,6 +254,45 @@ namespace ControlUnitTests
+         VERIFY_IS_TRUE(GhosttyPacketText(pending, 0x0D).empty());
+     }
+ 
++    // The event the Windows App on Android really delivers, taken from the
++    // pane's own trace while the reporter typed `A?:`:
++    //
++    //     key down vkey=0x10 scan=0x2A mods=0x0010   <- shift, a press of its own
++    //     key up   vkey=0x10 scan=0x2A mods=0x0000   <- released before the letter
++    //     key down vkey=0x41 scan=0x00 mods=0x0000   <- `A`, with no scan code
++    //
++    // Scan code zero is the signature: a key pressed on a keyboard always has
++    // one. The virtual key alone cannot say whether `a` or `A` was meant, so
++    // the character has to come from the character event instead. KD-25.
++    void GhosttyKeyTests::AnInjectedCharacterKeyIsNotOursToTranslate()
++    {
++        const auto layout = GetKeyboardLayout(0);
++        if (LOWORD(reinterpret_cast<UINT_PTR>(layout)) != 0x0409)
++        {
++            Log::Result(WEX::Logging::TestResults::Skipped, L"not a US layout");
++            return;
++        }
++
++        // The three keys from that trace, all injected.
++        VERIFY_IS_TRUE(GhosttyKeyIsInjectedCharacter('A', 0));
++        VERIFY_IS_TRUE(GhosttyKeyIsInjectedCharacter(VK_OEM_2, 0)); // `/?`
++        VERIFY_IS_TRUE(GhosttyKeyIsInjectedCharacter(VK_OEM_1, 0)); // `;:`
++
++        // Typed on a keyboard, the same keys are ours to translate - this rule
++        // must be inert for everyone who is not typing through a remote client.
++        VERIFY_IS_FALSE(GhosttyKeyIsInjectedCharacter('A', 0x1E));
++        VERIFY_IS_FALSE(GhosttyKeyIsInjectedCharacter(VK_OEM_2, 0x35));
++
++        // Injected keys that carry no character stay with the engine, which
++        // owns their encoding. Handing these to the character event would drop
++        // them: no character event follows a key that produces no character.
++        VERIFY_IS_FALSE(GhosttyKeyIsInjectedCharacter(VK_LEFT, 0));
++        VERIFY_IS_FALSE(GhosttyKeyIsInjectedCharacter(VK_F5, 0));
++        VERIFY_IS_FALSE(GhosttyKeyIsInjectedCharacter(VK_RETURN, 0));
++        VERIFY_IS_FALSE(GhosttyKeyIsInjectedCharacter(VK_BACK, 0));
++        VERIFY_IS_FALSE(GhosttyKeyIsInjectedCharacter(VK_ESCAPE, 0));
++    }
++
+     // The pane's process has exited and the connection has printed "You can now
+     // close this terminal with Ctrl+D, or press Enter to restart". Which key
+     // means which, and - as much as it matters - which keys mean neither.
