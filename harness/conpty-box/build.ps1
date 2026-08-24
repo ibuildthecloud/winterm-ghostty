@@ -1,0 +1,15 @@
+# Build the ConPTY corruption harness.
+#
+# Plain Win32 - the ConPTY entry points are resolved at runtime from the
+# conpty.dll under test, so nothing here links against the terminal build.
+$ErrorActionPreference = "Stop"
+Set-Location $PSScriptRoot
+
+$vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+if (-not $vs) { throw "Visual Studio not found" }
+
+$cl = 'cl /nologo /EHsc /std:c++20 /W3 /O2 /Fe:conpty-box.exe main.cpp user32.lib'
+cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul 2>&1 && $cl"
+if ($LASTEXITCODE -ne 0) { throw "compile failed with exit code $LASTEXITCODE" }
+
+Write-Host "built $PSScriptRoot\conpty-box.exe"

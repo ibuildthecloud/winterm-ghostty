@@ -84,6 +84,11 @@ harness/keylog/*.exe
 harness/keylog/*.obj
 harness/keylog/*.txt
 
+# harness/conpty-box: does the ConPTY host corrupt a large escape-dense frame?
+harness/conpty-box/*.exe
+harness/conpty-box/*.obj
+harness/conpty-box/*.raw
+
 # harness/glyphmask: is the glyph atlas coverage, or has D2D corrected it?
 harness/glyphmask/*.exe
 harness/glyphmask/*.obj
