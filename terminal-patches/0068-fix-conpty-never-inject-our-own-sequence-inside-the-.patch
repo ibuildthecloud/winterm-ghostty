@@ -1,0 +1,462 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Mon, 24 Aug 2026 18:06:12 -0700
+Subject: [PATCH] fix(conpty): never inject our own sequence inside the
+ application's (KD-26)
+
+A full-screen frame written over ConPTY arrives mangled about half the
+time: the frame lands a row low with stale rows beneath it, and tails of
+escape sequences are printed as literal text - `;240m`, `[95m`, `291X`.
+Reported from use; reproduces on both engines and not on the terminal the
+Store ships, and swapping only OpenConsole.exe between two otherwise
+identical installs moves the fault.
+
+In ConPTY mode WriteCharsVT parses the application's output into the
+buffer *and* passes the original bytes through verbatim. The parser
+tolerates a write that ends mid-sequence; the writer did not know the
+question existed. Anything conhost emits of its own - a CUP, the cursor
+re-sync's DSR - was appended to the same buffer regardless, landing
+between the head and the tail of a sequence the application was still
+writing. The terminal then sees a complete CSI inside an incomplete one:
+the inner ESC aborts the sequence in progress, the injected sequence is
+dispatched, and the rest of the application's arrives as text.
+
+Writes are split at arbitrary offsets in normal operation - conhost's own
+parser comments on WSL delivering 16 byte chunks - so which sequence gets
+cut, and where, varies run to run. That is the 50%.
+
+VtIo now follows the application's bytes through their sequences
+(_trackPassthrough: ground, escape, CSI, and the string sequences ended
+by BEL or ST), and everything conhost generates goes through _ownSink(),
+which returns the live buffer at a boundary and a pending buffer
+mid-sequence. Pending bytes are appended the moment the application's
+sequence completes, so ours are delayed rather than misplaced.
+WritePassthrough marks which writes carry the application's bytes, since
+that is the only path that can leave the stream mid-sequence.
+WriteCharsLegacy is untouched: control characters are stripped or handled
+individually there, so no sequence survives to be split.
+
+Bisected to upstream da0446a7d ("Send a CPR request on every unknown
+sequence", #20009) - eight rounds, unpatched upstream conhost built per
+step with a fixed toolchain, swapping only OpenConsole.exe, 20 replays
+per verdict. That commit did not add the injection; the machinery
+predates it. It widened the trigger from resizes to every unknown
+sequence, and the latch is sticky, which turned a latent race constant.
+The tests below show the defect without that path at all.
+
+Three tests, each checked in both directions:
+
+    NoInjectionInsideAnIncompleteSequence         fails before, passes after
+    NoInjectionInsideAnIncompleteStringSequence   fails before, passes after
+    OwnWritesAreNotHeldBackBetweenSequences       passes before and after
+
+The third is the guard against over-correcting: waiting for a sequence to
+finish must not become withholding our own writes when there is nothing
+to wait for. VtIoTests 16 -> 18/18.
+
+ScreenBufferTests::ResizeCursorUnchanged aborts the test host at
+assert(gci.IsConsoleLocked()) in SetConptyCursorPositionMayBeWrong. It
+does so with this change stashed too - pre-existing upstream, verified,
+not ours.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/host/VtIo.cpp              | 120 ++++++++++++++++++++++++++++++---
+ src/host/VtIo.hpp              |  25 +++++++
+ src/host/_stream.cpp           |   9 +--
+ src/host/ut_host/VtIoTests.cpp | 110 ++++++++++++++++++++++++++++++
+ 4 files changed, 245 insertions(+), 19 deletions(-)
+
+diff --git a/src/host/VtIo.cpp b/src/host/VtIo.cpp
+index f5214d381..ced5802f6 100644
+--- a/src/host/VtIo.cpp
++++ b/src/host/VtIo.cpp
+@@ -475,7 +475,9 @@ void VtIo::_flushNow()
+     {
+         minSize = 4;
+         _writerRestoreCursor = false;
+-        _back.append("\x1b\x38"); // DECRC: DEC Restore Cursor (+ attributes)
++        // Pairs with BackupCursor's DECSC, so it belongs wherever that went -
++        // never inside a sequence the application is part-way through.
++        _ownSink().append("\x1b\x38"); // DECRC: DEC Restore Cursor (+ attributes)
+     }
+ 
+     if (_overlappedPending)
+@@ -554,18 +556,92 @@ void VtIo::_flushNow()
+     }
+ }
+ 
++// Follows the application's own bytes through their escape sequences, so that
++// _ownSink() knows whether it is safe to add ours.
++//
++// Only enough VT to answer one question: is the passthrough stream mid-sequence?
++// Ground means every sequence it has written so far is finished.
++void VtIo::_trackPassthrough(const std::string_view chunk) noexcept
++{
++    for (const auto ch : chunk)
++    {
++        const auto c = static_cast<unsigned char>(ch);
++
++        switch (_passthroughState)
++        {
++        case PassthroughState::Ground:
++            if (c == 0x1b)
++            {
++                _passthroughState = PassthroughState::Escape;
++            }
++            break;
++        case PassthroughState::Escape:
++            if (c == '[')
++            {
++                _passthroughState = PassthroughState::Csi;
++            }
++            else if (c == ']' || c == 'P' || c == 'X' || c == '^' || c == '_')
++            {
++                _passthroughState = PassthroughState::String;
++            }
++            else
++            {
++                // A two-byte escape, and the ST of a string sequence lands here
++                // as well - either way the sequence is over.
++                _passthroughState = PassthroughState::Ground;
++            }
++            break;
++        case PassthroughState::Csi:
++            // Parameter and intermediate bytes are 0x20-0x3f; a final byte in
++            // 0x40-0x7e ends it.
++            if (c >= 0x40 && c <= 0x7e)
++            {
++                _passthroughState = PassthroughState::Ground;
++            }
++            break;
++        case PassthroughState::String:
++            if (c == 0x07)
++            {
++                _passthroughState = PassthroughState::Ground;
++            }
++            else if (c == 0x1b)
++            {
++                // Presumably the ESC of an ST; the next byte returns us to
++                // ground whatever it is.
++                _passthroughState = PassthroughState::Escape;
++            }
++            break;
++        }
++    }
++
++    // Back at a boundary: anything of ours that was waiting can go out now,
++    // after the application's completed sequence rather than inside it.
++    if (_passthroughState == PassthroughState::Ground && !_pendingOwnWrites.empty())
++    {
++        _back.append(_pendingOwnWrites);
++        _pendingOwnWrites.clear();
++    }
++}
++
++// Where a sequence *we* generate should go: straight out if the application is
++// between sequences, or into the pending buffer if it is part-way through one.
++std::string& VtIo::_ownSink() noexcept
++{
++    return _passthroughState == PassthroughState::Ground ? _back : _pendingOwnWrites;
++}
++
+ void VtIo::Writer::BackupCursor() const
+ {
+     if (!_io->_writerRestoreCursor)
+     {
+         _io->_writerRestoreCursor = true;
+-        _io->_back.append("\x1b\x37"); // DECSC: DEC Save Cursor (+ attributes)
++        _io->_ownSink().append("\x1b\x37"); // DECSC: DEC Save Cursor (+ attributes)
+     }
+ }
+ 
+ void VtIo::Writer::WriteUTF8(std::string_view str) const
+ {
+-    _io->_back.append(str);
++    _io->_ownSink().append(str);
+ }
+ 
+ void VtIo::Writer::WriteUTF16(std::wstring_view str) const
+@@ -607,6 +683,28 @@ void VtIo::Writer::WriteUTF16(std::wstring_view str) const
+ 
+ // When DISABLE_NEWLINE_AUTO_RETURN is not set (Bad! Don't do it!) we'll do newline translation for you.
+ // That's the only difference of this function from WriteUTF16: It does LF -> CRLF translation.
++// The application's own output, passed through verbatim.
++//
++// Told apart from everything else we write because it is the only thing that
++// can leave the stream mid-sequence: a write can end anywhere, including inside
++// an escape sequence, and the rest arrives later. Following it here is what lets
++// _ownSink() hold our own sequences back until the application's is finished.
++void VtIo::Writer::WritePassthrough(const std::wstring_view str, const bool disableNewlineTranslation) const
++{
++    const auto trackFrom = _io->_back.size();
++
++    if (disableNewlineTranslation)
++    {
++        WriteUTF16(str);
++    }
++    else
++    {
++        WriteUTF16TranslateCRLF(str);
++    }
++
++    _io->_trackPassthrough(std::string_view{ _io->_back }.substr(trackFrom));
++}
++
+ void VtIo::Writer::WriteUTF16TranslateCRLF(std::wstring_view str) const
+ {
+     const auto beg = str.begin();
+@@ -692,13 +790,13 @@ void VtIo::Writer::WriteUCS2(wchar_t ch) const
+         buf[len++] = static_cast<char>(0x80 | (ch & 0x3f));
+     }
+ 
+-    _io->_back.append(buf, len);
++    _io->_ownSink().append(buf, len);
+ }
+ 
+ // CUP: Cursor Position
+ void VtIo::Writer::WriteCUP(til::point position) const
+ {
+-    fmt::format_to(std::back_inserter(_io->_back), FMT_COMPILE("\x1b[{};{}H"), position.y + 1, position.x + 1);
++    fmt::format_to(std::back_inserter(_io->_ownSink()), FMT_COMPILE("\x1b[{};{}H"), position.y + 1, position.x + 1);
+ }
+ 
+ // DECTCEM: Text Cursor Enable
+@@ -706,7 +804,7 @@ void VtIo::Writer::WriteDECTCEM(bool enabled) const
+ {
+     char buf[] = "\x1b[?25h";
+     buf[std::size(buf) - 2] = enabled ? 'h' : 'l';
+-    _io->_back.append(&buf[0], std::size(buf) - 1);
++    _io->_ownSink().append(&buf[0], std::size(buf) - 1);
+ }
+ 
+ // SGR 1006: SGR Extended Mouse Mode
+@@ -714,7 +812,7 @@ void VtIo::Writer::WriteSGR1006(bool enabled) const
+ {
+     char buf[] = "\x1b[?1003;1006h";
+     buf[std::size(buf) - 2] = enabled ? 'h' : 'l';
+-    _io->_back.append(&buf[0], std::size(buf) - 1);
++    _io->_ownSink().append(&buf[0], std::size(buf) - 1);
+ }
+ 
+ // DECAWM: Autowrap Mode
+@@ -722,7 +820,7 @@ void VtIo::Writer::WriteDECAWM(bool enabled) const
+ {
+     char buf[] = "\x1b[?7h";
+     buf[std::size(buf) - 2] = enabled ? 'h' : 'l';
+-    _io->_back.append(&buf[0], std::size(buf) - 1);
++    _io->_ownSink().append(&buf[0], std::size(buf) - 1);
+ }
+ 
+ // ASB: Alternate Screen Buffer
+@@ -730,7 +828,7 @@ void VtIo::Writer::WriteASB(bool enabled) const
+ {
+     char buf[] = "\x1b[?1049h";
+     buf[std::size(buf) - 2] = enabled ? 'h' : 'l';
+-    _io->_back.append(&buf[0], std::size(buf) - 1);
++    _io->_ownSink().append(&buf[0], std::size(buf) - 1);
+ }
+ 
+ // DSR CPR: Cursor Position Report
+@@ -741,7 +839,7 @@ bool VtIo::Writer::WriteDSRCPR() const
+         return false;
+     }
+ 
+-    _io->_back.append("\x1b[6n");
++    _io->_ownSink().append("\x1b[6n");
+     _io->_pVtInputThread->CaptureNextCursorPositionReport();
+     return true;
+ }
+@@ -750,7 +848,7 @@ void VtIo::Writer::WriteWindowVisibility(bool visible) const
+ {
+     char buf[] = "\x1b[1t";
+     buf[2] = visible ? '1' : '2';
+-    _io->_back.append(&buf[0], std::size(buf) - 1);
++    _io->_ownSink().append(&buf[0], std::size(buf) - 1);
+ }
+ 
+ void VtIo::Writer::WriteWindowTitle(std::wstring_view title) const
+diff --git a/src/host/VtIo.hpp b/src/host/VtIo.hpp
+index 7330bdaad..5af90d720 100644
+--- a/src/host/VtIo.hpp
++++ b/src/host/VtIo.hpp
+@@ -33,6 +33,7 @@ namespace Microsoft::Console::VirtualTerminal
+             void WriteUTF8(std::string_view str) const;
+             void WriteUTF16(std::wstring_view str) const;
+             void WriteUTF16TranslateCRLF(std::wstring_view str) const;
++            void WritePassthrough(std::wstring_view str, bool disableNewlineTranslation) const;
+             void WriteUTF16StripControlChars(std::wstring_view str) const;
+             void WriteUCS2(wchar_t ch) const;
+             void WriteCUP(til::point position) const;
+@@ -97,6 +98,30 @@ namespace Microsoft::Console::VirtualTerminal
+         // The back buffer is the one we're concurrently writing to.
+         std::string _front;
+         std::string _back;
++
++        // Where the application's own bytes are in their escape sequences, and
++        // anything of ours that is waiting for them to finish.
++        //
++        // In ConPTY mode an application's output is passed through verbatim, and
++        // a single write can end in the middle of a sequence - writes arrive
++        // split at arbitrary offsets. Appending our own escape sequence at that
++        // moment puts it *between* the head and the tail of theirs: the inner
++        // ESC aborts the sequence in progress and its tail reaches the terminal
++        // as text. See _trackPassthrough and VtIoTests::
++        // NoInjectionInsideAnIncompleteSequence.
++        enum class PassthroughState : uint8_t
++        {
++            Ground,
++            Escape,
++            Csi,
++            String, // OSC, DCS, SOS, PM, APC - anything ended by BEL or ST
++        };
++        PassthroughState _passthroughState = PassthroughState::Ground;
++        std::string _pendingOwnWrites;
++
++        void _trackPassthrough(std::string_view chunk) noexcept;
++        std::string& _ownSink() noexcept;
++
+         OVERLAPPED* _overlapped = nullptr;
+         OVERLAPPED _overlappedBuf{};
+         wil::unique_event _overlappedEvent;
+diff --git a/src/host/_stream.cpp b/src/host/_stream.cpp
+index 14d0bf91d..6600fa089 100644
+--- a/src/host/_stream.cpp
++++ b/src/host/_stream.cpp
+@@ -401,14 +401,7 @@ void WriteCharsVT(SCREEN_INFORMATION& screenInfo, const std::wstring_view& str)
+         // DISABLE_NEWLINE_AUTO_RETURN not being set is equivalent to a LF -> CRLF translation.
+         const auto write = [&](size_t beg, size_t end) {
+             const auto chunk = til::safe_slice_abs(str, beg, end);
+-            if (disableNewlineTranslation)
+-            {
+-                writer.WriteUTF16(chunk);
+-            }
+-            else
+-            {
+-                writer.WriteUTF16TranslateCRLF(chunk);
+-            }
++            writer.WritePassthrough(chunk, disableNewlineTranslation);
+         };
+ 
+         // When we encounter something like a RIS (hard reset), we must re-enable
+diff --git a/src/host/ut_host/VtIoTests.cpp b/src/host/ut_host/VtIoTests.cpp
+index 6de23ae0f..f2b41df2c 100644
+--- a/src/host/ut_host/VtIoTests.cpp
++++ b/src/host/ut_host/VtIoTests.cpp
+@@ -270,6 +270,116 @@ class ::Microsoft::Console::VirtualTerminal::VtIoTests
+         VERIFY_ARE_EQUAL(expected, actual);
+     }
+ 
++    // conpty: conhost must never put its own escape sequence inside one the
++    // application is still writing.
++    //
++    // In ConPTY mode the application's bytes are passed through verbatim, and a
++    // single write can end in the middle of a sequence - WSL splits writes at
++    // arbitrary offsets, as the comment in stateMachine.cpp about "16 byte
++    // chunks" notes. Anything conhost appends to the same buffer at that moment
++    // lands between the head and the tail. The terminal then sees a complete
++    // CSI wedged inside an incomplete one: the inner ESC aborts the sequence in
++    // progress, and the tail is printed as text.
++    //
++    // Seen in the wild after the cursor re-sync began firing on every unknown
++    // sequence, appending ESC [ 6 n: an SGR arrived at the terminal as the bare
++    // text ";240m", another as "[95m", and an ECH as "291X" - three fragments,
++    // three split offsets, one cause. Any conhost-originated write carries the
++    // same hazard, so this test provokes it with a cursor position report,
++    // which needs no VT input thread.
++    TEST_METHOD(NoInjectionInsideAnIncompleteSequence)
++    {
++        resetContents();
++        readOutput();
++
++        // The passthrough path is the one an application with VT processing on
++        // takes - which is what a WSL shell does, and the only path where an
++        // escape sequence survives to be split.
++        const auto initialMode = screenInfo->OutputMode;
++        const auto cleanup = wil::scope_exit([=]() {
++            screenInfo->OutputMode = initialMode;
++        });
++        screenInfo->OutputMode = ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
++
++        size_t written;
++
++        // The head of an SGR sequence: this is where the pipe split it.
++        THROW_IF_FAILED(routines.WriteConsoleWImpl(*screenInfo, L"\x1b[38;5", written, nullptr));
++
++        // conhost emits something of its own, as it does for a cursor re-sync
++        // or any API call that has to report state.
++        THROW_IF_FAILED(routines.SetConsoleCursorPositionImpl(*screenInfo, { 2, 1 }));
++
++        // The rest of the application's sequence.
++        THROW_IF_FAILED(routines.WriteConsoleWImpl(*screenInfo, L";240m", written, nullptr));
++
++        const auto actual = readOutput();
++
++        // The failure is an ESC arriving between the head and the tail.
++        const auto torn = actual.find("\x1b[38;5\x1b") != std::string_view::npos;
++        if (torn)
++        {
++            Log::Comment(NoThrowString().Format(L"torn stream: %hs", std::string{ actual }.c_str()));
++        }
++        VERIFY_IS_FALSE(torn, L"conhost injected its own sequence inside the application's");
++
++        // And the application's sequence still has to arrive whole.
++        VERIFY_IS_TRUE(actual.find("\x1b[38;5;240m") != std::string_view::npos,
++                       L"the application's sequence did not survive intact");
++    }
++
++    // The same hazard for a string sequence. These end on BEL or ST rather than
++    // a final byte, so they stay open across far more bytes than a CSI does -
++    // an OSC 8 hyperlink or a long title is easily split.
++    TEST_METHOD(NoInjectionInsideAnIncompleteStringSequence)
++    {
++        resetContents();
++        readOutput();
++
++        const auto initialMode = screenInfo->OutputMode;
++        const auto cleanup = wil::scope_exit([=]() {
++            screenInfo->OutputMode = initialMode;
++        });
++        screenInfo->OutputMode = ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
++
++        size_t written;
++
++        // An OSC that has not been terminated yet.
++        THROW_IF_FAILED(routines.WriteConsoleWImpl(*screenInfo, L"\x1b]0;partial", written, nullptr));
++        THROW_IF_FAILED(routines.SetConsoleCursorPositionImpl(*screenInfo, { 2, 1 }));
++        // ST, which closes it.
++        THROW_IF_FAILED(routines.WriteConsoleWImpl(*screenInfo, L"\x1b\\", written, nullptr));
++
++        const auto actual = readOutput();
++        VERIFY_IS_TRUE(actual.find("\x1b]0;partial\x1b\\") != std::string_view::npos,
++                       L"the application's string sequence did not survive intact");
++    }
++
++    // The other half of the contract: waiting for a sequence to finish must not
++    // turn into holding our own writes back when there is nothing to wait for.
++    // Between sequences they go out as they always did.
++    TEST_METHOD(OwnWritesAreNotHeldBackBetweenSequences)
++    {
++        resetContents();
++        readOutput();
++
++        const auto initialMode = screenInfo->OutputMode;
++        const auto cleanup = wil::scope_exit([=]() {
++            screenInfo->OutputMode = initialMode;
++        });
++        screenInfo->OutputMode = ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
++
++        size_t written;
++
++        // A complete sequence this time.
++        THROW_IF_FAILED(routines.WriteConsoleWImpl(*screenInfo, L"\x1b[38;5;240m", written, nullptr));
++        THROW_IF_FAILED(routines.SetConsoleCursorPositionImpl(*screenInfo, { 2, 1 }));
++
++        const auto actual = readOutput();
++        VERIFY_IS_TRUE(actual.find("\x1b[2;3H") != std::string_view::npos,
++                       L"our own sequence was withheld when the stream was at a boundary");
++    }
++
+     TEST_METHOD(WriteConsoleOutputW)
+     {
+         resetContents();

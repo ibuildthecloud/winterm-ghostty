@@ -92,3 +92,6 @@ harness/conpty-box/*.raw
 # harness/glyphmask: is the glyph atlas coverage, or has D2D corrected it?
 harness/glyphmask/*.exe
 harness/glyphmask/*.obj
+
+# The detached worktree scripts/bisect-conhost.ps1 builds upstream conhost in.
+/terminal-bisect/

@@ -2479,3 +2479,131 @@ snapshot, on both engines. A `ctrl+shift+f` typed from a remote client can
 therefore miss its binding — unreported, not measured here, and a change in
 shared upstream code rather than in the ghostty translator, so it is recorded
 rather than fixed in passing.
+
+---
+
+### KD-26 — A large frame written over ConPTY is corrupted about half the time — **fixed 2026-08-24**
+
+**Reported by the user, from use.** A full-screen TUI frame — one ~12 KB write
+carrying several hundred escape sequences — arrives mangled: the frame sits one
+row low with rows of earlier frames left beneath it, and tails of escape
+sequences are printed as literal text. Three fragments were seen on one screen:
+`;240m`, `[95m`, and `291X`.
+
+**Not ours, and not the ghostty engine.** It reproduces on a ghostty pane *and*
+a cascadia pane, which run entirely different VT parsers — two unrelated parsers
+cannot corrupt identically from correct input, so the damage was already in the
+bytes they were handed. And it does not reproduce on the terminal the Store
+ships. Swapping **only `OpenConsole.exe`** between two otherwise identical
+installs moved the fault, which named the ConPTY host.
+
+We build conhost from source at our pin; the Store ships the 1.24 release
+branch, which forked from `main` a year earlier. So this is upstream `main` code
+that has not shipped to the Store.
+
+#### The defect
+
+In ConPTY mode `WriteCharsVT` parses the application's output into conhost's
+buffer **and passes the original bytes through verbatim**. The parser copes with
+a write that ends mid-sequence (`_cachedSequence`); the writer had no notion of
+it. Anything conhost emits of its own — a `CUP`, the cursor re-sync's `DSR` —
+was appended to the same buffer regardless, landing between the head and the
+tail of a sequence the application was still writing.
+
+The terminal then receives a complete CSI wedged inside an incomplete one. The
+inner `ESC` aborts the sequence in progress, the injected sequence is
+dispatched, the parser returns to ground, and the remainder arrives as text:
+
+| write split after | terminal receives | printed |
+|---|---|---|
+| `\x1b[38;5` | `\x1b[38;5` + injected CSI + `;240m` | `;240m` |
+| `\x1b` | `\x1b` + injected CSI + `[95m` | `[95m` |
+| `\x1b[` | `\x1b[` + injected CSI + `291X` | `291X` |
+
+Three reported fragments, three split offsets, one cause. Writes are split at
+arbitrary offsets in normal operation — conhost's own parser comments on WSL
+delivering 16-byte chunks — which is why identical replays corrupt about half
+the time.
+
+When the injected sequence is a cursor position request, its reply compounds it:
+the terminal's `CSI row;col R` is handled on the VT **input** thread and calls
+`SetConsoleCursorPositionImpl`, moving conhost's cursor to the terminal's
+position while the output thread is mid-repaint. That is the row offset.
+
+#### Bisect
+
+```
+good  e0400150d  Use `vs-pwsh` icons if applicable (#19990)
+bad   da0446a7d  Send a CPR request on every unknown sequence (#20009)
+```
+
+Eight rounds; unpatched upstream conhost built per step in a detached worktree
+with a **fixed toolchain** (v145, SDK 10.0.26100.0) so a verdict could not be the
+compiler; only `OpenConsole.exe` swapped into a fixed install; **20 replays per
+verdict**, because a single clean run proves nothing at 50%. Calibrated first on
+the known-bad pin, at the user's direction — *"start the bisect on a bad commit
+so that we know the test validates correctly"* — which is what made every later
+"clean" trustworthy.
+
+#20009 did not add the injection: `WaitForConptyCursorPositionToBeSynchronized`
+and the `_back`/`_front` buffers predate it. It widened the trigger from resizes
+to **every unknown sequence**, and that latch is sticky until a cursor report
+clears it, so once armed it fires during ordinary output. A latent race made
+constant.
+
+#### The fix — terminal patch 0068
+
+`VtIo` follows the application's bytes through their escape sequences
+(`_trackPassthrough`: ground, escape, CSI, and the string sequences ended by BEL
+or ST). Everything conhost generates goes through `_ownSink()`, which returns the
+live buffer at a sequence boundary and a pending buffer mid-sequence; pending
+bytes are appended the moment the application's sequence completes. So conhost's
+output is delayed by microseconds rather than misplaced. `WritePassthrough`
+marks which writes carry the application's bytes, since that is the only path
+that can leave the stream mid-sequence.
+
+`WriteCharsLegacy` is untouched: control characters are stripped or handled
+individually there, so no escape sequence survives to be split.
+
+#### Measured
+
+Three tests in `VtIoTests`, each checked **in both directions** — a test that
+does not fail without the fix proves nothing:
+
+| test | without the fix | with it |
+|---|---|---|
+| `NoInjectionInsideAnIncompleteSequence` | fails: `torn stream: \x1b[38;5\x1b[2;3H;240m` | passes |
+| `NoInjectionInsideAnIncompleteStringSequence` | fails: the OSC does not survive intact | passes |
+| `OwnWritesAreNotHeldBackBetweenSequences` | passes | passes |
+
+The third is the guard against over-correcting. `VtIoTests` 16 → **18/18**.
+
+#### The harness that did not work, and why that mattered
+
+`harness/conpty-box` drives a ConPTY headlessly and judges what it emits — it
+exists, it is committed, and **it never reproduced this**: 60 runs of a generated
+frame and 10 of the reporter's own capture were clean, through a WSL writer as
+well as a Windows one, with writes split mid-sequence, with WT's glyph flags, and
+with reader backpressure.
+
+The reason is now obvious and was not then: the injection only fires when a
+console client calls `GetConsoleScreenBufferInfo` while the latch is set, and the
+box's child never called it. The box was missing the one ingredient that triggers
+it. Three real bugs in the box were found and fixed on the way (a child
+inheriting the parent's redirected stdout instead of attaching to the pty; UTF-8
+mojibake in code page 437 that *looked* like the corruption; a reader that
+answered none of ConPTY's queries) — worth keeping, but the instrument that
+found this was a human at a 293x80 window.
+
+#### Not reported upstream yet
+
+At the user's direction: the fix is carried here and tested in use first. Drafts
+of the upstream issue and PR exist, written against upstream's own templates,
+and are deliberately built on the three unit tests rather than on the reporting
+application.
+
+#### Unrelated, found on the way
+
+`ScreenBufferTests::ResizeCursorUnchanged` aborts the test host (exit code 3) at
+`assert(gci.IsConsoleLocked())` in `SetConptyCursorPositionMayBeWrong`. It does
+so with this fix stashed too — verified pre-existing upstream, not ours.

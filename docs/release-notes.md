@@ -32,6 +32,28 @@ Nothing switches engine by itself. Add `"engine": "ghostty"` to a profile — or
 
 To confirm a pane is really using it, open the search box (`Ctrl+Shift+F`): on a ghostty pane the regex and case toggles are greyed out.
 
+## New in 0.2.12
+
+### Large, colourful full-screen output is no longer corrupted
+
+A full-screen application repainting over ConPTY — a TUI, a pager, anything that
+writes a whole screen at once with plenty of colour — could have its frame
+mangled roughly half the time: the frame drawn one row low with rows of the
+previous frame left underneath, and fragments of escape sequences printed as
+literal text such as `;240m` or `[95m`.
+
+The console host passes an application's output through to the terminal
+untouched, while also adding sequences of its own. A single write can end
+part-way through an escape sequence, and the host was adding its own bytes
+without checking — landing them between the two halves of the application's.
+The terminal then aborted the half-finished sequence and printed its tail as
+text. It now waits for the application's sequence to finish first
+([KD-26](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/known-defects.md)).
+
+This affects both engines, since the console host sits underneath both. It is an
+upstream defect in code that has not yet reached the shipping terminal, found by
+bisecting Microsoft's history and carried here as a patch.
+
 ## New in 0.2.11
 
 ### Typing from a phone or tablet over Remote Desktop
