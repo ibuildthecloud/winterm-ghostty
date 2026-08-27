@@ -1,0 +1,301 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Algorant <Skantastico@gmail.com>
+Date: Wed, 26 Aug 2026 09:40:58 -0400
+Subject: [PATCH] feat(control): support pane opacity
+
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 44 ++++++++-
+ .../TerminalControl/GhosttyControlCore.h      |  8 ++
+ .../GhosttySettingsTranslator.cpp             | 22 +++--
+ .../Control.UnitTests.vcxproj                 |  1 +
+ .../UnitTests_Control/GhosttyOpacityTests.cpp | 95 +++++++++++++++++++
+ .../GhosttySettingsTests.cpp                  | 14 +++
+ 6 files changed, 175 insertions(+), 9 deletions(-)
+ create mode 100644 src/cascadia/UnitTests_Control/GhosttyOpacityTests.cpp
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index fcb89f8a0..cc233ad3c 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -29,6 +29,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         _settings{ settings }
+     {
+         _setUnfocusedAppearance(unfocusedAppearance);
++        _resetAppearanceState();
+ 
+         // Captured on the thread that creates the pane, which is the UI thread.
+         // Actions arrive on libghostty's threads and the WinRT events they turn
+@@ -602,6 +603,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             _raiseOnUiThread([this, kind, color]() {
+                 if (kind == GHOSTTY_ACTION_COLOR_KIND_BACKGROUND)
+                 {
++                    _backgroundColor = color;
+                     BackgroundColorChanged.raise(*this, nullptr);
+                 }
+                 TabColorChanged.raise(*this, nullptr);
+@@ -1745,10 +1747,22 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     {
+         _settings = settings;
+         _setUnfocusedAppearance(newAppearance);
++        _resetAppearanceState();
+ 
+         _pushSettings();
+     }
+ 
++    void GhosttyControlCore::_resetAppearanceState()
++    {
++        // A settings reload discards the runtime override, as cascadia does.
++        // TermControl rebuilds its XAML brush after UpdateSettings returns.
++        _runtimeOpacity.reset();
++        if (const auto appearance = FocusedAppearance())
++        {
++            _backgroundColor = til::color{ appearance.DefaultBackground() };
++        }
++    }
++
+     void GhosttyControlCore::_setUnfocusedAppearance(const IControlAppearance& newAppearance)
+     {
+         _hasUnfocusedAppearance = static_cast<bool>(newAppearance);
+@@ -1792,11 +1806,35 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     void GhosttyControlCore::SetOverrideColorScheme(const Core::ICoreScheme&) {}
+ 
+     til::color GhosttyControlCore::ForegroundColor() const { return til::color{ 0xFF, 0xFF, 0xFF }; }
+-    til::color GhosttyControlCore::BackgroundColor() const { return til::color{ 0x28, 0x2C, 0x34 }; }
++    til::color GhosttyControlCore::BackgroundColor() const { return _backgroundColor; }
+ 
+-    float GhosttyControlCore::Opacity() const noexcept { return 1.0f; }
++    float GhosttyControlCore::Opacity() const noexcept
++    {
++        if (_runtimeOpacity)
++        {
++            return *_runtimeOpacity;
++        }
++        return _settings ? _settings.Opacity() : 1.0f;
++    }
++
++    // Acrylic is a separate presentation feature. Returning false keeps this
++    // patch to solid XAML opacity while preserving the existing behaviour for
++    // profiles that request acrylic.
+     bool GhosttyControlCore::UseAcrylic() const noexcept { return false; }
+-    void GhosttyControlCore::AdjustOpacity(const float /*opacity*/, const bool /*relative*/) {}
++
++    void GhosttyControlCore::AdjustOpacity(const float opacity, const bool relative)
++    {
++        const auto current = Opacity();
++        const auto next = std::clamp(relative ? current + opacity : opacity, 0.0f, 1.0f);
++        if (next == current)
++        {
++            return;
++        }
++
++        _runtimeOpacity = next;
++        auto args = winrt::make_self<TransparencyChangedEventArgs>(next);
++        TransparencyChanged.raise(*this, *args);
++    }
+     void GhosttyControlCore::ToggleShaderEffects() {}
+     void GhosttyControlCore::ResumeRendering() {}
+     void GhosttyControlCore::WindowVisibilityChanged(const bool /*showOrHide*/) {}
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.h b/src/cascadia/TerminalControl/GhosttyControlCore.h
+index b46e76906..aed4b77d9 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.h
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.h
+@@ -286,6 +286,14 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         Control::IControlAppearance _unfocusedAppearance{ nullptr };
+         bool _hasUnfocusedAppearance{ false };
+         void _setUnfocusedAppearance(const IControlAppearance& newAppearance);
++
++        // XAML owns the pane's numeric opacity and background brush. The
++        // ghostty swap chain leaves its default background transparent so it
++        // can show through. Runtime opacity is the scroll/keybinding override;
++        // null means use the profile value.
++        std::optional<float> _runtimeOpacity;
++        til::color _backgroundColor{ 0x28, 0x2C, 0x34 };
++        void _resetAppearanceState();
+         TerminalConnection::ITerminalConnection _connection{ nullptr };
+         TerminalConnection::ITerminalConnection::TerminalOutput_revoker _connectionOutputRevoker;
+         TerminalConnection::ITerminalConnection::StateChanged_revoker _connectionStateRevoker;
+diff --git a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+index cbba18e9f..8bf43ab6a 100644
+--- a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
++++ b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+@@ -10,12 +10,12 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ {
+     // Settings -> the key/value pairs ghostty's config takes.
+     //
+-    // The MVP scope is deliberately five fields (font, size, scheme,
+-    // scrollback, padding): the ones without which a pane is visibly wrong
+-    // rather than merely unstyled. Everything else - opacity, acrylic,
+-    // background image, bell style - is Phase 6 parity work and is left at
+-    // ghostty's defaults on purpose, so a half-applied setting never looks
+-    // like a translator bug.
++    // The profile fields forwarded here are the values libghostty must own.
++    // Pane opacity is deliberately different: XAML owns the numeric opacity
++    // and background brush, while ghostty supplies transparent pixels for the
++    // default background. Applying the profile's opacity in both layers would
++    // double-compose it (0.9 over 0.9 is effectively 0.99). Acrylic,
++    // background images and shaders remain outside this translator.
+     //
+     // Pure on purpose, and in its own file so that file can be compiled into
+     // the unit tests: it touches no engine state, so it needs no libghostty,
+@@ -253,6 +253,16 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         set("window-padding-y", "0");
+         set("window-padding-balance", "false");
+ 
++        // --- Composition --------------------------------------------------
++        // TermControl already paints the profile background with a XAML brush
++        // and applies the runtime/profile opacity to that brush. The ghostty
++        // swap chain is layered above it, so its default background must be
++        // fully transparent or it hides the XAML result. Explicit cell
++        // backgrounds stay opaque, matching cascadia and preventing text UIs
++        // from becoming translucent merely because the pane is.
++        set("background-opacity", "0");
++        set("background-opacity-cells", "false");
++
+         // --- Colour scheme ------------------------------------------------
+         if (const auto scheme = settings.try_as<Core::ICoreScheme>())
+         {
+diff --git a/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj b/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
+index b355b5abb..f2c298af7 100644
+--- a/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
++++ b/src/cascadia/UnitTests_Control/Control.UnitTests.vcxproj
+@@ -36,6 +36,7 @@
+   <ItemGroup>
+     <ClCompile Include="ControlCoreTests.cpp" />
+     <ClCompile Include="GhosttySettingsTests.cpp" />
++    <ClCompile Include="GhosttyOpacityTests.cpp" />
+     <ClCompile Include="GhosttyEngineSelectionTests.cpp" />
+     <ClCompile Include="GhosttySearchTests.cpp" />
+     <ClCompile Include="GhosttyKeyTests.cpp" />
+diff --git a/src/cascadia/UnitTests_Control/GhosttyOpacityTests.cpp b/src/cascadia/UnitTests_Control/GhosttyOpacityTests.cpp
+new file mode 100644
+index 000000000..10d8faa7e
+--- /dev/null
++++ b/src/cascadia/UnitTests_Control/GhosttyOpacityTests.cpp
+@@ -0,0 +1,95 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++//
++// Runtime opacity belongs to GhosttyControlCore rather than the settings
++// translator: XAML reads it back through IControlCore and updates the pane's
++// background brush from TransparencyChanged.
++
++#include "pch.h"
++#include "../TerminalControl/GhosttyControlCore.h"
++#include "MockControlSettings.h"
++
++using namespace WEX::TestExecution;
++using namespace winrt;
++using namespace winrt::Microsoft::Terminal;
++
++namespace ControlUnitTests
++{
++    class GhosttyOpacityTests
++    {
++        BEGIN_TEST_CLASS(GhosttyOpacityTests)
++            TEST_CLASS_PROPERTY(L"TestTimeout", L"0:0:10")
++        END_TEST_CLASS()
++
++        TEST_METHOD(ProfileRuntimeAndClamp);
++        TEST_METHOD(SettingsReloadResetsRuntimeAndBackground);
++
++    private:
++        static winrt::com_ptr<Control::implementation::GhosttyControlCore> _core(
++            const winrt::com_ptr<MockControlSettings>& settings)
++        {
++            const Control::IControlAppearance noUnfocusedAppearance{ nullptr };
++            const TerminalConnection::ITerminalConnection noConnection{ nullptr };
++            return winrt::make_self<Control::implementation::GhosttyControlCore>(
++                *settings,
++                noUnfocusedAppearance,
++                noConnection);
++        }
++    };
++
++    void GhosttyOpacityTests::ProfileRuntimeAndClamp()
++    {
++        auto settings = winrt::make_self<MockControlSettings>();
++        settings->Opacity(0.5f);
++        auto core = _core(settings);
++
++        VERIFY_ARE_EQUAL(0.5f, core->Opacity());
++
++        size_t changes = 0;
++        float last = 0.0f;
++        core->TransparencyChanged([&](auto&&, const Control::TransparencyChangedEventArgs& args) {
++            ++changes;
++            last = args.Opacity();
++        });
++
++        core->AdjustOpacity(0.25f, true);
++        VERIFY_ARE_EQUAL(0.75f, core->Opacity());
++        VERIFY_ARE_EQUAL(0.75f, last);
++        VERIFY_ARE_EQUAL(size_t{ 1 }, changes);
++        VERIFY_ARE_EQUAL(0.5f, settings->Opacity(), L"runtime adjustment must not mutate the profile");
++
++        core->AdjustOpacity(2.0f, true);
++        VERIFY_ARE_EQUAL(1.0f, core->Opacity(), L"relative adjustment clamps to one");
++        VERIFY_ARE_EQUAL(size_t{ 2 }, changes);
++
++        core->AdjustOpacity(-2.0f, false);
++        VERIFY_ARE_EQUAL(0.0f, core->Opacity(), L"absolute adjustment clamps to zero");
++        VERIFY_ARE_EQUAL(size_t{ 3 }, changes);
++
++        core->AdjustOpacity(0.0f, false);
++        VERIFY_ARE_EQUAL(size_t{ 3 }, changes, L"an unchanged opacity raises no event");
++    }
++
++    void GhosttyOpacityTests::SettingsReloadResetsRuntimeAndBackground()
++    {
++        auto original = winrt::make_self<MockControlSettings>();
++        original->Opacity(0.5f);
++        const til::color originalColor{ 0x11, 0x22, 0x33 };
++        original->DefaultBackground(originalColor);
++        auto core = _core(original);
++
++        VERIFY_ARE_EQUAL(originalColor, core->BackgroundColor());
++        core->AdjustOpacity(0.25f, false);
++        VERIFY_ARE_EQUAL(0.25f, core->Opacity());
++
++        auto replacement = winrt::make_self<MockControlSettings>();
++        replacement->Opacity(0.75f);
++        const til::color replacementColor{ 0x44, 0x55, 0x66 };
++        replacement->DefaultBackground(replacementColor);
++        const Control::IControlAppearance noUnfocusedAppearance{ nullptr };
++        core->UpdateSettings(*replacement, noUnfocusedAppearance);
++
++        VERIFY_ARE_EQUAL(0.75f, core->Opacity(), L"reload discards the runtime override, matching cascadia");
++        VERIFY_ARE_EQUAL(replacementColor, core->BackgroundColor());
++    }
++}
+diff --git a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+index cf3700f77..73f19ba1a 100644
+--- a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
++++ b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+@@ -38,6 +38,7 @@ namespace ControlUnitTests
+         TEST_METHOD(InfiniteScrollbackIsNotForwarded);
+         TEST_METHOD(FiniteScrollbackIsForwarded);
+         TEST_METHOD(PaddingIsZeroBecauseWindowsTerminalAlreadyPads);
++        TEST_METHOD(DefaultBackgroundIsTransparentForXamlComposition);
+         TEST_METHOD(SchemeProducesForegroundBackgroundAndFullPalette);
+         TEST_METHOD(WordDelimitersReachTheEngine);
+         TEST_METHOD(TripleClickHighlightsTheWholeLine);
+@@ -157,6 +158,19 @@ namespace ControlUnitTests
+         VERIFY_IS_TRUE(_has(entries, "window-padding-balance", "false"));
+     }
+ 
++    // TermControl already paints the profile background with a XAML brush and
++    // applies the profile/runtime opacity to that brush. If ghostty also paints
++    // its default background, it covers the brush; if both layers apply 0.9,
++    // the result is effectively 0.99 opaque. Only the default background is
++    // transparent: explicit ANSI cell backgrounds must remain opaque.
++    void GhosttySettingsTests::DefaultBackgroundIsTransparentForXamlComposition()
++    {
++        const auto entries = Control::implementation::TranslateGhosttySettings(*_settings());
++
++        VERIFY_IS_TRUE(_has(entries, "background-opacity", "0"));
++        VERIFY_IS_TRUE(_has(entries, "background-opacity-cells", "false"));
++    }
++
+     // The colours matter for more than looks: while the pane was drawn in
+     // ghostty's defaults and WT's padding in the profile's background, the
+     // mismatch showed up as a visible frame around the terminal.
