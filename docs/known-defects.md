@@ -2846,8 +2846,12 @@ underlined it.
 
 #### The fix
 
-ghostty patch 0047 splits the regex where it was already split, and gives the two
-halves the rules they each deserve:
+**Paths are not links in this fork at all.** `Config.default` registers one link
+carrying `url.scheme_regex` — branch one alone — at `.hover`. Branches two and
+three are never registered.
+
+`url.zig` still gains the split, because the distinction is worth naming and
+`url.regex` had to stay intact for `StringMap`'s tests:
 
 ```zig
 pub const scheme_regex = scheme_url_branch;
@@ -2855,32 +2859,40 @@ pub const path_regex = rooted_or_relative_path_branch ++ "|" ++ bare_relative_pa
 pub const regex = scheme_regex ++ "|" ++ path_regex;   // unchanged, byte for byte
 ```
 
-`Config.default` then registers two links instead of one: the URL at `.hover`,
-the path at upstream's `hover_mods = ctrl`. `url.regex` itself is untouched, so
-`StringMap`'s tests and anything else built on it are unaffected.
+`path_regex` is left defined and unused, for whoever wants it back.
 
-The reasoning for the asymmetry, since it is the whole point: **a URL is
-unambiguous and a path is not.** `https://example.com` cannot be mistaken for
-prose. `src/main.zig` is ordinary text that happens to contain a slash, and there
-is no way to tell the one a user wants to open from the hundred they are only
-reading. Cascadia has no path matching at all, so ctrl is already more than
-parity — the path links are a ghostty feature kept, not a cascadia feature
-missed.
+**This took two attempts, and the first one was wrong in an instructive way.**
+The obvious fix was to demote paths rather than drop them: URL on `.hover`, path
+on upstream's `hover_mods = ctrl`. That shipped, and the reporter rejected it
+within minutes — *"the paths all get underlined only when you hold ctrl. That
+doesn't seem correct."*
 
-`link-url = false` now strips **both** defaults rather than the first. Windows
-Terminal's `detectURLs` is the switch behind it, and turning that off on a
-cascadia pane leaves nothing detected; leaving paths live would have been a new
-surprise in place of the old one.
+He was right, and the reason is one the demotion missed. **Ctrl is not a quiet
+place to put things.** You hold ctrl in order to click a URL, so "only under
+ctrl" means "every time you go to use the feature that works". The noise had not
+been removed, only moved to the moment of use.
+
+The deciding argument is parity, and it settles it cleanly: **cascadia has no
+path matching at all.** There was never a gap here to fill — the path branches
+were a ghostty feature nobody in this fork had asked for, invisible behind a
+modifier for as long as the modifier hid everything, and visible only because
+KD-27 lifted it.
+
+`link-url = false` therefore strips the one default, as upstream does.
 
 #### Measured
 
-`zig build test`: **3107 passed, 56 skipped, 0 failed** — one more than KD-28,
-from a second new test. Two now pin this, both written because the failure they
-guard against is silent:
+`zig build test`: **3107 passed, 56 skipped, 0 failed**. Two tests pin it, both
+written because the failures they guard are silent:
 
-- the two default links exist, in order, with the right regexes and the right
-  highlight rules;
-- `link-url = false` leaves zero links, not one.
+- the single default link carries `scheme_regex`, not `regex`, and highlights on
+  `.hover`, not `.hover_mods` — the two independent ways a rebase reverts this;
+- `link-url = false` leaves zero links.
+
+**By the reporter**, in a pane printing a line of paths (`/etc/hosts`,
+`./build/out`, `~/notes.md`, `src/config/url.zig`, `foo/bar`) and a line of
+slash-bearing prose (`and/or`, `read/write`, `a/b testing`): none of it is a
+link, with or without ctrl. A URL and an OSC 8 link on the lines above still are.
 
 #### What this cost, and what it is worth
 
@@ -2890,9 +2902,17 @@ shipped: the answer was in the **first line of the doc comment** on the constant
 being changed, and the constant was read, quoted in a commit message, and pinned
 with a test — without that line being read.
 
-Worth keeping: **when a change turns something invisible into something visible,
-re-read what it actually matches.** A modifier gate is a place where over-matching
-hides for free. Nobody had complained about ghostty's path links because nobody
-had seen them, and "this was already the behaviour, I only changed when it shows"
-is exactly the reasoning that ships this bug.
+Worth keeping, twice over:
 
+**When a change turns something invisible into something visible, re-read what it
+actually matches.** A modifier gate is a place where over-matching hides for
+free. Nobody had complained about ghostty's path links because nobody had seen
+them, and "this was already the behaviour, I only changed when it shows" is
+exactly the reasoning that ships this bug.
+
+**A modifier is not a place to hide something unwanted.** The first fix moved
+paths behind ctrl and called it bounded. It is not bounded: ctrl is the key you
+hold in order to click a URL, so the noise arrives exactly when the user is
+trying to use the feature that works. If a thing should not be shown, do not
+show it - and here the deciding argument was available from the start, since
+cascadia has no path matching at all and there was never a gap to fill.

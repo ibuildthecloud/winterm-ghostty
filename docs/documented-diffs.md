@@ -66,13 +66,14 @@ What stays different:
   Closing this needs a ghostty renderer change - an underline driven by the
   cell's hyperlink id rather than by the hover set - and was scoped out
   deliberately on 2026-08-31, not overlooked.
-- **A ghostty pane also matches file paths, which cascadia does not** —
-  `/etc/hosts`, `./x`, `~/x` and bare relative paths like `src/main.zig`
-  (`config/url.zig`'s second and third branches). They highlight only while
-  ctrl is held, and a ctrl+click opens them. That asymmetry with URLs, which
-  highlight on a plain hover, is deliberate: a URL is unambiguous and a path is
-  ordinary text containing a slash. Previewing paths on hover underlined most
-  of the output of most commands for about an hour on 2026-08-31 — see
+- **A file path is not a link, on either engine.** ghostty's default matcher
+  covers file paths as well as URLs (`config/url.zig`'s second and third
+  branches: `/etc/hosts`, `./x`, `~/x`, and bare relative ones like
+  `src/main.zig`). This fork registers the scheme branch only, so a ghostty pane
+  matches exactly what a cascadia pane does. That is a ghostty feature given up
+  deliberately, twice over: on hover it underlined most of the output of most
+  commands, and behind ctrl it underlined it whenever a user held ctrl to click
+  a real URL - see
   [KD-29](known-defects.md#kd-29--every-file-path-in-the-output-highlighted-on-hover--fixed-2026-08-31).
 - **The underline is ghostty's**, drawn by its renderer in its own weight and
   colour rather than by WT's.

@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Mon, 31 Aug 2026 12:14:02 -0700
+Subject: [PATCH] config: a file path is not a link
+
+The previous patch demoted path matching to `hover_mods = ctrl` rather
+than removing it. Reported from use within minutes: "the paths all get
+underlined only when you hold ctrl. That doesn't seem correct."
+
+He was right, and the reason the demotion missed is worth stating.
+**Ctrl is not a quiet place to put things.** Ctrl is the key you hold in
+order to click a URL, so "only under ctrl" means "every time you go to
+use the feature that works". The noise was not removed, only moved to the
+moment of use.
+
+So paths are not matched at all now. Config.default registers one link
+carrying `url.scheme_regex` - branch one alone - and branches two and
+three are never registered. `url.path_regex` stays defined and unused,
+for whoever wants it back, and `url.regex` is still the two joined byte
+for byte.
+
+The deciding argument is parity and it was available from the start:
+Windows Terminal's cascadia engine has no path matching whatsoever, a
+ghostty pane is judged beside one in the same window, and there was never
+a gap here to fill. The path branches were a ghostty feature nobody in
+this fork had asked for, invisible for as long as upstream's modifier hid
+everything, and visible only because we stopped hiding.
+
+`link-url = false` strips the one default again, as upstream does.
+
+zig build test: 3107 passed, 56 skipped, 0 failed.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Qm2sT9zLC2AndHGSanf2ws
+---
+ src/config/Config.zig | 73 ++++++++++++++++++-------------------------
+ 1 file changed, 30 insertions(+), 43 deletions(-)
+
+diff --git a/src/config/Config.zig b/src/config/Config.zig
+index 6739762f9..326361241 100644
+--- a/src/config/Config.zig
++++ b/src/config/Config.zig
+@@ -3962,35 +3962,34 @@ pub fn default(alloc_gpa: Allocator) Allocator.Error!Config {
+     // Add our default command palette entries
+     try result.@"command-palette-entry".init(alloc);
+ 
+-    // Our default links, in priority order: a URL, then a file path.
++    // One default link: a URL, highlighted on a plain hover.
+     //
+-    // Upstream has one link carrying `url.regex`, which matches both, at
+-    // `.{ .hover_mods = ctrlOrSuper }`. This fork splits them because they do
+-    // not deserve the same rule:
++    // Two deliberate departures from upstream, which registers a single link
++    // carrying `url.regex` at `.{ .hover_mods = ctrlOrSuper }`:
+     //
+-    // - A **URL** highlights on a plain hover, matching what Windows
+-    //   Terminal's cascadia engine does and what this fork's panes are judged
+-    //   against. `https://example.com` is unambiguous; nothing else looks like
+-    //   it.
++    // 1. **`url.scheme_regex`, not `url.regex`.** `url.regex` matches file
++    //    paths as well - see its doc comment, and its second and third
++    //    branches - and this fork does not want them. Windows Terminal's
++    //    cascadia engine has no path matching at all, a ghostty pane is judged
++    //    beside one in the same window, and `src/main.zig` is ordinary text
++    //    that happens to contain a slash. Highlighting paths on hover lit up
++    //    most of the output of most commands; moving them behind ctrl left
++    //    them lighting up whenever a user held ctrl to click a real URL. Both
++    //    were reported from use, within an hour of each other, and the second
++    //    is why this is a removal rather than a demotion.
+     //
+-    // - A **path** keeps upstream's modifier. `src/main.zig` and `/etc/hosts`
+-    //   are ordinary text that happens to contain a slash, and previewing them
+-    //   on hover lit up most of the output of most commands - reported from
+-    //   use, an hour after the URL half shipped. Cascadia has no path matching
+-    //   at all, so ctrl is already more than parity.
++    // 2. **`.hover`, not `.hover_mods`.** A URL underlines as soon as the
++    //    pointer is over it, which is what a cascadia pane does. The modifier
++    //    still gates *opening* it - that is the embedder's ctrl+click - so
++    //    this only changes the preview.
+     //
+-    // Order is priority order (see the `link` docs), so a scheme URL is
+-    // matched as a URL and never as the path that follows its slashes.
++    // `url.regex` and `url.path_regex` are left intact for anything that wants
++    // them; nothing here registers them.
+     try result.link.links.append(alloc, .{
+         .regex = url.scheme_regex,
+         .action = .{ .open = {} },
+         .highlight = .{ .hover = {} },
+     });
+-    try result.link.links.append(alloc, .{
+-        .regex = url.path_regex,
+-        .action = .{ .open = {} },
+-        .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
+-    });
+ 
+     return result;
+ }
+@@ -4039,36 +4038,28 @@ pub fn loadEntry(
+     try self.loadIter(alloc, &iter);
+ }
+ 
+-test "a URL highlights on a plain hover, a path only under ctrl" {
++test "the default link matches URLs only, and highlights on a plain hover" {
+     const testing = std.testing;
+     const alloc = testing.allocator;
+ 
+     var cfg: Config = try .default(alloc);
+     defer cfg.deinit();
+ 
+-    // Upstream has one link at `.{ .hover_mods = ctrlOrSuper }` carrying a
+-    // regex that matches URLs *and* paths. This fork splits them, and both
+-    // halves of that split are load-bearing:
+-    //
+-    // - the URL on `.hover`, because a ghostty pane is judged beside a
+-    //   cascadia pane that underlines a URL on a plain hover;
+-    // - the path still behind ctrl, because hovering paths lit up most of the
+-    //   output of most commands when it briefly did not.
++    // Both halves of this are departures from upstream, and both are silent
++    // when a rebase onto a new upstream pin reverts them:
+     //
+-    // A rebase onto a new upstream pin reverts both silently, and neither
+-    // failure is loud. This is what catches it.
+-    try testing.expectEqual(@as(usize, 2), cfg.link.links.items.len);
+-    try testing.expect(
+-        std.meta.activeTag(cfg.link.links.items[0].highlight) == .hover,
+-    );
++    // - `scheme_regex`, not `regex`: the latter matches file paths too, and
++    //   this fork wants none of them (cascadia has no path matching at all).
++    // - `.hover`, not `.hover_mods`: a URL previews without a modifier,
++    //   because the cascadia pane it is judged beside does.
++    try testing.expectEqual(@as(usize, 1), cfg.link.links.items.len);
+     try testing.expectEqualStrings(url.scheme_regex, cfg.link.links.items[0].regex);
+     try testing.expect(
+-        std.meta.activeTag(cfg.link.links.items[1].highlight) == .hover_mods,
++        std.meta.activeTag(cfg.link.links.items[0].highlight) == .hover,
+     );
+-    try testing.expectEqualStrings(url.path_regex, cfg.link.links.items[1].regex);
+ }
+ 
+-test "link-url off removes both default matchers" {
++test "link-url off leaves no link matchers at all" {
+     const testing = std.testing;
+     const alloc = testing.allocator;
+ 
+@@ -4928,11 +4919,7 @@ pub fn finalize(self: *Config) !void {
+ 
+     // If URLs are disabled, cut off the first link. The first link is
+     // always the URL matcher.
+-    // Both defaults, not one: this fork registers the URL and the path matcher
+-    // separately (see `default`), and `link-url` off means no link detection,
+-    // not "paths only". Windows Terminal's `detectURLs` is the switch behind
+-    // it, and turning that off on a cascadia pane leaves nothing detected.
+-    if (!self.@"link-url") self.link.links.items = self.link.links.items[2..];
++    if (!self.@"link-url") self.link.links.items = self.link.links.items[1..];
+ 
+     // We warn when the quit-after-last-window-closed-delay is set to a very
+     // short value because it can cause Ghostty to quit before the first

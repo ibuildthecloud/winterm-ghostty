@@ -59,17 +59,6 @@ interface is exactly the kind of program that marks its own text as links. Both
 engines now behave the same, and a ctrl+click over a link still opens it rather
 than being reported to the program - a plain click goes to the program as before.
 
-### File paths are links too, under ctrl
-
-ghostty recognises file paths as well as URLs - `/etc/hosts`, `~/notes.md`,
-`src/main.zig` - and a ctrl+click opens them. Cascadia does not do this at all,
-so it is an addition rather than a difference to apologise for.
-
-Paths highlight only while ctrl is held, where a URL highlights on a plain
-hover. That is deliberate: a URL is unmistakable, whereas a path is ordinary
-text that happens to contain a slash, and previewing every one of them on hover
-underlines half of any build log.
-
 One difference remains, and it is the smaller half. Cascadia gives *every* OSC 8
 hyperlink a faint dotted underline whether or not you are near it; a ghostty pane
 marks one only while the pointer is on it.
