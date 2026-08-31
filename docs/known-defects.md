@@ -1,66 +1,3 @@
-#### Defect 3 — an injected character key is not ours to translate
-
-**The one that mattered.** What the pane is handed while `A?:` is typed from the
-Windows App on Android, from its own trace (`GHOSTTY_TRACE_KEYS`):
-
-```
-key down vkey=0x10 scan=0x2A mods=0x0010   <- shift, a press of its own
-key up   vkey=0x10 scan=0x2A mods=0x0000   <- released before the letter
-key down vkey=0x41 scan=0x00 mods=0x0000   <- `A`, with no scan code
-```
-
-The client injects the character as a unicode event, as defect 2 describes. But
-the pane never sees a `VK_PACKET`: `A` is producible on the current layout, so
-**Windows resolves the packet back into a virtual key** and hands the window a
-bare `0x41` with **no scan code** and no modifier — the shift that would explain
-it having been released two events earlier. `?` arrives as `VK_OEM_2` and `:` as
-`VK_OEM_1`, the same way.
-
-Asking the layout what key `0x41` produces cannot answer the question: it is the
-`A` key whether or not shift was meant. The answer is `a`, which is what the
-pane typed.
-
-Windows still composes the character the client meant for the character message
-that follows, and that is where a **cascadia** pane takes its text from — which
-is why a cascadia pane in the same window, given the identical events, is
-correct. That contrast is the whole diagnosis, and it was available from the
-first minute of the session.
-
-**Fixed** by `GhosttyKeyIsInjectedCharacter`: scan code zero means the event was
-synthesized, so the key is reported unhandled and the character event delivers
-it, exactly as cascadia does. A key pressed on a keyboard always carries a scan
-code, so this is inert for everyone typing on one.
-
-Narrowed to keys that produce text. An injected arrow key, function key or Enter
-has no character behind it and no character event will follow, so those still go
-to the surface as keys and keep the engine's encoding. The [KD-24](#kd-24) exit
-keys are answered ahead of this and are unaffected.
-
-#### What told the three apart
-
-Nothing observable from outside distinguishes them: all three produce a lost
-shift, and each explanation accounted for the reported symptom completely.
-
-- Defect 1 was reasoned from the source and reproduced synthetically.
-- Defect 2 needed `harness/keylog`, a hook on the raw input, to see what the
-  client puts on the wire.
-- Defect 3 needed `GHOSTTY_TRACE_KEYS` — the pane's own view — because what the
-  client sends and what the window receives are **not the same event**. The OS
-  rewrites it in between, and no instrument outside the pane can see that.
-
-**The measurement that would have found it first was never taken.** A cascadia
-pane and a ghostty pane in one window, the same keystrokes from the reporter's
-own transport, compared. It was asked for at the start of the session, not
-obtained, and worked around; two fixes were shipped before the reporter supplied
-the answer himself — *cascadia works, only ghostty windows do not* — which
-inverts the conclusion the session had reached ("the client is broken") and
-points straight at defect 3.
-
-Worth keeping: **a fix that makes a synthetic reproduction pass is not evidence
-that the cause was found**, and *the control run is not optional*. Both
-synthetic reproductions here were faithful to a transport the reporter never
-used.
-
 # Known defects
 
 Things a ghostty pane gets **wrong**, as opposed to things it deliberately does
@@ -1970,6 +1907,13 @@ One difference does bite here: ghostty only looks for an OSC 8 link when
 the modifiers *equal* ctrl-or-super, so an application's own links are
 invisible until ctrl is held, where cascadia shows them on a plain hover.
 
+> **Superseded 2026-08-31.** That gate is gone, on both the regex link and
+> the OSC 8 one - the user reported the modifier-gated preview as links not
+> working at all, which was the right reading of it. See
+> [KD-27](#kd-27--links-were-invisible-until-ctrl-was-held--fixed-2026-08-31).
+> Everything else in this entry stands: the position, the drag rule, the
+> synthesised release, and Windows Terminal owning the click.
+
 #### Still ghostty's, not cascadia's
 
 Which text counts as a link, and the fact that every link - OSC 8 included -
@@ -2410,6 +2354,69 @@ already accounted for them when it chose the character. A character outside the
 BMP arrives as two packets, so a high surrogate is held until its low surrogate
 lands; that state is cleared on a focus change like the modifier state.
 
+#### Defect 3 — an injected character key is not ours to translate
+
+**The one that mattered.** What the pane is handed while `A?:` is typed from the
+Windows App on Android, from its own trace (`GHOSTTY_TRACE_KEYS`):
+
+```
+key down vkey=0x10 scan=0x2A mods=0x0010   <- shift, a press of its own
+key up   vkey=0x10 scan=0x2A mods=0x0000   <- released before the letter
+key down vkey=0x41 scan=0x00 mods=0x0000   <- `A`, with no scan code
+```
+
+The client injects the character as a unicode event, as defect 2 describes. But
+the pane never sees a `VK_PACKET`: `A` is producible on the current layout, so
+**Windows resolves the packet back into a virtual key** and hands the window a
+bare `0x41` with **no scan code** and no modifier — the shift that would explain
+it having been released two events earlier. `?` arrives as `VK_OEM_2` and `:` as
+`VK_OEM_1`, the same way.
+
+Asking the layout what key `0x41` produces cannot answer the question: it is the
+`A` key whether or not shift was meant. The answer is `a`, which is what the
+pane typed.
+
+Windows still composes the character the client meant for the character message
+that follows, and that is where a **cascadia** pane takes its text from — which
+is why a cascadia pane in the same window, given the identical events, is
+correct. That contrast is the whole diagnosis, and it was available from the
+first minute of the session.
+
+**Fixed** by `GhosttyKeyIsInjectedCharacter`: scan code zero means the event was
+synthesized, so the key is reported unhandled and the character event delivers
+it, exactly as cascadia does. A key pressed on a keyboard always carries a scan
+code, so this is inert for everyone typing on one.
+
+Narrowed to keys that produce text. An injected arrow key, function key or Enter
+has no character behind it and no character event will follow, so those still go
+to the surface as keys and keep the engine's encoding. The [KD-24](#kd-24) exit
+keys are answered ahead of this and are unaffected.
+
+#### What told the three apart
+
+Nothing observable from outside distinguishes them: all three produce a lost
+shift, and each explanation accounted for the reported symptom completely.
+
+- Defect 1 was reasoned from the source and reproduced synthetically.
+- Defect 2 needed `harness/keylog`, a hook on the raw input, to see what the
+  client puts on the wire.
+- Defect 3 needed `GHOSTTY_TRACE_KEYS` — the pane's own view — because what the
+  client sends and what the window receives are **not the same event**. The OS
+  rewrites it in between, and no instrument outside the pane can see that.
+
+**The measurement that would have found it first was never taken.** A cascadia
+pane and a ghostty pane in one window, the same keystrokes from the reporter's
+own transport, compared. It was asked for at the start of the session, not
+obtained, and worked around; two fixes were shipped before the reporter supplied
+the answer himself — *cascadia works, only ghostty windows do not* — which
+inverts the conclusion the session had reached ("the client is broken") and
+points straight at defect 3.
+
+Worth keeping: **a fix that makes a synthetic reproduction pass is not evidence
+that the cause was found**, and *the control run is not optional*. Both
+synthetic reproductions here were faithful to a transport the reporter never
+used.
+
 #### The measurement that told the two apart
 
 Nothing observable from outside distinguishes them: both produce a lost shift,
@@ -2607,3 +2614,96 @@ application.
 `ScreenBufferTests::ResizeCursorUnchanged` aborts the test host (exit code 3) at
 `assert(gci.IsConsoleLocked())` in `SetConptyCursorPositionMayBeWrong`. It does
 so with this fix stashed too — verified pre-existing upstream, not ours.
+
+---
+
+### KD-27 — Links were invisible until ctrl was held — **fixed 2026-08-31, confirmed by the reporter**
+
+**Reported by the user, from use**, with the control run supplied in the same
+sentence:
+
+> *"ctrl+click is not highlighting URLs, making them clickable. It just seems
+> like links are not functioning in ghostty at all. In cascadia on mouse hover a
+> link will get underlined and for OSC hyperlinks they have a dotted underline.
+> And on ctrl+click they open in the browser. All three are not working in
+> ghostty."*
+
+#### What was actually wrong
+
+**Nothing was broken.** The machinery [KD-20](#kd-20--a-url-highlighted-where-the-last-click-was-and-ctrlclick-opened-nothing--fixed-2026-08-18)
+built was intact and unchanged — the mouse position, the drag rule, the
+synthesised release, `MOUSE_OVER_LINK`, WT's ctrl+click. Nothing in that path had
+been touched since; the commits in between were key handling (KD-24, KD-25) and
+ConPTY (KD-26).
+
+What was wrong was a **decision**, taken at KD-20 and written up as accepted:
+ghostty highlights nothing until ctrl is held, and that was carried over as
+GD-01's "a link previews only while ctrl is held, OSC 8 included". The report is
+what showed the acceptance was wrong, and the reasoning is short: a preview you
+have to already suspect is there in order to see is not a preview. There is no
+reason to hold a modifier over a piece of text unless you already believe it is a
+link — which is the thing the highlight exists to tell you.
+
+Three gates in ghostty implemented that rule, and they had to move together,
+because the underline comes from one of them and the reported URL from another:
+
+| Where | What it said |
+|---|---|
+| `config/Config.zig`, `default()` | the built-in URL link is `.{ .hover_mods = ctrlOrSuper }` |
+| `Surface.zig`, `linkAtPos` | look at a cell's hyperlink data only `if (mouse_mods.equal(ctrlOrSuper))` |
+| `renderer/generic.zig` | ask for the OSC 8 highlight set only under the same equality |
+
+Move one alone and the pane highlights text it will not report, or reports a link
+it does not draw. The middle one also explains a smaller oddity nobody had
+reported: **ctrl+shift found no link either**, since the test was equality, not
+containment.
+
+#### The fix
+
+ghostty patch 0045 removes all three, and the terminal side stops any release it
+sends from opening a link — ghostty opens on the *release* of a click over one,
+and `over_link` is now true far more often than it was. That costs nothing, since
+WT never forwards a link click to the surface anyway: `PointerPressed` answers a
+ctrl+click from `GetHyperlink` and returns. Opening a link stays entirely WT's,
+through its own opener and its dialog for schemes it refuses.
+
+One ghostty test, on the config default. It is the single value that a rebase
+onto a new upstream pin would silently revert, and the symptom of that regression
+is invisible rather than loud.
+
+#### Measured
+
+**By the reporter, by hand, on his own machine:** *"i tested and the ghostty side
+is functioning like the cascadia side."*
+
+**Captured**, a ghostty pane and a cascadia pane split in one window of a Debug
+portable build, both running the same two lines — a bare `http://` URL and an
+OSC 8 sequence whose label is `CLICK THIS TEXT` and whose target is
+`https://example.com/osc8-target`:
+
+| pointer | ghostty pane | cascadia pane |
+|---|---|---|
+| on `CLICK THIS TEXT` | **underlined**, no ctrl held | underlined |
+| away from it | not marked | still dotted-underlined |
+
+The second row is the difference that remains and was scoped out deliberately:
+cascadia marks every OSC 8 cell whether you are near it or not, ghostty marks one
+only under the pointer. It is written up in
+[GD-01](documented-diffs.md#gd-01--hyperlinks--implemented-2026-08-18-hover-parity-2026-08-31).
+
+`zig build test`: 3106 passed, 56 skipped, 0 failed.
+
+#### What this cost, and what it is worth
+
+The scripted probe was the weakest part of the session and contributed nothing.
+It needs the pointer and the foreground; the user was at the machine for most of
+the work, the one run that completed was mis-calibrated and captured a background
+window, and the frame that actually proved the fix was an accident — the user's
+own pointer happened to be resting on the OSC 8 link when an unrelated capture
+was taken.
+
+Worth keeping: **a difference recorded as accepted is not thereby settled.**
+GD-01 named this exact behaviour, in writing, on the day it shipped, and named it
+as the bigger of its two differences — and it still took a user report to
+re-open, because a documented diff reads as a decision already made rather than
+as a question still open. The list is a backlog, not an archive.

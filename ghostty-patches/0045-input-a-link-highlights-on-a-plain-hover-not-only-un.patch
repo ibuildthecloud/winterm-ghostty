@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Mon, 31 Aug 2026 09:25:02 -0700
+Subject: [PATCH] input: a link highlights on a plain hover, not only under
+ ctrl
+
+A URL in a Windows Terminal ghostty pane was not visibly a link until ctrl
+was held, and neither was an OSC 8 hyperlink an application had marked.
+Reported from use, against the cascadia pane in the same window, which
+underlines a URL as soon as the pointer is on it and dotted-underlines
+every OSC 8 cell whether the pointer is near it or not.
+
+Three gates said ctrl, and they had to go together: the underline is drawn
+from one of them and the reported link comes from another, so moving one
+alone makes a pane that highlights text it will not report, or reports a
+link it does not draw.
+
+- `Config.default` registers the built-in URL link with
+  `.highlight = .{ .hover_mods = ctrlOrSuper }`. Now `.hover`.
+- `Surface.linkAtPos` looked at a cell's hyperlink data only when the mouse
+  mods *equal* ctrl-or-super - so ctrl+shift found nothing either. Gone.
+- The renderer's OSC 8 pass tested that same equality before asking for the
+  highlighted cell set. Gone.
+
+This is a deliberate divergence from upstream, not a bug fix. Upstream's
+rule is defensible for a terminal that owns its own click; this fork's
+embedder does not own it. Windows Terminal answers a ctrl+click itself, on
+the press, from `GetHyperlink`, and never forwards it to the surface - so
+nothing here makes a plain click open a link. The highlight is the preview
+and only the preview.
+
+One test, on the config default, because that is the value a rebase onto a
+new upstream pin would silently revert.
+
+zig build test: 3106 passed, 56 skipped, 0 failed.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Qm2sT9zLC2AndHGSanf2ws
+---
+ src/Surface.zig          | 10 ++++++++--
+ src/config/Config.zig    | 29 +++++++++++++++++++++++++++--
+ src/renderer/generic.zig |  8 ++++----
+ 3 files changed, 39 insertions(+), 8 deletions(-)
+
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 8f2f674d5..06f40b9b8 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -4410,8 +4410,14 @@ fn linkAtPos(
+     // Get our comparison mods
+     const mouse_mods = self.mouseModsWithCapture(self.mouse.mods);
+ 
+-    // If we have the proper modifiers set then we can check for OSC8 links.
+-    if (mouse_mods.equal(input.ctrlOrSuper(.{}))) hyperlink: {
++    // An OSC8 hyperlink is checked with no modifier requirement. Upstream
++    // asks for ctrl-or-super here, which hides an application's own links
++    // until a modifier is held; every other terminal - Windows Terminal's
++    // cascadia engine included - marks them as soon as the pointer is over
++    // them, and an application that emits OSC 8 has said outright that this
++    // text is a link. Opening one still takes a ctrl+click: the embedder owns
++    // the click, and the highlight is only the preview.
++    hyperlink: {
+         const rac = mouse_pin.rowAndCell();
+         const cell = rac.cell;
+         if (!cell.hyperlink) break :hyperlink;
+diff --git a/src/config/Config.zig b/src/config/Config.zig
+index 55be18012..35f477fcc 100644
+--- a/src/config/Config.zig
++++ b/src/config/Config.zig
+@@ -3962,11 +3962,17 @@ pub fn default(alloc_gpa: Allocator) Allocator.Error!Config {
+     // Add our default command palette entries
+     try result.@"command-palette-entry".init(alloc);
+ 
+-    // Add our default link for URL detection
++    // Add our default link for URL detection.
++    //
++    // `.hover` rather than upstream's `.{ .hover_mods = ctrlOrSuper }`: a URL
++    // underlines as soon as the pointer is over it, which is what Windows
++    // Terminal's cascadia engine does and what this fork's panes are compared
++    // against. The modifier still gates *opening* it - that is the embedder's
++    // ctrl+click - so this only changes the preview.
+     try result.link.links.append(alloc, .{
+         .regex = url.regex,
+         .action = .{ .open = {} },
+-        .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
++        .highlight = .{ .hover = {} },
+     });
+ 
+     return result;
+@@ -4016,6 +4022,25 @@ pub fn loadEntry(
+     try self.loadIter(alloc, &iter);
+ }
+ 
++test "the default URL link highlights on a plain hover" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var cfg: Config = try .default(alloc);
++    defer cfg.deinit();
++
++    // Upstream's default here is `.{ .hover_mods = ctrlOrSuper }`, which shows
++    // nothing until ctrl is held. A ghostty pane is judged beside a cascadia
++    // pane in the same Windows Terminal window, and that one underlines a URL
++    // on a plain hover - so a rebase that quietly restores the modifier is a
++    // regression, and this is what catches it. Opening the link still takes a
++    // ctrl+click; the embedder owns the click.
++    try testing.expectEqual(@as(usize, 1), cfg.link.links.items.len);
++    try testing.expect(
++        std.meta.activeTag(cfg.link.links.items[0].highlight) == .hover,
++    );
++}
++
+ test "loadEntry sets a value" {
+     const testing = std.testing;
+     const alloc = testing.allocator;
+diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
+index 69b0e5cc8..4a7f2dc1c 100644
+--- a/src/renderer/generic.zig
++++ b/src/renderer/generic.zig
+@@ -5,7 +5,6 @@ const wuffs = @import("wuffs");
+ const apprt = @import("../apprt.zig");
+ const configpkg = @import("../config.zig");
+ const font = @import("../font/main.zig");
+-const inputpkg = @import("../input.zig");
+ const os = @import("../os/main.zig");
+ const terminal = @import("../terminal/main.zig");
+ const renderer = @import("../renderer.zig");
+@@ -1262,9 +1261,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                     // If our mouse isn't hovering, we have no links.
+                     const vp = state.mouse.point orelse break :osc8 .empty;
+ 
+-                    // If the right mods aren't pressed, then we can't match.
+-                    if (!state.mouse.mods.equal(inputpkg.ctrlOrSuper(.{})))
+-                        break :osc8 .empty;
++                    // No modifier requirement: Surface.linkAtPos highlights
++                    // an OSC8 link on a plain hover, and the two have to agree
++                    // about which cells are lit or the underline appears
++                    // without the link being reported (or the reverse).
+ 
+                     break :osc8 self.terminal_state.linkCells(
+                         arena_alloc,

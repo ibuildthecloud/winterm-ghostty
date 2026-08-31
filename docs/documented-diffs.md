@@ -24,11 +24,19 @@ known from the code and has not been exercised.
 These four were decided at the gate (2026-08-05) and are deferred by decision, not
 by omission.
 
-### GD-01 — Hyperlinks — **implemented 2026-08-18**  ([#3](https://github.com/ibuildthecloud/winterm-ghostty/issues/3))
+### GD-01 — Hyperlinks — **implemented 2026-08-18, hover parity 2026-08-31**  ([#3](https://github.com/ibuildthecloud/winterm-ghostty/issues/3))
 
-A URL in a ghostty pane highlights under ctrl, under the pointer; WT's tooltip
-shows it; and ctrl+click opens it through Windows Terminal's own opener, dialog
-for refused schemes included.
+A URL in a ghostty pane underlines under the pointer, on a plain hover; an OSC 8
+hyperlink does the same; WT's tooltip shows the target; and ctrl+click opens it
+through Windows Terminal's own opener, dialog for refused schemes included.
+
+The plain hover is newer than the rest. As first implemented this followed
+ghostty's own rule — nothing highlighted until ctrl was held, OSC 8 included —
+and that was written up below as a difference to live with. The user reported it
+as links not working at all, which is the right reading: a modifier-gated
+preview is invisible, and an application that emits OSC 8 has said outright that
+the text is a link. See
+[KD-27](known-defects.md#kd-27--links-were-invisible-until-ctrl-was-held--fixed-2026-08-31).
 
 **The gate's reason for deferring this was wrong**, and worth recording as a
 lesson rather than quietly deleting: it read "nothing in the C API reads a link
@@ -45,13 +53,19 @@ What stays different:
   its scheme list, and its rules about a trailing `.` or `)` decide it
   (`config/url.zig`); cascadia has its own pattern. The two agree on ordinary
   URLs and can disagree at the edges.
-- **A link previews only while ctrl is held, OSC 8 included.** ghostty reports a
-  link when it highlights one, and it highlights nothing without ctrl: a regex
-  link's default rule is `hover_mods = ctrl`, and an OSC 8 link is only looked
-  for when the modifiers *equal* ctrl-or-super (`Surface.zig`, `linkAtPos`) -
-  so ctrl+shift does not find one either. Cascadia shows its tooltip on a plain
-  hover, and for OSC 8 that is the bigger difference, since an application that
-  marks its own links expects them to be visible without a modifier.
+- **An OSC 8 link is marked only while the pointer is on it.** Cascadia dotted-
+  underlines every cell carrying a hyperlink id, hovered or not
+  (`GridLines::HyperlinkUnderline`, `renderer.cpp`), and switches that to a solid
+  underline on hover. ghostty has no always-on marking for hyperlink cells at
+  all, so a ghostty pane shows an OSC 8 link only when the pointer is over it.
+  Closing this needs a ghostty renderer change - an underline driven by the
+  cell's hyperlink id rather than by the hover set - and was scoped out
+  deliberately on 2026-08-31, not overlooked.
+- **A link is not highlighted while an application owns the mouse.** ghostty
+  stops refreshing links once mouse reporting is on unless shift is escaping the
+  capture (`Surface.zig`, the `mouse_event == .none` gate); cascadia's
+  `SetHoveredCell` has no such gate and keeps underlining URLs inside a TUI.
+  *Read from the source, not measured.*
 - **The underline is ghostty's**, drawn by its renderer in its own weight and
   colour rather than by WT's.
 - **`GetHyperlink` answers about the pointer, not about the position it is

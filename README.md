@@ -196,8 +196,9 @@ it, and `docs/manual-validation.md` carries what still needs a human.
 | 9 | upstreaming — ongoing |
 
 `docs/documented-diffs.md` lists every remaining behavioural difference with what causes it
-and what closing it would cost. The ones you would notice daily: no hyperlink hover or
-ctrl-click, bracketed paste always off, mouse reporting unwired, no keyboard selection.
+and what closing it would cost. The ones you would notice daily: no keyboard selection or
+mark mode, search without regex or case sensitivity, no scrollbar pips, and an OSC 8
+hyperlink marked only while the pointer is on it rather than always.
 
 ## How this project is run
 

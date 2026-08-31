@@ -32,6 +32,25 @@ Nothing switches engine by itself. Add `"engine": "ghostty"` to a profile — or
 
 To confirm a pane is really using it, open the search box (`Ctrl+Shift+F`): on a ghostty pane the regex and case toggles are greyed out.
 
+## New in 0.2.13
+
+### Links are visible again, without holding ctrl
+
+A URL in a ghostty pane now underlines as soon as the pointer is over it, and so
+does a link an application marks with an OSC 8 hyperlink - `ls --hyperlink`, a
+build log's clickable paths, a test runner's report URL. Ctrl+click opens it,
+through Windows Terminal's own opener and its dialog for schemes it will not
+launch, exactly as on a cascadia pane.
+
+Before this, nothing was highlighted until ctrl was held. That was ghostty's own
+rule, carried over unexamined, and it made the feature effectively invisible:
+without a reason to hold a modifier over a piece of text, there was nothing to
+tell you the text was a link at all.
+
+One difference remains, and it is the smaller half. Cascadia gives *every* OSC 8
+hyperlink a faint dotted underline whether or not you are near it; a ghostty pane
+marks one only while the pointer is on it.
+
 ## New in 0.2.12
 
 ### Large, colourful full-screen output is no longer corrupted

@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Mon, 31 Aug 2026 09:25:11 -0700
+Subject: [PATCH] fix(control): no release we send ghostty may open a link
+ (KD-27)
+
+libghostty now highlights a link on a plain hover rather than only under
+ctrl, which is what KD-27 asked for. That makes `Surface.mouse.over_link`
+true far more often, and ghostty opens a link on the *release* of a click
+over one (`processLinks`).
+
+Every release that reaches ghostty from a pane is either synthesised by
+`_releaseMouseIfHeld` - already suppressed for exactly this reason, since
+WT reports no release outside VT mouse mode - or sent from
+`SendMouseEvent` while an application owns the mouse. Neither is a user's
+link click: Windows Terminal answers that itself, on the press, and
+`ControlInteractivity::PointerPressed` takes a ctrl+click over a link from
+`GetHyperlink` and returns without forwarding it. So the second one is
+suppressed too.
+
+Insurance rather than a fix for an observed bug. ghostty stops refreshing
+links once mouse reporting is on, but the `over_link` it last settled on
+outlives that and is what `processLinks` tests.
+
+Also corrects a comment in GhosttySettingsTranslator that still described
+the highlight as happening under ctrl.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Qm2sT9zLC2AndHGSanf2ws
+---
+ .../TerminalControl/GhosttyControlCore.cpp         | 14 ++++++++++++++
+ .../TerminalControl/GhosttySettingsTranslator.cpp  |  2 +-
+ 2 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index fcb89f8a0..038f1941a 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -1336,7 +1336,21 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         case WM_LBUTTONUP:
+         case WM_RBUTTONUP:
+         case WM_MBUTTONUP:
++            // Suppressed for the same reason _releaseMouseIfHeld suppresses:
++            // ghostty opens a link on the release of a click over one, and no
++            // release that reaches it is ever a link click. WT answers that
++            // itself, on the *press* - a ctrl+click over a link never gets
++            // this far, since ControlInteractivity::PointerPressed takes it
++            // from GetHyperlink and returns.
++            //
++            // Insurance rather than a fix for an observed bug: an application
++            // owns the mouse on this path, so ghostty stops refreshing links,
++            // but the over_link it last settled on outlives that and is what
++            // processLinks tests. Now that a link highlights on a plain hover
++            // that state is reached far more often than it was.
++            _suppressOpenUrl = true;
+             ghostty_surface_mouse_button(_surface, GHOSTTY_MOUSE_RELEASE, button, mods);
++            _suppressOpenUrl = false;
+             _mouseDown = false;
+             break;
+ 
+diff --git a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+index cbba18e9f..6f14b3507 100644
+--- a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
++++ b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+@@ -116,7 +116,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         // WT's own switch for turning URL detection off, which ghostty spells
+         // `link-url`. Both default to on, and both mean the same thing: with it
+-        // off a URL in output is plain text - no highlight under ctrl, nothing
++        // off a URL in output is plain text - no highlight on hover, nothing
+         // for ctrl+click to open. OSC 8 hyperlinks are unaffected either side;
+         // an application that marks its own links keeps them.
+         set("link-url", settings.DetectURLs() ? "true" : "false");
