@@ -47,6 +47,18 @@ rule, carried over unexamined, and it made the feature effectively invisible:
 without a reason to hold a modifier over a piece of text, there was nothing to
 tell you the text was a link at all.
 
+### Links work inside full-screen programs too
+
+A program that takes over the mouse - a full-screen UI, a file manager, anything
+that tracks the pointer - used to switch links off entirely in a ghostty pane.
+Hover did nothing and ctrl+click did nothing, while the same screen in a cascadia
+pane had working links.
+
+This is the case that matters most for OSC 8, because a program drawing its own
+interface is exactly the kind of program that marks its own text as links. Both
+engines now behave the same, and a ctrl+click over a link still opens it rather
+than being reported to the program - a plain click goes to the program as before.
+
 One difference remains, and it is the smaller half. Cascadia gives *every* OSC 8
 hyperlink a faint dotted underline whether or not you are near it; a ghostty pane
 marks one only while the pointer is on it.

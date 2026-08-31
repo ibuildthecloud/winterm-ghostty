@@ -38,6 +38,11 @@ preview is invisible, and an application that emits OSC 8 has said outright that
 the text is a link. See
 [KD-27](known-defects.md#kd-27--links-were-invisible-until-ctrl-was-held--fixed-2026-08-31).
 
+A second gate, found the same day and fixed with it, made links dead inside any
+application holding the mouse — which is where an OSC 8 link is most likely to
+be, since the program drawing a full-screen UI is the one marking its own text.
+See [KD-28](known-defects.md#kd-28--links-were-dead-inside-a-mouse-grabbing-application--fixed-2026-08-31).
+
 **The gate's reason for deferring this was wrong**, and worth recording as a
 lesson rather than quietly deleting: it read "nothing in the C API reads a link
 back out or reports one under the pointer", and concluded that a new libghostty
@@ -61,11 +66,6 @@ What stays different:
   Closing this needs a ghostty renderer change - an underline driven by the
   cell's hyperlink id rather than by the hover set - and was scoped out
   deliberately on 2026-08-31, not overlooked.
-- **A link is not highlighted while an application owns the mouse.** ghostty
-  stops refreshing links once mouse reporting is on unless shift is escaping the
-  capture (`Surface.zig`, the `mouse_event == .none` gate); cascadia's
-  `SetHoveredCell` has no such gate and keeps underlining URLs inside a TUI.
-  *Read from the source, not measured.*
 - **The underline is ghostty's**, drawn by its renderer in its own weight and
   colour rather than by WT's.
 - **`GetHyperlink` answers about the pointer, not about the position it is

@@ -2707,3 +2707,104 @@ GD-01 named this exact behaviour, in writing, on the day it shipped, and named i
 as the bigger of its two differences — and it still took a user report to
 re-open, because a documented diff reads as a decision already made rather than
 as a question still open. The list is a backlog, not an archive.
+
+---
+
+### KD-28 — Links were dead inside a mouse-grabbing application — **fixed 2026-08-31, found by the reporter**
+
+**Reported by the user, from use**, immediately after
+[KD-27](#kd-27--links-were-invisible-until-ctrl-was-held--fixed-2026-08-31) was
+confirmed working:
+
+> *"you can see on the right pane which is cascadia the `4323->4321` text is a
+> link, but in the ghostty side that same screen it is not a link. I know it
+> won't be underlined until mouse hover but even on hover and click it doesn't
+> work as a link. that's a OSC 8 cell."*
+
+The program was a full-screen GUI that grabs the mouse, which is the whole
+diagnosis.
+
+#### What was wrong
+
+ghostty refuses to look for links at all once an application turns mouse
+reporting on. Two places, the same condition:
+
+```zig
+self.io.terminal.flags.mouse_event == .none or
+    (self.mouse.mods.shift and !self.mouseShiftCapture(false))
+```
+
+- `cursorPosCallback` — the refresh on a pointer move.
+- `keyCallback` — the refresh when the modifiers change.
+
+Cascadia has no equivalent test anywhere: `ControlCore::_updateHoveredCell` runs
+on every pointer move regardless of mouse mode, and `ControlInteractivity::
+PointerMoved` calls it *after* the VT-mouse branch rather than instead of it. So
+in the same window, on the same screen, one pane marked the link and the other
+treated it as text — which is exactly what the reporter saw.
+
+Upstream's rule is coherent on its own terms: the application owns the mouse, and
+ghostty's convention is that you hold **shift** to escape the grab. It is the
+wrong rule for a pane sitting next to a cascadia pane, and it is wrong in the
+worst possible place, because **a full-screen program is the most likely thing to
+be emitting OSC 8 in the first place** — it is the one that knows its own text is
+a link. KD-27 made links visible everywhere except where they mattered most.
+
+#### The fix
+
+ghostty patch 0046 drops the gate from both callbacks. Upstream's other branch in
+`keyCallback` — which reset the mouse shape and reported an empty URL when
+reporting was on — went with it rather than being lost: that reset is precisely
+what a refresh that finds no link already does, in `mouseRefreshLinks`' trailing
+`if (over_link)`.
+
+Nothing on the Windows Terminal side needed changing, and two things already in
+place turned out to be exactly what this needed:
+
+- **The position still arrives.** `GhosttyControlCore::SetHoveredCell` bails when
+  `ghostty_surface_mouse_captured`, but `SendMouseEvent` calls `_mouseTo` before
+  anything else, so a pointer move under capture reaches
+  `ghostty_surface_mouse_pos` anyway. There was never a missing position, only a
+  refusal to act on one.
+- **The click already outranks the report.** `ControlInteractivity::PointerPressed`
+  tests the hyperlink *before* `_canSendVTMouseInput` (GH#9396), so a ctrl+click
+  over a link opens it instead of reporting it to the application — which is what
+  makes such a link clickable rather than merely visible, and is cascadia's
+  behaviour too. A plain click still goes to the application.
+- **Nothing new can open a link.** The VT-mouse release started suppressing
+  `OPEN_URL` in terminal patch 0069, written for KD-27 as insurance against
+  exactly this state being reachable. It stopped being insurance the moment this
+  patch landed.
+
+**Cost.** Link detection now runs on cells the pointer enters inside a TUI, where
+before it ran on none. That is the same work already done on every cell outside
+mouse mode, gated the same way — `mouse.link_point` dedupes by viewport cell, so
+it is per cell, not per pixel — so this is a mode changing, not a new cost per
+frame. Worth watching if a regex link ever gets expensive; cascadia avoids the
+question entirely by computing pattern locations on buffer change and doing an
+interval lookup per hover, which is the better design and a bigger change.
+
+#### Measured
+
+`zig build test`: 3106 passed, 56 skipped, 0 failed — unchanged.
+
+**By the reporter**, in a purpose-built window: two tabs, each split ghostty-left
+/ cascadia-right, both panes printing the same OSC 8 link, differing only in
+whether the shell had issued `DECSET 1000`. *"tab 2 ghostty pane mouse hover
+doesn't work."* Tab 1 — the same panes without mouse reporting — worked. That
+isolates the gate to the mouse mode and nothing else.
+
+#### What this cost, and what it is worth
+
+KD-27 shipped with this bullet already written into GD-01, from reading the
+source, marked *"read from the source, not measured"*. It was recorded as a
+difference to live with, on the same day, in the same session, by the same
+reasoning that KD-27 exists to correct — and it took the user hitting it, an hour
+later, to be treated as a defect.
+
+Worth keeping: **writing a difference down is not triaging it.** The bullet
+correctly described a behaviour that made the feature useless in its most
+important case, and being written in the "what stays different" list is what
+stopped anyone asking whether it should. When a diff is discovered *while fixing
+a bug in the same feature*, that is the moment to ask whether it is the same bug.
+

@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Mon, 31 Aug 2026 11:40:17 -0700
+Subject: [PATCH] input: links are found while an application holds the mouse
+
+An OSC 8 link printed by a full-screen program was a link in a Windows
+Terminal cascadia pane and inert text in a ghostty pane on the same
+screen - no hover highlight, and a ctrl+click with nothing to open.
+Reported from use, with the control run beside it.
+
+ghostty declines to refresh links at all once mouse reporting is on,
+unless shift is escaping the capture. Two places carry the same test:
+cursorPosCallback, for a pointer move, and keyCallback, for a change of
+modifiers. Both are dropped here.
+
+Upstream's rule is coherent on its own terms - the application owns the
+mouse, and holding shift is how you escape the grab. It is the wrong rule
+for a pane judged beside a cascadia pane, whose `_updateHoveredCell` has
+no such test and keeps marking links inside a TUI. And it is wrong in the
+worst place: a program drawing a full-screen interface is the most likely
+thing to be emitting OSC 8 in the first place, since it is the one that
+knows its own text is a link.
+
+keyCallback's other branch - which reset the mouse shape and reported an
+empty URL when reporting was on - goes with the gate rather than being
+lost. That reset is exactly what a refresh finding no link already does,
+in mouseRefreshLinks' trailing `if (over_link)`.
+
+Cost: link detection now runs on cells the pointer enters inside a TUI,
+where before it ran on none. That is the same work already done on every
+cell outside mouse mode, deduped the same way by mouse.link_point - per
+cell, not per pixel - so this is a mode changing rather than a new cost.
+
+zig build test: 3106 passed, 56 skipped, 0 failed.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Qm2sT9zLC2AndHGSanf2ws
+---
+ src/Surface.zig | 75 ++++++++++++++++++++++---------------------------
+ 1 file changed, 34 insertions(+), 41 deletions(-)
+
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 06f40b9b8..def45deb9 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -2816,39 +2816,24 @@ pub fn keyCallback(
+         // Update our modifiers, this will update mouse mods too
+         self.modsChanged(event.mods);
+ 
+-        // We only refresh links if
+-        // 1. mouse reporting is off
+-        // OR
+-        // 2. mouse reporting is on and we are not reporting shift to the terminal
+-        if (self.io.terminal.flags.mouse_event == .none or
+-            (self.mouse.mods.shift and !self.mouseShiftCapture(false)))
+-        {
+-            // Refresh our link state
+-            const pos = self.rt_surface.getCursorPos() catch break :mouse_mods;
+-            self.renderer_state.mutex.lockUncancelable(global.io());
+-            defer self.renderer_state.mutex.unlock(global.io());
+-            self.mouseRefreshLinks(
+-                pos,
+-                self.posToViewport(pos.x, pos.y),
+-                self.mouse.over_link,
+-            ) catch |err| {
+-                log.warn("failed to refresh links err={}", .{err});
+-                break :mouse_mods;
+-            };
+-        } else if (self.io.terminal.flags.mouse_event != .none and !self.mouse.mods.shift) {
+-            // If we have mouse reports on and we don't have shift pressed, we reset state
+-            _ = try self.rt_app.performAction(
+-                .{ .surface = self },
+-                .mouse_shape,
+-                self.io.terminal.mouse_shape,
+-            );
+-            _ = try self.rt_app.performAction(
+-                .{ .surface = self },
+-                .mouse_over_link,
+-                .{ .url = "" },
+-            );
+-            try self.queueRender();
+-        }
++        // Refresh our link state. Not gated on mouse reporting being off -
++        // see cursorPosCallback for why this fork differs there.
++        //
++        // Upstream's other branch, which reset the shape and reported an
++        // empty URL when reporting was on, is gone with the gate rather than
++        // lost: that reset is exactly what a refresh finding no link already
++        // does, in mouseRefreshLinks' `if (over_link)` tail.
++        const pos = self.rt_surface.getCursorPos() catch break :mouse_mods;
++        self.renderer_state.mutex.lockUncancelable(global.io());
++        defer self.renderer_state.mutex.unlock(global.io());
++        self.mouseRefreshLinks(
++            pos,
++            self.posToViewport(pos.x, pos.y),
++            self.mouse.over_link,
++        ) catch |err| {
++            log.warn("failed to refresh links err={}", .{err});
++            break :mouse_mods;
++        };
+     }
+ 
+     // Process the cursor state logic. This will update the cursor shape if
+@@ -4715,15 +4700,23 @@ pub fn cursorPosCallback(
+     // OR
+     // 2. the cursor position has changed (either we have no previous state, or the state has
+     //    changed)
+-    // AND
+-    // 1. mouse reporting is off
+-    // OR
+-    // 2. mouse reporting is on and we are not reporting shift to the terminal
+-    if ((over_link or
++    //
++    // Upstream adds a second requirement - that mouse reporting be off, or
++    // that shift be escaping the capture - so that an application holding the
++    // mouse sees no link highlighting at all. This fork drops it. Windows
++    // Terminal's cascadia engine marks a link inside a mouse-grabbing
++    // application too (`ControlCore::_updateHoveredCell` has no such test),
++    // and a ghostty pane beside a cascadia one in the same window has to
++    // agree. Reported from use: an OSC 8 link in a full-screen GUI was a link
++    // in one pane and inert text in the other.
++    //
++    // This costs a mode, not a new cost: it is the same work already done on
++    // every cell the pointer enters when reporting is off. What makes such a
++    // link clickable rather than merely visible is Windows Terminal's own
++    // rule that a ctrl+click outranks a VT mouse report (GH#9396).
++    if (over_link or
+         self.mouse.link_point == null or
+-        (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
+-        (self.io.terminal.flags.mouse_event == .none or
+-            (self.mouse.mods.shift and !self.mouseShiftCapture(false))))
++        (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp)))
+     {
+         // If we were previously over a link, we always update. We do this so that if the text
+         // changed underneath us, even if the mouse didn't move, we update the URL hints and state
