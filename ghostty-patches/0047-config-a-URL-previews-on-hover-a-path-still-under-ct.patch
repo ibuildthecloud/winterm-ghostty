@@ -1,0 +1,193 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Mon, 31 Aug 2026 11:58:10 -0700
+Subject: [PATCH] config: a URL previews on hover, a path still under ctrl
+
+url.regex is not a URL regex. Its own first line says so - "Default
+URL/path regex. This is used to detect URLs and file paths in terminal
+output" - and two of its three branches match paths, including bare
+relative ones like `src/main.zig`.
+
+The previous patch moved that whole link to `.hover` on the strength of
+the identifier's name. Upstream's modifier had been hiding the path
+matching, so nothing about it was visible until it was: pointing anywhere
+near ordinary output - an ls listing, a stack trace, a build log -
+underlined it. Reported from use within the hour.
+
+Split where the regex was already split. `scheme_regex` is branch one,
+`path_regex` is branches two and three, and `regex` is still the two
+joined, byte for byte, so StringMap's tests and anything else built on it
+are untouched.
+
+Config.default then registers two links rather than one: the URL at
+`.hover`, the path at upstream's `hover_mods = ctrl`. The asymmetry is
+the point. A URL is unambiguous; `src/main.zig` is ordinary text that
+happens to contain a slash, and there is no telling the one someone wants
+to open from the hundred they are only reading. Cascadia has no path
+matching at all, so ctrl is already more than parity.
+
+`link-url = false` strips both defaults rather than the first. Windows
+Terminal's `detectURLs` is the switch behind it, and turning that off on
+a cascadia pane leaves nothing detected.
+
+Two tests, both because the failure they guard is silent: the two links
+exist in order with the right regexes and rules, and link-url off leaves
+none.
+
+zig build test: 3107 passed, 56 skipped, 0 failed.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Qm2sT9zLC2AndHGSanf2ws
+---
+ src/config/Config.zig | 75 ++++++++++++++++++++++++++++++++++---------
+ src/config/url.zig    | 19 +++++++++--
+ 2 files changed, 75 insertions(+), 19 deletions(-)
+
+diff --git a/src/config/Config.zig b/src/config/Config.zig
+index 35f477fcc..6739762f9 100644
+--- a/src/config/Config.zig
++++ b/src/config/Config.zig
+@@ -3962,18 +3962,35 @@ pub fn default(alloc_gpa: Allocator) Allocator.Error!Config {
+     // Add our default command palette entries
+     try result.@"command-palette-entry".init(alloc);
+ 
+-    // Add our default link for URL detection.
++    // Our default links, in priority order: a URL, then a file path.
+     //
+-    // `.hover` rather than upstream's `.{ .hover_mods = ctrlOrSuper }`: a URL
+-    // underlines as soon as the pointer is over it, which is what Windows
+-    // Terminal's cascadia engine does and what this fork's panes are compared
+-    // against. The modifier still gates *opening* it - that is the embedder's
+-    // ctrl+click - so this only changes the preview.
++    // Upstream has one link carrying `url.regex`, which matches both, at
++    // `.{ .hover_mods = ctrlOrSuper }`. This fork splits them because they do
++    // not deserve the same rule:
++    //
++    // - A **URL** highlights on a plain hover, matching what Windows
++    //   Terminal's cascadia engine does and what this fork's panes are judged
++    //   against. `https://example.com` is unambiguous; nothing else looks like
++    //   it.
++    //
++    // - A **path** keeps upstream's modifier. `src/main.zig` and `/etc/hosts`
++    //   are ordinary text that happens to contain a slash, and previewing them
++    //   on hover lit up most of the output of most commands - reported from
++    //   use, an hour after the URL half shipped. Cascadia has no path matching
++    //   at all, so ctrl is already more than parity.
++    //
++    // Order is priority order (see the `link` docs), so a scheme URL is
++    // matched as a URL and never as the path that follows its slashes.
+     try result.link.links.append(alloc, .{
+-        .regex = url.regex,
++        .regex = url.scheme_regex,
+         .action = .{ .open = {} },
+         .highlight = .{ .hover = {} },
+     });
++    try result.link.links.append(alloc, .{
++        .regex = url.path_regex,
++        .action = .{ .open = {} },
++        .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
++    });
+ 
+     return result;
+ }
+@@ -4022,23 +4039,45 @@ pub fn loadEntry(
+     try self.loadIter(alloc, &iter);
+ }
+ 
+-test "the default URL link highlights on a plain hover" {
++test "a URL highlights on a plain hover, a path only under ctrl" {
+     const testing = std.testing;
+     const alloc = testing.allocator;
+ 
+     var cfg: Config = try .default(alloc);
+     defer cfg.deinit();
+ 
+-    // Upstream's default here is `.{ .hover_mods = ctrlOrSuper }`, which shows
+-    // nothing until ctrl is held. A ghostty pane is judged beside a cascadia
+-    // pane in the same Windows Terminal window, and that one underlines a URL
+-    // on a plain hover - so a rebase that quietly restores the modifier is a
+-    // regression, and this is what catches it. Opening the link still takes a
+-    // ctrl+click; the embedder owns the click.
+-    try testing.expectEqual(@as(usize, 1), cfg.link.links.items.len);
++    // Upstream has one link at `.{ .hover_mods = ctrlOrSuper }` carrying a
++    // regex that matches URLs *and* paths. This fork splits them, and both
++    // halves of that split are load-bearing:
++    //
++    // - the URL on `.hover`, because a ghostty pane is judged beside a
++    //   cascadia pane that underlines a URL on a plain hover;
++    // - the path still behind ctrl, because hovering paths lit up most of the
++    //   output of most commands when it briefly did not.
++    //
++    // A rebase onto a new upstream pin reverts both silently, and neither
++    // failure is loud. This is what catches it.
++    try testing.expectEqual(@as(usize, 2), cfg.link.links.items.len);
+     try testing.expect(
+         std.meta.activeTag(cfg.link.links.items[0].highlight) == .hover,
+     );
++    try testing.expectEqualStrings(url.scheme_regex, cfg.link.links.items[0].regex);
++    try testing.expect(
++        std.meta.activeTag(cfg.link.links.items[1].highlight) == .hover_mods,
++    );
++    try testing.expectEqualStrings(url.path_regex, cfg.link.links.items[1].regex);
++}
++
++test "link-url off removes both default matchers" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var cfg: Config = try .default(alloc);
++    defer cfg.deinit();
++
++    cfg.@"link-url" = false;
++    try cfg.finalize();
++    try testing.expectEqual(@as(usize, 0), cfg.link.links.items.len);
+ }
+ 
+ test "loadEntry sets a value" {
+@@ -4889,7 +4928,11 @@ pub fn finalize(self: *Config) !void {
+ 
+     // If URLs are disabled, cut off the first link. The first link is
+     // always the URL matcher.
+-    if (!self.@"link-url") self.link.links.items = self.link.links.items[1..];
++    // Both defaults, not one: this fork registers the URL and the path matcher
++    // separately (see `default`), and `link-url` off means no link detection,
++    // not "paths only". Windows Terminal's `detectURLs` is the switch behind
++    // it, and turning that off on a cascadia pane leaves nothing detected.
++    if (!self.@"link-url") self.link.links.items = self.link.links.items[2..];
+ 
+     // We warn when the quit-after-last-window-closed-delay is set to a very
+     // short value because it can cause Ghostty to quit before the first
+diff --git a/src/config/url.zig b/src/config/url.zig
+index 463ea9bfc..cc9accd58 100644
+--- a/src/config/url.zig
++++ b/src/config/url.zig
+@@ -106,13 +106,26 @@ const bare_relative_path_branch =
+     path_chars ++ "+" ++
+     no_trailing_colon;
+ 
+-pub const regex =
+-    scheme_url_branch ++
+-    "|" ++
++/// The scheme-URL branch on its own: `https://`, `mailto:`, `ftp://` and the
++/// rest of `url_schemes`. Split out so an embedder can highlight a URL on a
++/// plain hover while leaving path matching behind a modifier - a URL is
++/// unambiguous, `src/main.zig` is ordinary text that happens to contain a
++/// slash, and highlighting the second one on hover makes a mess of any output
++/// that mentions a file. See Config.default.
++pub const scheme_regex = scheme_url_branch;
++
++/// The two path branches: rooted and dot-relative (`/x`, `./x`, `../x`, `~/x`)
++/// and bare relative (`src/config/url.zig`).
++pub const path_regex =
+     rooted_or_relative_path_branch ++
+     "|" ++
+     bare_relative_path_branch;
+ 
++pub const regex =
++    scheme_regex ++
++    "|" ++
++    path_regex;
++
+ test "url regex" {
+     const testing = std.testing;
+ 

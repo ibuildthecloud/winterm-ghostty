@@ -2808,3 +2808,91 @@ important case, and being written in the "what stays different" list is what
 stopped anyone asking whether it should. When a diff is discovered *while fixing
 a bug in the same feature*, that is the moment to ask whether it is the same bug.
 
+---
+
+### KD-29 — Every file path in the output highlighted on hover — **fixed 2026-08-31, found by the reporter**
+
+**Reported by the user, from use**, minutes after
+[KD-28](#kd-28--links-were-dead-inside-a-mouse-grabbing-application--fixed-2026-08-31)
+was confirmed working:
+
+> *"okay, that's working but right now it seems to be highlighting anything that
+> basically has a `/` in it it seems like. So paths get highlighted like
+> `/foo/bar` or I think even `foo/bar`."*
+
+He was right on both counts, including the one he was unsure about.
+
+#### What was wrong
+
+**A regression, introduced by [KD-27](#kd-27--links-were-invisible-until-ctrl-was-held--fixed-2026-08-31) earlier the same day**, and introduced by not reading past the
+name of the thing being changed.
+
+`url.regex` is not a URL regex. Its own doc comment says so in the first line —
+*"Default URL/path regex. This is used to detect URLs and file paths in terminal
+output"* — and it has three branches:
+
+| Branch | Matches |
+|---|---|
+| `scheme_url_branch` | `https://…`, `mailto:`, `ftp://`, and the rest of `url_schemes` |
+| `rooted_or_relative_path_branch` | `/etc/hosts`, `./x`, `../x`, `~/x` |
+| `bare_relative_path_branch` | `src/config/url.zig` — "bare relative paths", in its own words |
+
+Upstream registers all three as one link at `hover_mods = ctrl`, so the path
+matching is invisible until you deliberately hold a modifier, and reads as a
+feature when you do. KD-27 moved that whole link to `.hover` on the strength of
+the identifier's name. The result: pointing anywhere near ordinary output —
+a `ls` listing, a stack trace, a build log, this repository's own file paths —
+underlined it.
+
+#### The fix
+
+ghostty patch 0047 splits the regex where it was already split, and gives the two
+halves the rules they each deserve:
+
+```zig
+pub const scheme_regex = scheme_url_branch;
+pub const path_regex = rooted_or_relative_path_branch ++ "|" ++ bare_relative_path_branch;
+pub const regex = scheme_regex ++ "|" ++ path_regex;   // unchanged, byte for byte
+```
+
+`Config.default` then registers two links instead of one: the URL at `.hover`,
+the path at upstream's `hover_mods = ctrl`. `url.regex` itself is untouched, so
+`StringMap`'s tests and anything else built on it are unaffected.
+
+The reasoning for the asymmetry, since it is the whole point: **a URL is
+unambiguous and a path is not.** `https://example.com` cannot be mistaken for
+prose. `src/main.zig` is ordinary text that happens to contain a slash, and there
+is no way to tell the one a user wants to open from the hundred they are only
+reading. Cascadia has no path matching at all, so ctrl is already more than
+parity — the path links are a ghostty feature kept, not a cascadia feature
+missed.
+
+`link-url = false` now strips **both** defaults rather than the first. Windows
+Terminal's `detectURLs` is the switch behind it, and turning that off on a
+cascadia pane leaves nothing detected; leaving paths live would have been a new
+surprise in place of the old one.
+
+#### Measured
+
+`zig build test`: **3107 passed, 56 skipped, 0 failed** — one more than KD-28,
+from a second new test. Two now pin this, both written because the failure they
+guard against is silent:
+
+- the two default links exist, in order, with the right regexes and the right
+  highlight rules;
+- `link-url = false` leaves zero links, not one.
+
+#### What this cost, and what it is worth
+
+Three reports in one session, each one finding the previous fix's blind spot.
+This one was the cheapest to have avoided and the most embarrassing to have
+shipped: the answer was in the **first line of the doc comment** on the constant
+being changed, and the constant was read, quoted in a commit message, and pinned
+with a test — without that line being read.
+
+Worth keeping: **when a change turns something invisible into something visible,
+re-read what it actually matches.** A modifier gate is a place where over-matching
+hides for free. Nobody had complained about ghostty's path links because nobody
+had seen them, and "this was already the behaviour, I only changed when it shows"
+is exactly the reasoning that ships this bug.
+
