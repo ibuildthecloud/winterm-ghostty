@@ -38,7 +38,7 @@ To confirm a pane is really using it, open the search box (`Ctrl+Shift+F`): on a
 
 A URL in a ghostty pane now underlines as soon as the pointer is over it, and so
 does a link an application marks with an OSC 8 hyperlink - `ls --hyperlink`, a
-build log's clickable paths, a test runner's report URL. Ctrl+click opens it,
+test runner's report URL, a tool that marks its own output. Ctrl+click opens it,
 through Windows Terminal's own opener and its dialog for schemes it will not
 launch, exactly as on a cascadia pane.
 
@@ -62,6 +62,15 @@ than being reported to the program - a plain click goes to the program as before
 One difference remains, and it is the smaller half. Cascadia gives *every* OSC 8
 hyperlink a faint dotted underline whether or not you are near it; a ghostty pane
 marks one only while the pointer is on it.
+
+### What is not a link
+
+A bare file path is not a link on either engine. ghostty's own matcher covers
+file paths as well as URLs, and this fork switches that half off deliberately:
+a URL is unmistakable, whereas `src/main.zig` is ordinary text that happens to
+contain a slash, and marking every one of them underlined most of the output of
+most commands. Cascadia has never matched paths either, so this is the two
+engines agreeing rather than a feature missing from one.
 
 ## New in 0.2.12
 
