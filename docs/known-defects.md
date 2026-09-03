@@ -2810,6 +2810,175 @@ a bug in the same feature*, that is the moment to ask whether it is the same bug
 
 ---
 
+### KD-30 — Ctrl+Enter did nothing — **fixed 2026-09-03, found by the reporter**
+
+**Reported by the user, from use:**
+
+> *"it appears to be that ghostty does not respect ctrl+enter properly where as
+> cascadia does"*
+
+And then, when a diagnosis was offered, **measured** — with a script that puts
+the terminal into each keyboard mode in turn and dumps the bytes that arrive:
+
+```
+--- Plain terminal input; no extended keyboard mode ---
+Shift-Enter   hex: 1b 5b 32 37 3b 32 3b 31 33 7e   chars: 033 [ 2 7 ; 2 ; 1 3 ~
+Ctrl-Enter    no bytes received within 5 seconds
+Ctrl-J        hex: 0a                              chars: \n
+
+--- xterm modifyOtherKeys 2; Kitty disabled ---
+Ctrl-Enter    no bytes received within 5 seconds
+
+--- Kitty keyboard protocol; disambiguate keys ---
+Shift-Enter   hex: 1b 5b 31 33 3b 32 75            chars: 033 [ 1 3 ; 2 u
+Ctrl-Enter    no bytes received within 5 seconds
+```
+
+That measurement is the whole entry. It refuted a diagnosis that had already
+been written up in detail, and it did so on one line: **not one byte, in any
+mode.**
+
+#### Two defects, and the first one hid the second
+
+**1. ghostty's own keybindings are live inside a Windows Terminal pane.**
+
+`Config.zig`, in ghostty's default keybind set:
+
+```zig
+// Toggle fullscreen
+try self.set.put(alloc, .{ .key = .{ .physical = .enter }, .mods = inputpkg.ctrlOrSuper(.{}) },
+    .{ .toggle_fullscreen = {} });
+
+// Toggle zoom a split
+try self.set.put(alloc, .{ .key = .{ .physical = .enter }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true }) },
+    .{ .toggle_split_zoom = {} });
+```
+
+`ctrlOrSuper` is super on macOS and **ctrl everywhere else**, so on Windows that
+is `ctrl+enter` and `ctrl+shift+enter`. `Surface.maybeHandleBinding` runs
+*before* any encoding, which is why the key was dead in all three modes at once:
+the encoder was never reached, so the keyboard mode could not matter.
+
+**Declining the action does not give the key back**, and that is the part worth
+carrying forward. `GhosttyControlCore::_handleAction` reports both of these
+unhandled, which DESIGN.md describes as "correct, not a gap" for the tab and
+split actions beside them. It is correct, and it is *not sufficient*: in
+`Surface.maybeHandleBinding` a matched binding is consumed on `flags.consumed`,
+which **defaults to true**, and the only escape is `flags.performable` ("act as
+though a binding didn't exist"), which **defaults to false** and is not set on
+these two. So: key swallowed on the way in, an action nobody ran, no bytes out,
+nothing logged.
+
+Windows Terminal is innocent throughout. `TermControl::_KeyHandler` matches the
+user's action map before offering the key to the engine, and WT has no
+`ctrl+enter` default, so it passed the key down correctly — into ghostty's table.
+
+Fixed in the settings translator, because *which keybindings exist* is the
+embedder's business and that is the seam for saying so:
+
+```cpp
+set("keybind", "ctrl+enter=unbind");
+set("keybind", "ctrl+shift+enter=unbind");
+```
+
+**2. Once the key arrives, the encoding was still not cascadia's.**
+
+Unblocking alone would have traded silence for `\x1b[27;5;13~` — xterm's
+modifyOtherKeys "format other keys" form, which upstream ghostty sends for
+ctrl+enter and which the reporting user's applications cannot read either. The
+shift+enter row of the measurement above is the proof it would have: that
+sequence is the same table, one row up, and it was arriving all along.
+
+Two things are wrong with it here. It is **ungated** — the alt rows in that same
+table carry `modify_other_keys` and only fire once an application has asked with
+`CSI > 4;2m`, while the ctrl rows carry nothing and fire at applications that
+never asked. And **nothing on Windows expects it**: conhost and cascadia both
+collapse the modifier the PC way, so ctrl makes Enter LF, which is to say
+ctrl+enter is another way to type ctrl+j.
+
+So the four ctrl rows on `.enter` became LF, alt keeping its ESC prefix as it
+does for every other C0 in that table, and the keypad's Enter gained the same
+rows — upstream has none at all, so ctrl+numpad-enter fell to the catch-all
+`\r` and disagreed with ctrl+enter as well as with cascadia.
+
+**The kitty path is untouched on purpose.** Both engines already agree on
+`CSI 13;5u` there, and that is exactly why this rule lives in the legacy table
+rather than in a keybind: a keybind cannot see the keyboard mode, so
+`ctrl+enter=text:\n` would have broken the half that already worked.
+
+#### What each engine sends now
+
+Legacy mode:
+
+| Key | cascadia | ghostty before | ghostty now |
+|---|---|---|---|
+| enter | `\r` | `\r` | `\r` |
+| shift+enter | `\r` | `\x1b[27;2;13~` | `\x1b[27;2;13~` (unchanged) |
+| **ctrl+enter** | `\n` | **nothing — bound** | `\n` |
+| **ctrl+shift+enter** | `\n` | **nothing — bound** | `\n` |
+| ctrl+alt+enter | `\x1b\n` | `\x1b[27;7;13~` | `\x1b\n` |
+| ctrl+numpad-enter | `\n` | `\r` | `\n` |
+
+Under the kitty protocol both engines encode `CSI 13;5u`, and always did.
+shift+enter is deliberately left as ghostty encodes it: cascadia collapses it to
+a plain `\r`, so matching cascadia there would *remove* a key an application can
+distinguish, and nothing was reported against it.
+
+#### Measured
+
+`zig build test`: **3115 passed, 56 skipped, 0 failed** — eight new tests, since
+both failure directions are silent. An application that does not understand
+CSI 27 does nothing visible, and a rebase that reverts these rows looks like
+nothing at all. They pin the four legacy ctrl rows, that shift+enter is
+unchanged from upstream, that plain enter is still CR, both keypad modes, and
+that kitty still encodes `CSI 13;5u`. One WT unit test pins the two unbinds,
+because that symptom is pure silence with its cause in another repository.
+
+#### Still open, deliberately
+
+**ghostty's default keybind set holds a dozen more bindings that WT leaves
+unbound, and they are dead in exactly the same way** — `ctrl+shift+o` and
+`ctrl+shift+e` (`new_split`), `ctrl+shift+i` (`inspector`), `ctrl+shift+q`
+(`quit`), `ctrl+shift+,` (`reload_config`). Anything WT *does* bind never
+reaches the engine and is therefore safe, which is why only these two surfaced.
+
+The general answer is `keybind = clear` — WT owns keybindings, so the engine
+should hold none — but that also drops bindings which work today and which WT
+does not bind (`shift+page_up`/`page_down` scrolling, `ctrl+shift+up`/`down`
+jump-to-prompt, `ctrl+shift+a` select-all). That is a DESIGN-level call about
+what the engine owns, not a fix to slip in beside this one, so it is written up
+as a decision to take.
+
+The selection bindings are not in that list and need no action: ghostty sets
+`performable = true` on all eight `adjust_selection` rows, so shift+arrow falls
+through to the application whenever there is no selection to adjust.
+
+#### What this cost, and what it is worth
+
+A diagnosis, written up at length, with a byte-level table covering three
+keyboard modes — and the ctrl half of it was fiction. The mechanism described
+was real, the code references were right, and the key never got there for any of
+it to run.
+
+**A code path you have read is not a code path that runs.** Reading the encoder
+answered "what would this table emit for ctrl+enter", which was never the
+question. The question was "what arrives", and only the wire answers that. The
+tell was available and was walked straight past: the report said ctrl+enter did
+*nothing*, and an unrecognised `\x1b[27;5;13~` looks like nothing **to an
+application** but is not nothing **on the wire**. One byte dump discriminates
+those two — and the machinery to take it (`GHOSTTY_TRACE_KEYS`,
+`scripts/probe-key-trace.ps1`, `harness/keylog`) was built by this project, for
+this class of bug, and sat unused while the wrong question was answered
+thoroughly.
+
+**Ask what else sits between the key and the encoder.** The engine is a whole
+terminal application — its own keybindings, config and window management — and
+this fork embeds it as a component while leaving its keybind set fully armed.
+That is a standing hazard with a rebase-shaped renewal schedule, not one bad row
+in a table. Note also that DESIGN.md already asserted the ownership this defect
+violated: the assertion was written about action callbacks, and the consuming
+mechanism never consults them.
+
 ### KD-29 — Every file path in the output highlighted on hover — **fixed 2026-08-31, found by the reporter**
 
 **Reported by the user, from use**, minutes after

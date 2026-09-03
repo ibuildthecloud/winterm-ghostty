@@ -32,6 +32,38 @@ Nothing switches engine by itself. Add `"engine": "ghostty"` to a profile — or
 
 To confirm a pane is really using it, open the search box (`Ctrl+Shift+F`): on a ghostty pane the regex and case toggles are greyed out.
 
+## New in 0.2.14
+
+### Ctrl+Enter works
+
+Ctrl+Enter in a ghostty pane did nothing at all. It now sends what every other
+Windows terminal sends — a line feed, the same byte as Ctrl+J — so the shells and
+command-line tools that read it for "new line, don't submit yet" behave the way
+they do in a cascadia pane. Ctrl+Shift+Enter and the keypad's Ctrl+Enter were
+wrong in the same way and are fixed with it.
+
+Two separate faults sat on top of each other, and the first hid the second. The
+key was being swallowed before the terminal could encode it: ghostty ships its
+own keybindings for use as a standalone application, they were still live inside
+a pane, and Ctrl+Enter is bound to *toggle fullscreen* there. Windows Terminal
+owns window management here, so the pane declined the action — which, it turns
+out, does not hand the key back. Those two Enter bindings are now unbound.
+
+Underneath it, the encoding was not the one Windows uses either: ghostty sent
+`ESC [27;5;13~`, an xterm convention that vim and emacs understand and that
+almost nothing else on Windows does, and sent it whether or not the application
+had asked for it. Ctrl+Enter is a line feed now.
+
+Shift+Enter is deliberately left alone. A ghostty pane reports it distinctly, as
+`ESC [27;2;13~`, where cascadia collapses it into a plain Enter that no
+application can tell apart — so matching cascadia there would take a key away
+rather than fix one. If an application you use wants Shift+Enter to mean "new
+line" and is not seeing it, that is worth reporting.
+
+Applications that enable the kitty keyboard protocol were unaffected throughout
+and still are: both engines encode Ctrl+Enter as `CSI 13;5u` there, and always
+did.
+
 ## New in 0.2.13
 
 ### Links are visible again, without holding ctrl

@@ -1,0 +1,219 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Thu, 3 Sep 2026 08:03:11 -0700
+Subject: [PATCH] input: ctrl+enter is LF, as every Windows terminal sends it
+
+Reported from use: ctrl+enter did nothing in a ghostty pane while it worked
+in a cascadia one. The report is only half about this file - the key was
+also being swallowed by a keybind before it ever reached the encoder, fixed
+on the Windows Terminal side - but once it arrives, this is what it has to
+encode.
+
+Upstream sends `\x1b[27;5;13~` for ctrl+enter: xterm's modifyOtherKeys
+"format other keys" form. Two things make it wrong here.
+
+It is *ungated*. The alt rows in the same table carry `modify_other_keys`
+and so only fire once an application has asked for that mode with
+`CSI > 4;2m`. The ctrl rows carry nothing, so they fire at applications
+that never asked, which is precisely the set of applications that cannot
+read them.
+
+And nothing on Windows expects it. conhost and Windows Terminal's cascadia
+engine both collapse the modifier the PC way - ctrl makes Enter LF, which
+is to say ctrl+enter is another way to type ctrl+j (terminalInput.cpp, the
+VK_RETURN case). A pane in this fork is judged beside a cascadia pane in
+the same window, so that is the encoding it owes. The reporter's own
+measurement, taken with a byte dumper across all three keyboard modes, is
+what made this legible: shift+enter delivered `\x1b[27;2;13~` from this
+table, ctrl+enter delivered nothing at all, and ctrl+j delivered 0x0a.
+
+So the four ctrl rows become LF, with alt keeping its ESC prefix as it does
+for every other C0 here. The keypad's Enter gains the same rows: upstream
+has no ctrl row for it at all, so ctrl+numpad-enter fell to the catch-all
+`\r` and disagreed with ctrl+enter as well as with cascadia. Application
+keypad mode keeps its `\x1bO5M`, gated as before.
+
+The kitty path is deliberately untouched. Under kitty both engines already
+agree on `CSI 13;5u`, and that is the reason this rule lives in the legacy
+table rather than in a keybind: a keybind cannot see the keyboard mode, so
+`ctrl+enter=text:\n` would have broken the half that works.
+
+Eight tests, because both failure directions are silent - an application
+that does not understand CSI 27 does nothing visible, and a rebase that
+reverts this looks like nothing at all. They pin the four legacy ctrl rows,
+that shift+enter is unchanged from upstream, that plain enter is still CR,
+the two keypad modes, and that kitty still encodes `CSI 13;5u`.
+
+zig build test: 3115 passed, 56 skipped, 0 failed.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FBNu9ApwBYHifBT6v94fDB
+---
+ src/input/function_keys.zig | 39 +++++++++++++--
+ src/input/key_encode.zig    | 96 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 130 insertions(+), 5 deletions(-)
+
+diff --git a/src/input/function_keys.zig b/src/input/function_keys.zig
+index 66ab4bc4d..cdf892f5b 100644
+--- a/src/input/function_keys.zig
++++ b/src/input/function_keys.zig
+@@ -119,7 +119,18 @@ pub const keys = keys: {
+     result.set(.numpad_multiply, kpKeys("j"));
+     result.set(.numpad_subtract, kpKeys("m"));
+     result.set(.numpad_add, kpKeys("k"));
+-    result.set(.numpad_enter, kpKeys("M") ++ .{Entry{ .sequence = "\r" }});
++    result.set(.numpad_enter, kpKeys("M") ++ .{
++        // The same LF rule as `.enter` above, for the keypad's Enter. Upstream has
++        // no ctrl row here at all: in numerical keypad mode every modified press
++        // falls to the catch-all `\r`, so ctrl+numpad-enter disagreed with
++        // ctrl+enter as well as with cascadia. Application keypad mode is untouched -
++        // the `kpKeys` entries are gated on it and match first.
++        Entry{ .mods = .{ .ctrl = true }, .keypad = .normal, .sequence = "\n" },
++        Entry{ .mods = .{ .ctrl = true, .shift = true }, .keypad = .normal, .sequence = "\n" },
++        Entry{ .mods = .{ .alt = true, .ctrl = true }, .keypad = .normal, .sequence = "\x1b\n" },
++        Entry{ .mods = .{ .alt = true, .ctrl = true, .shift = true }, .keypad = .normal, .sequence = "\x1b\n" },
++        Entry{ .sequence = "\r" },
++    });
+     result.set(.numpad_up, pcStyle("\x1b[1;{}A") ++ cursorKey("\x1b[A", "\x1bOA"));
+     result.set(.numpad_down, pcStyle("\x1b[1;{}B") ++ cursorKey("\x1b[B", "\x1bOB"));
+     result.set(.numpad_right, pcStyle("\x1b[1;{}C") ++ cursorKey("\x1b[C", "\x1bOC"));
+@@ -206,10 +217,28 @@ pub const keys = keys: {
+ 
+         // Everything else
+         .{ .mods = .{ .alt = true, .shift = true }, .sequence = "\x1b[27;4;13~" },
+-        .{ .mods = .{ .ctrl = true }, .sequence = "\x1b[27;5;13~" },
+-        .{ .mods = .{ .ctrl = true, .shift = true }, .sequence = "\x1b[27;6;13~" },
+-        .{ .mods = .{ .alt = true, .ctrl = true }, .sequence = "\x1b[27;7;13~" },
+-        .{ .mods = .{ .alt = true, .ctrl = true, .shift = true }, .sequence = "\x1b[27;8;13~" },
++
++        // ctrl+enter is LF. Upstream sends `\x1b[27;5;13~` here - xterm's
++        // modifyOtherKeys "format other keys" encoding - and sends it *ungated*,
++        // unlike the alt rows above, which carry `modify_other_keys` and so only
++        // fire once an application has asked for that mode with `CSI > 4;2m`. An
++        // application that never asked gets seven bytes it has no reason to parse.
++        //
++        // On Windows nothing expects them. conhost and Windows Terminal's cascadia
++        // engine both collapse the modifier the PC way - ctrl makes Enter LF, which
++        // is to say ctrl+enter is another way to type ctrl+j - and a pane in this
++        // fork is judged beside a cascadia pane in the same window, so that is the
++        // encoding it owes. Reported from use: PSReadLine, node/ink applications and
++        // every REPL that reads 0x0A for "newline, do not submit" did nothing at all.
++        //
++        // Alt still prefixes ESC, as it does for every other C0 in this table. The
++        // kitty path is untouched and still encodes `CSI 13;5u`, which is what
++        // cascadia sends under kitty as well - this rule is legacy-only, and that is
++        // exactly why it belongs here and not in a keybind, which cannot see the mode.
++        .{ .mods = .{ .ctrl = true }, .sequence = "\n" },
++        .{ .mods = .{ .ctrl = true, .shift = true }, .sequence = "\n" },
++        .{ .mods = .{ .alt = true, .ctrl = true }, .sequence = "\x1b\n" },
++        .{ .mods = .{ .alt = true, .ctrl = true, .shift = true }, .sequence = "\x1b\n" },
+         .{ .mods = .{ .super = true }, .sequence = "\x1b[27;9;13~" },
+         .{ .mods = .{ .super = true, .shift = true }, .sequence = "\x1b[27;10;13~" },
+         .{ .mods = .{ .alt = true, .super = true }, .sequence = "\x1b[27;11;13~" },
+diff --git a/src/input/key_encode.zig b/src/input/key_encode.zig
+index 6ab5a4cc8..2894a667b 100644
+--- a/src/input/key_encode.zig
++++ b/src/input/key_encode.zig
+@@ -2281,6 +2281,102 @@ test "legacy: keypad enter" {
+     try testing.expectEqualStrings("\r", writer.buffered());
+ }
+ 
++// ctrl+enter is LF in this fork, not `\x1b[27;5;13~`. See the comment on the
++// `.enter` entries in function_keys.zig for why, and note the two independent
++// ways a rebase reverts it: the ctrl rows going back to CSI 27, and the kitty
++// path below - which must keep encoding `CSI 13;5u` - being "fixed" to match.
++test "legacy: ctrl+enter is LF" {
++    var buf: [128]u8 = undefined;
++    var writer: std.Io.Writer = .fixed(&buf);
++    try legacy(&writer, .{
++        .key = .enter,
++        .mods = .{ .ctrl = true },
++        .consumed_mods = .{},
++    }, .{});
++    try testing.expectEqualStrings("\n", writer.buffered());
++}
++
++test "legacy: ctrl+shift+enter is LF" {
++    var buf: [128]u8 = undefined;
++    var writer: std.Io.Writer = .fixed(&buf);
++    try legacy(&writer, .{
++        .key = .enter,
++        .mods = .{ .ctrl = true, .shift = true },
++        .consumed_mods = .{},
++    }, .{});
++    try testing.expectEqualStrings("\n", writer.buffered());
++}
++
++test "legacy: alt+ctrl+enter is ESC LF" {
++    var buf: [128]u8 = undefined;
++    var writer: std.Io.Writer = .fixed(&buf);
++    try legacy(&writer, .{
++        .key = .enter,
++        .mods = .{ .alt = true, .ctrl = true },
++        .consumed_mods = .{},
++    }, .{});
++    try testing.expectEqualStrings("\x1b\n", writer.buffered());
++}
++
++test "legacy: shift+enter is unchanged from upstream" {
++    var buf: [128]u8 = undefined;
++    var writer: std.Io.Writer = .fixed(&buf);
++    try legacy(&writer, .{
++        .key = .enter,
++        .mods = .{ .shift = true },
++        .consumed_mods = .{},
++    }, .{});
++    try testing.expectEqualStrings("\x1b[27;2;13~", writer.buffered());
++}
++
++test "legacy: enter alone is CR" {
++    var buf: [128]u8 = undefined;
++    var writer: std.Io.Writer = .fixed(&buf);
++    try legacy(&writer, .{
++        .key = .enter,
++        .mods = .{},
++        .consumed_mods = .{},
++    }, .{});
++    try testing.expectEqualStrings("\r", writer.buffered());
++}
++
++test "legacy: ctrl+keypad enter is LF" {
++    var buf: [128]u8 = undefined;
++    var writer: std.Io.Writer = .fixed(&buf);
++    try legacy(&writer, .{
++        .key = .numpad_enter,
++        .mods = .{ .ctrl = true },
++        .consumed_mods = .{},
++    }, .{});
++    try testing.expectEqualStrings("\n", writer.buffered());
++}
++
++// Application keypad mode still owns the keypad Enter, ctrl included: the
++// LF rule above is gated on numerical mode so it cannot shadow this.
++test "legacy: ctrl+keypad enter with application keypad" {
++    var buf: [128]u8 = undefined;
++    var writer: std.Io.Writer = .fixed(&buf);
++    try legacy(&writer, .{
++        .key = .numpad_enter,
++        .mods = .{ .ctrl = true },
++        .consumed_mods = .{},
++    }, .{ .keypad_key_application = true });
++    try testing.expectEqualStrings("\x1bO5M", writer.buffered());
++}
++
++// The kitty path is deliberately untouched by the LF rule: cascadia encodes
++// ctrl+enter as CSI 13;5u under kitty too, so the two agree here already.
++test "kitty: ctrl+enter is CSI 13;5u, not LF" {
++    var buf: [128]u8 = undefined;
++    var writer: std.Io.Writer = .fixed(&buf);
++    try kitty(&writer, .{
++        .key = .enter,
++        .mods = .{ .ctrl = true },
++        .utf8 = "",
++    }, .{ .kitty_flags = .{ .disambiguate = true } });
++    try testing.expectEqualStrings("\x1b[13;5u", writer.buffered());
++}
++
+ test "legacy: keypad 1" {
+     var buf: [128]u8 = undefined;
+     var writer: std.Io.Writer = .fixed(&buf);

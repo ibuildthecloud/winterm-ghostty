@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Thu, 3 Sep 2026 08:17:26 -0700
+Subject: [PATCH] fix(control): ghostty's own ctrl+enter keybinding ate the key
+ (KD-30)
+
+Reported from use: ctrl+enter did nothing in a ghostty pane while it worked
+in a cascadia one. Measured with a byte dumper across all three keyboard
+modes, and nothing arrived in any of them - which is what pointed at a
+binding rather than at an encoding, since an encoding cannot be wrong in
+legacy, modifyOtherKeys and kitty mode identically.
+
+ghostty ships a full application's worth of keybindings and they are still
+live inside a WT pane. Two of them are on Enter:
+
+    ctrl+enter       -> toggle_fullscreen
+    ctrl+shift+enter -> toggle_split_zoom
+
+`ctrlOrSuper` is super on macOS and ctrl everywhere else, so on Windows
+those are exactly the chords reported. Surface.maybeHandleBinding runs
+before any encoding, so the encoder was never reached.
+
+Declining the action does not hand the key back, and that is the part worth
+remembering. GhosttyControlCore reports both unhandled - WT owns window
+chrome and pane zoom - and DESIGN.md says returning false for the tab and
+split actions beside them is "correct, not a gap". It is correct and it is
+not sufficient: a matched binding is consumed on `flags.consumed`, which
+defaults to true, and only `flags.performable` (default false, not set on
+these two) makes an unperformed action fall through to encoding. Key
+swallowed on the way in, an action nobody ran, no bytes out, nothing logged.
+
+Windows Terminal is innocent throughout: _KeyHandler matches the user's
+action map before offering the key to the engine, and WT has no ctrl+enter
+default, so it passed the key down correctly - into ghostty's table.
+
+Unbound in the settings translator rather than patched out of ghostty:
+which keybindings exist is the embedder's business, and this is the seam for
+saying so. A named key parses to the same physical trigger the default
+registers (Binding.zig, Trigger.parse), so these match.
+
+The encoding half is a ghostty patch (input: ctrl+enter is LF). Without it
+this change would only have traded silence for `\x1b[27;5;13~`, which the
+reporter's applications cannot read either.
+
+Deliberately just these two chords. ghostty's default set holds a dozen more
+that WT leaves unbound - ctrl+shift+o/e, ctrl+shift+i, ctrl+shift+q - and
+they are dead the same way. `keybind = clear` is the general answer and is a
+DESIGN-level call about what the engine owns, so it is written up as a
+decision to take rather than taken here on the way past.
+
+Verified on the wire with scripts/probe-enter-keys.ps1 (new): in a ghostty
+pane ctrl+enter, ctrl+shift+enter and ctrl+numpad-enter now deliver <LF>,
+shift+enter still delivers <ESC>[27;2;13~, plain enter <CR>.
+
+unitControl: Total=76, Passed=76, Failed=0.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FBNu9ApwBYHifBT6v94fDB
+---
+ .../GhosttySettingsTranslator.cpp             | 43 +++++++++++++++++++
+ .../GhosttySettingsTests.cpp                  | 21 +++++++++
+ 2 files changed, 64 insertions(+)
+
+diff --git a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+index 6f14b3507..abae2caf7 100644
+--- a/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
++++ b/src/cascadia/TerminalControl/GhosttySettingsTranslator.cpp
+@@ -46,6 +46,49 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             entries.emplace_back(std::string{ key }, std::move(value));
+         };
+ 
++        // --- Keybindings --------------------------------------------------
++        // Windows Terminal owns the keybindings in this fork: TermControl
++        // matches the user's action map before the key is offered to the
++        // engine at all (_KeyHandler, ahead of _TrySendKeyEvent). Everything
++        // WT leaves unbound is meant to reach the application in the pane.
++        //
++        // ghostty disagrees, because it ships a full application's worth of
++        // its own keybindings and they are still live inside a pane. Two of
++        // them eat a key outright:
++        //
++        //   ctrl+enter       -> toggle_fullscreen
++        //   ctrl+shift+enter -> toggle_split_zoom
++        //
++        // Reported from use: ctrl+enter did nothing in a ghostty pane while it
++        // worked in a cascadia one - measured with a byte dumper across all
++        // three keyboard modes, and *nothing* arrived in any of them, which is
++        // what pointed at a binding rather than at an encoding.
++        //
++        // Declining the action does not hand the key back, and that is the
++        // part worth remembering. GhosttyControlCore reports both of these
++        // unhandled - WT owns window chrome and pane zoom - and DESIGN.md
++        // notes that returning false for NEW_TAB/NEW_SPLIT is "correct, not a
++        // gap". It is not sufficient, though: in Surface.maybeHandleBinding a
++        // matched binding is consumed on `flags.consumed`, which defaults to
++        // true, and only `flags.performable` (default false, and not set on
++        // these two) makes an unperformed action fall through to encoding. So
++        // the key was swallowed on the way in, an action nobody ran, and no
++        // bytes out.
++        //
++        // Unbound here rather than patched out of ghostty: which keybindings
++        // exist is the embedder's business, and this is the seam for saying so.
++        // A named key parses to the same physical trigger the default
++        // registers (Binding.zig, Trigger.parse), so these match.
++        //
++        // Deliberately just these two. ghostty's default set holds a dozen more
++        // that WT leaves unbound - ctrl+shift+o/e (new_split), ctrl+shift+i
++        // (inspector), ctrl+shift+q (quit) - and they are dead the same way.
++        // Clearing the whole set is the obvious general answer and is a
++        // DESIGN-level call about what the engine owns, so it is written up as
++        // a decision to take rather than taken here on the way past.
++        set("keybind", "ctrl+enter=unbind");
++        set("keybind", "ctrl+shift+enter=unbind");
++
+         // --- Font ---------------------------------------------------------
+         // WT's fontFace is a CSS-style list, not one name: "Cascadia Code,
+         // Segoe UI Emoji" means the first family for text and the second for
+diff --git a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+index cf3700f77..0dc3ddb25 100644
+--- a/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
++++ b/src/cascadia/UnitTests_Control/GhosttySettingsTests.cpp
+@@ -47,6 +47,7 @@ namespace ControlUnitTests
+         TEST_METHOD(CursorShapeIsForwarded);
+         TEST_METHOD(IntenseTextStyleIsForwarded);
+         TEST_METHOD(BackslashesAreDoubledForTheWordCharsFieldOnly);
++        TEST_METHOD(GhosttysOwnEnterKeybindingsAreUnbound);
+         TEST_METHOD(NullSettingsProduceNothing);
+ 
+     private:
+@@ -429,4 +430,24 @@ namespace ControlUnitTests
+         const Control::IControlSettings none{ nullptr };
+         VERIFY_ARE_EQUAL(0u, Control::implementation::TranslateGhosttySettings(none).size());
+     }
++
++    // ghostty ships its own keybindings and they are live inside a WT pane.
++    // ctrl+enter is bound to toggle_fullscreen there, and a bound key is
++    // consumed before it is ever encoded - so ctrl+enter produced no bytes at
++    // all in a ghostty pane, in every keyboard mode, while a cascadia pane sent
++    // LF. Declining the action is not enough to get the key back: `consumed`
++    // defaults to true and only `performable` (which these two bindings do not
++    // set) falls through.
++    //
++    // Pinned because the symptom is pure silence and the cause is in a
++    // different repository. An upstream rebase that re-adds a binding on a key
++    // WT does not bind will look exactly like this again.
++    void GhosttySettingsTests::GhosttysOwnEnterKeybindingsAreUnbound()
++    {
++        const auto entries = Control::implementation::TranslateGhosttySettings(*_settings());
++
++        VERIFY_IS_TRUE(_has(entries, "keybind", "ctrl+enter=unbind"));
++        VERIFY_IS_TRUE(_has(entries, "keybind", "ctrl+shift+enter=unbind"));
++    }
++
+ }
