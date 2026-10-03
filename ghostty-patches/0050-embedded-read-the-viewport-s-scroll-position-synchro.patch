@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Fri, 2 Oct 2026 21:45:50 -0700
+Subject: [PATCH] embedded: read the viewport's scroll position synchronously
+
+Windows Terminal scrolls by absolute row. Its wheel handler accumulates a
+fractional row from each WM_MOUSEWHEEL, asks the core to scroll_to_row, and
+on the next event reads the core's scroll offset back to decide whether
+the terminal "scrolled out from underneath" it - in which case it throws
+its accumulated position away and starts again from the core's.
+
+The only offset an embedder had to answer that with was the `scrollbar`
+action, and the action is late by construction: the renderer takes it
+during a frame and it is delivered on a later app tick. scroll_to_row
+itself is synchronous, so for a frame after every scroll the embedder
+holds a row the terminal has already left. A precision touchpad sends
+several wheel events per frame, each one restarted from that stale row,
+and the viewport was dragged back on itself - a two-finger scroll that
+jittered and covered a tenth of the distance a cascadia pane did (KD-31).
+
+ghostty_surface_scrollbar reads the active screen's scrollbar under the
+renderer-state lock, the same lock scroll_to_row takes, so it is never
+behind a scroll that has returned. It returns the action's own struct, so
+an embedder can treat the action as "something moved" and read the value
+here.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/ghostty.h      |  1 +
+ src/apprt/embedded.zig | 19 +++++++++++++++++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/include/ghostty.h b/include/ghostty.h
+index 36a44fed8..98517d7c3 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -1232,6 +1232,7 @@ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
+ GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+ GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
+ GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
++GHOSTTY_API ghostty_action_scrollbar_s ghostty_surface_scrollbar(ghostty_surface_t);
+ GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
+ GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index 0c6cc9405..ef09c4eb3 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -1962,6 +1962,25 @@ pub const CAPI = struct {
+         };
+     }
+ 
++    /// The viewport's scroll position as it is now, in the same shape the
++    /// `scrollbar` action carries.
++    ///
++    /// The action is not enough on its own for an embedder that scrolls by
++    /// absolute row: it is computed by the renderer during a frame and
++    /// delivered on a later app tick, so a report can describe the viewport
++    /// as it was before a `scroll_to_row` that has already happened. An
++    /// embedder that reads that stale offset back and scrolls relative to it
++    /// moves the viewport backwards. This reads the terminal itself, under
++    /// the same lock `scroll_to_row` takes, so it is never behind a scroll
++    /// that has returned.
++    export fn ghostty_surface_scrollbar(surface: *Surface) terminal.Scrollbar.C {
++        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
++        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
++
++        const t: *terminal.Terminal = surface.core_surface.renderer_state.terminal;
++        return t.screens.active.pages.scrollbar().cval();
++    }
++
+     /// Returns the PID of the foreground process for the surface PTY.
+     export fn ghostty_surface_foreground_pid(surface: *Surface) u64 {
+         return surface.core_surface.getProcessInfo(.foreground_pid) orelse 0;

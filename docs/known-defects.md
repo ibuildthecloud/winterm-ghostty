@@ -3085,3 +3085,74 @@ hold in order to click a URL, so the noise arrives exactly when the user is
 trying to use the feature that works. If a thing should not be shown, do not
 show it - and here the deciding argument was available from the start, since
 cascadia has no path matching at all and there was never a gap to fill.
+
+---
+
+### KD-31 — A two-finger scroll jittered back on itself — **fixed 2026-10-02, found by the reporter**
+
+**Reported by the user, from use:**
+
+> *"when we scroll a pane, like with a two finger scroll, it jitters. it goes up
+> and then bounced back a bit as it goes up or down."*
+
+#### Measured before anything was changed
+
+`scripts/probe-wheel-scroll.ps1` (new) sends a burst of small wheel deltas the
+way a precision touchpad does — 40 events of delta 30, about 4 ms apart, which
+is ten notches spread across several per frame — and captures where the
+viewport stops. Same burst, a buffer of 500 numbered lines, 0.2.4 portable:
+
+| Pane | Top line after the burst | Rows moved |
+|---|---|---|
+| cascadia (the control) | 373 | ~100 |
+| ghostty | 464 | ~8 |
+
+The jitter the user saw is the visible form of that number: the pane was not
+slow, it was **moving backwards** between moves forwards.
+
+#### Cause
+
+`ControlInteractivity::_mouseScrollHandler` accumulates a *fractional* row per
+wheel event (GH#9955.b — that is what makes a touchpad smooth), rounds it, and
+calls `UserScrollViewport`. On the next event it compares its own row with
+`ScrollOffset()`; if they disagree it decides "the core scrolled out from
+underneath us" and **restarts from the core's row**, discarding what it had
+accumulated.
+
+That comparison assumes cascadia's contract: `ScrollOffset()` has already
+moved when `UserScrollViewport` returns. `GhosttyControlCore` only moved it when
+ghostty's `SCROLLBAR` action arrived — and that action is taken by the renderer
+during a frame and delivered on a later app tick. `scroll_to_row` itself is
+synchronous, so for a frame after every scroll the core reported a row the
+terminal had already left. Several touchpad events land in that frame; each
+one saw the stale row, threw its progress away, and re-requested a row behind
+the one on screen. A mouse wheel, one event per notch, rarely hits the window,
+which is why this reads as a touchpad bug.
+
+#### Fix
+
+- **ghostty patch 0050** adds `ghostty_surface_scrollbar`, which reads the
+  active screen's scrollbar under the renderer-state lock — the lock
+  `scroll_to_row` takes — so it is never behind a scroll that has returned.
+  It returns the action's own struct.
+- **terminal patch 0071**: `UserScrollViewport` reads the position back
+  immediately, as cascadia's does, and the `SCROLLBAR` action is treated as a
+  notification that is re-read the same way, so a late report can no longer
+  put an old row back (it raises `ScrollPositionChanged` only when the value
+  actually moved).
+
+#### After
+
+Same probe, fixed build, both engines in the same build:
+
+| Burst | cascadia | ghostty |
+|---|---|---|
+| 40 × +30 (up) | 373 | **373** |
+| then 20 × −30 (down) | 423 | **423** |
+
+`zig build test` passes. No unit test pins this: the failure needs a live
+surface and a renderer racing the UI thread, and the probe is the measurement.
+
+**Not measured:** a real touchpad. The probe reproduces the event *pattern*
+(sub-notch deltas, several per frame); the reporter's hardware is the
+confirmation still owed.

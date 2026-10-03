@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Fri, 2 Oct 2026 21:57:36 -0700
+Subject: [PATCH] fix(control): a two-finger scroll jittered back on itself
+ (KD-31)
+
+ControlInteractivity scrolls by accumulating a fractional row per wheel
+event, calling UserScrollViewport with the rounded row, and comparing its
+own position against ScrollOffset() on the next event - if they disagree it
+assumes the core scrolled underneath it and restarts from the core's row.
+
+Cascadia's ScrollOffset() has moved by the time UserScrollViewport returns.
+Ours only moved when ghostty's SCROLLBAR action arrived, which is taken by
+the renderer during a frame and delivered a tick later. A precision
+touchpad sends several wheel events per frame, so every one of them found
+the stale row, discarded the accumulated progress and re-requested a row
+behind where the viewport already was. Measured with
+scripts/probe-wheel-scroll.ps1 (40 events of delta 30): a cascadia pane
+moved ~100 rows, a ghostty pane ~8, visibly bouncing on the way.
+
+UserScrollViewport now reads the position back with
+ghostty_surface_scrollbar (ghostty patch 0050) - scroll_to_row is
+synchronous, so the row is already there - and the SCROLLBAR action is
+treated as a notification and re-read the same way, so a late report can
+no longer put an old row back. After: both engines stop on the same line,
+scrolling up and down.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 53 ++++++++++++++++---
+ .../TerminalControl/GhosttyControlCore.h      |  4 +-
+ 2 files changed, 48 insertions(+), 9 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index 038f1941a..a13b4aad8 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -468,14 +468,18 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         case GHOSTTY_ACTION_SCROLLBAR:
+         {
+-            const auto total = static_cast<int32_t>(action.action.scrollbar.total);
+-            const auto offset = static_cast<int32_t>(action.action.scrollbar.offset);
+-            const auto len = static_cast<int32_t>(action.action.scrollbar.len);
+-            _raiseOnUiThread([this, total, offset, len]() {
+-                _bufferHeight = total;
+-                _scrollOffset = offset;
+-                _viewHeight = len;
+-                ScrollPositionChanged.raise(*this, winrt::make<implementation::ScrollPositionChangedArgs>(offset, len, total));
++            // The report is a notification, not a value to keep. It was taken
++            // by the renderer during a frame and arrives a tick later, so it can
++            // describe the viewport as it was before a scroll_to_row this side
++            // has already made - and ControlInteractivity scrolls relative to
++            // ScrollOffset() on every wheel event. Kept, that stale row pulled a
++            // two-finger scroll back on itself every frame (KD-31). The
++            // terminal itself is read instead, on arrival.
++            _raiseOnUiThread([this]() {
++                if (_syncScrollbar())
++                {
++                    ScrollPositionChanged.raise(*this, winrt::make<implementation::ScrollPositionChangedArgs>(_scrollOffset, _viewHeight, _bufferHeight));
++                }
+             });
+             return true;
+         }
+@@ -1400,6 +1404,39 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+ 
+         const auto action = fmt::format("scroll_to_row:{}", std::max(0, viewTop));
+         _bindingAction(action);
++
++        // Cascadia's UserScrollViewport has moved ScrollOffset() by the time
++        // it returns, and ControlInteractivity relies on that: it raises the
++        // scrollbar update from ScrollOffset() straight after this call, and
++        // the next wheel event compares against it to decide whether "the core
++        // scrolled out from underneath us". scroll_to_row is synchronous, so
++        // the row is already in the terminal; waiting for the SCROLLBAR report
++        // left a frame-wide window in which every wheel event started from the
++        // old row (KD-31). ghostty clamps the row, so this reads, not assumes.
++        _syncScrollbar();
++    }
++
++    // Re-reads the viewport position from the terminal. True if it moved.
++    bool GhosttyControlCore::_syncScrollbar()
++    {
++        if (!_surface)
++        {
++            return false;
++        }
++
++        const auto sb = ghostty_surface_scrollbar(_surface);
++        const auto total = static_cast<int32_t>(sb.total);
++        const auto offset = static_cast<int32_t>(sb.offset);
++        const auto len = static_cast<int32_t>(sb.len);
++        if (total == _bufferHeight && offset == _scrollOffset && len == _viewHeight)
++        {
++            return false;
++        }
++
++        _bufferHeight = total;
++        _scrollOffset = offset;
++        _viewHeight = len;
++        return true;
+     }
+ 
+     // Most of what an embedder needs from libghostty has no C entry point and
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.h b/src/cascadia/TerminalControl/GhosttyControlCore.h
+index b46e76906..748023316 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.h
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.h
+@@ -263,6 +263,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // Named binding actions are how most of libghostty is reached from an
+         // embedder; see the definition.
+         bool _bindingAction(std::string_view action) const;
++        bool _syncScrollbar();
+ 
+         // Selection is driven through ghostty's mouse handling, because that
+         // is the only thing that both sets the selection *and* draws it.
+@@ -374,7 +375,8 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         // every event of the drag repeats what the click said.
+         bool _blockSelect{ false };
+ 
+-        // Scroll state, from the SCROLLBAR action.
++        // Scroll state. The SCROLLBAR action says when it changed; the values
++        // themselves are read back from the terminal - see _syncScrollbar.
+         int32_t _scrollOffset{ 0 };
+         int32_t _viewHeight{ 0 };
+         int32_t _bufferHeight{ 0 };
