@@ -3088,7 +3088,7 @@ cascadia has no path matching at all and there was never a gap to fill.
 
 ---
 
-### KD-31 — A two-finger scroll jittered back on itself — **fixed 2026-10-02, found by the reporter**
+### KD-31 — A two-finger scroll jittered back on itself — **fixed 2026-10-02, confirmed by the reporter**
 
 **Reported by the user, from use:**
 
@@ -3153,6 +3153,6 @@ Same probe, fixed build, both engines in the same build:
 `zig build test` passes. No unit test pins this: the failure needs a live
 surface and a renderer racing the UI thread, and the probe is the measurement.
 
-**Not measured:** a real touchpad. The probe reproduces the event *pattern*
-(sub-notch deltas, several per frame); the reporter's hardware is the
-confirmation still owed.
+**Confirmed by the reporter** on a real touchpad ("cool works"), which the probe
+could only imitate: it reproduces the event *pattern* — sub-notch deltas,
+several per frame — not the hardware. Shipped in 0.2.15.
