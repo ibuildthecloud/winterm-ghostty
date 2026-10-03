@@ -32,6 +32,26 @@ Nothing switches engine by itself. Add `"engine": "ghostty"` to a profile — or
 
 To confirm a pane is really using it, open the search box (`Ctrl+Shift+F`): on a ghostty pane the regex and case toggles are greyed out.
 
+## New in 0.2.15
+
+### Touchpad scrolling is smooth
+
+A two-finger scroll in a ghostty pane jittered: the view moved, then jumped back
+a little, then moved again, and covered a fraction of the distance the same
+gesture scrolled a cascadia pane. A mouse wheel was mostly unaffected.
+
+A touchpad scrolls in fractions of a row, many events per frame, and Windows
+Terminal keeps the leftover fraction between them. After each step it checks
+where the pane says it is, and starts over from there if the two disagree. A
+ghostty pane answered with where it had been a frame ago, so most of those
+steps restarted from an old row and pulled the view backwards. It now answers
+with where it is ([KD-31](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/known-defects.md)).
+
+Measured with the same burst of small scroll steps on both engines: before,
+a cascadia pane moved about 100 rows and a ghostty pane about 8; now both stop
+on the same line, scrolling up and back down. Confirmed by the reporter on a
+real touchpad.
+
 ## New in 0.2.14
 
 ### Ctrl+Enter works
