@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Wed, 7 Oct 2026 15:17:39 -0700
+Subject: [PATCH] fix(conpty): a cursor position report is not echoed back as a
+ CUP (KD-32)
+
+The cursor re-sync writes DSR CPR and the terminal answers with where its
+cursor was when it read the DSR. InteractDispatch::MoveCursor, reached only
+with that captured reply, went through SetConsoleCursorPositionImpl, which
+also writes a CUP to the terminal. By then the application has usually kept
+writing, so the CUP moved the terminal's cursor to a stale position
+mid-frame and the application's relative movement landed offset from it: a
+Bubble Tea animation left two rows low and to the right (issue #21).
+
+The terminal is already where it reported, so MoveCursor now sets conhost's
+own cursor, raises the accessibility cursor event, releases the re-sync
+waiters, and writes nothing. The viewport snap is dropped: the position is
+already clamped into the virtual viewport.
+
+VtIoTests::CursorPositionReportIsNotEchoedToTheTerminal fails without the
+fix (stream ESC[3;5H ESC[1;1H X) and passes with it; VtIoTests 19/19.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/host/ut_host/VtIoTests.cpp            | 49 +++++++++++++++++++++++
+ src/terminal/adapter/InteractDispatch.cpp | 18 ++++++---
+ 2 files changed, 62 insertions(+), 5 deletions(-)
+
+diff --git a/src/host/ut_host/VtIoTests.cpp b/src/host/ut_host/VtIoTests.cpp
+index f2b41df2c..cba932cca 100644
+--- a/src/host/ut_host/VtIoTests.cpp
++++ b/src/host/ut_host/VtIoTests.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "CommonState.hpp"
+ #include "../../terminal/parser/InputStateMachineEngine.hpp"
++#include "../../terminal/adapter/InteractDispatch.hpp"
+ 
+ using namespace WEX::Common;
+ using namespace WEX::Logging;
+@@ -380,6 +381,54 @@ class ::Microsoft::Console::VirtualTerminal::VtIoTests
+                        L"our own sequence was withheld when the stream was at a boundary");
+     }
+ 
++    // The cursor re-sync writes DSR CPR and the terminal answers with where its
++    // cursor was when it read the DSR. By the time the answer arrives the
++    // application has usually kept writing, so the reported position is stale.
++    // Echoing it back as a CUP moved the terminal's cursor there mid-frame, and
++    // everything the application drew next with relative movement landed
++    // offset (seen as a TUI's animation left two rows low and to the right).
++    // The terminal is already where it said it is: the reply must update our
++    // cursor and release the waiters, and write nothing.
++    TEST_METHOD(CursorPositionReportIsNotEchoedToTheTerminal)
++    {
++        resetContents();
++        readOutput();
++
++        const auto initialMode = screenInfo->OutputMode;
++        const auto cleanup = wil::scope_exit([=]() {
++            screenInfo->OutputMode = initialMode;
++        });
++        screenInfo->OutputMode = ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
++
++        auto& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
++        gci.LockConsole();
++        const auto unlock = wil::scope_exit([&] { gci.UnlockConsole(); });
++
++        // A resize or an unknown sequence armed the re-sync, and the DSR went
++        // out while the cursor was at the home position.
++        screenInfo->SetConptyCursorPositionMayBeWrong();
++
++        // The application keeps drawing before the reply arrives.
++        size_t written;
++        THROW_IF_FAILED(routines.WriteConsoleWImpl(*screenInfo, L"\x1b[3;5H", written, nullptr));
++
++        // The terminal's reply to the DSR: CSI 1 ; 1 R, as of before that CUP.
++        InteractDispatch dispatch;
++        dispatch.MoveCursor(1, 1);
++
++        // The application's next relative draw.
++        THROW_IF_FAILED(routines.WriteConsoleWImpl(*screenInfo, L"X", written, nullptr));
++
++        const auto actual = readOutput();
++        if (actual != "\x1b[3;5HX")
++        {
++            Log::Comment(NoThrowString().Format(L"stream: %hs", std::string{ actual }.c_str()));
++        }
++        VERIFY_ARE_EQUAL(std::string_view{ "\x1b[3;5HX" }, actual, L"the CPR reply was written back to the terminal");
++
++        VERIFY_IS_FALSE(screenInfo->ConptyCursorPositionMayBeWrong(), L"the CPR reply did not release the re-sync");
++    }
++
+     TEST_METHOD(WriteConsoleOutputW)
+     {
+         resetContents();
+diff --git a/src/terminal/adapter/InteractDispatch.cpp b/src/terminal/adapter/InteractDispatch.cpp
+index 8c6474348..0a76398cb 100644
+--- a/src/terminal/adapter/InteractDispatch.cpp
++++ b/src/terminal/adapter/InteractDispatch.cpp
+@@ -149,8 +149,7 @@ void InteractDispatch::WindowManipulation(const DispatchTypes::WindowManipulatio
+ // - col: The column to move the cursor to.
+ void InteractDispatch::MoveCursor(const VTInt row, const VTInt col)
+ {
+-    const auto& api = ServiceLocator::LocateGlobals().api;
+-    auto& info = ServiceLocator::LocateGlobals().getConsoleInformation().GetActiveOutputBuffer();
++    auto& info = ServiceLocator::LocateGlobals().getConsoleInformation().GetActiveOutputBuffer().GetActiveBuffer();
+ 
+     // First retrieve some information about the buffer
+     const auto viewport = _api.GetBufferAndViewport().viewport;
+@@ -161,12 +160,21 @@ void InteractDispatch::MoveCursor(const VTInt row, const VTInt col)
+     coordCursor.y = std::clamp(coordCursor.y, viewport.top, viewport.bottom);
+     coordCursor.x = std::clamp(coordCursor.x, viewport.left, viewport.right);
+ 
+-    // Finally, attempt to set the adjusted cursor position back into the console.
+-    LOG_IF_FAILED(api->SetConsoleCursorPositionImpl(info, coordCursor));
++    // Only ever reached with the reply to our own DSR CPR, so this sets our
++    // cursor alone. SetConsoleCursorPositionImpl would also write a CUP, and the
++    // terminal is already where it just told us it is - or rather was: the
++    // reply describes the stream as of the DSR, and the application has usually
++    // kept writing since. Echoing it back moved the terminal's cursor to that
++    // stale position mid-frame, and the application's relative movement landed
++    // offset from there (KD-32).
++    LOG_IF_NTSTATUS_FAILED(info.SetCursorPosition(coordCursor));
++
++    auto& an = ServiceLocator::LocateGlobals().accessibilityNotifier;
++    an.CursorChanged(info.GetTextBuffer().GetCursor().GetPosition(), false);
+ 
+     // Unblock any callers inside SCREEN_INFORMATION::WaitForConptyCursorPositionToBeSynchronized().
+     // The cursor position has now been updated to the terminal's.
+-    info.GetActiveBuffer().ResetConptyCursorPositionMayBeWrong();
++    info.ResetConptyCursorPositionMayBeWrong();
+ }
+ 
+ // Routine Description:

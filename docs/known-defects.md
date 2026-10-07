@@ -3156,3 +3156,76 @@ surface and a renderer racing the UI thread, and the probe is the measurement.
 **Confirmed by the reporter** on a real touchpad ("cool works"), which the probe
 could only imitate: it reproduces the event *pattern* — sub-notch deltas,
 several per frame — not the hardware. Shipped in 0.2.15.
+
+---
+
+### KD-32 — A TUI's animation was drawn two rows low and stayed there — **fixed 2026-10-07**  ([#21](https://github.com/ibuildthecloud/winterm-ghostty/issues/21))
+
+**Reported by the user** with the mechanism already traced through upstream
+conhost. A Bubble Tea v2 console (`discobox`) opens with a ~1 s colour animation
+repainting a few cells every 40 ms. On a ghostty pane, especially when the
+window jitters as it opens, the animated text is left **two rows below and to
+the right** of where it belongs, a stray `W` (the first character of the
+placeholder line) appears at column 0 one row further down, and both stay until
+something rewrites those rows. The application's output replays cleanly in a VT
+emulator, so its bytes are not the problem.
+
+This is the other half of KD-26's *"its reply compounds it… that is the row
+offset"*. Patch 0068 keeps conhost's own bytes out of the middle of an
+application's sequence; the `CUP` it emitted there was still wrong.
+
+#### Cause
+
+1. Conhost latches "my cursor may be wrong" on every buffer resize and on every
+   output sequence it does not know (upstream #20009). Bubble Tea sends
+   `CSI > 4 m` (XTMODKEYS) at startup, so the latch is set on every launch, and a
+   window jittering as it opens resizes several times.
+2. The next `GetConsoleScreenBufferInfo(Ex)` from any client writes `ESC[6n` and
+   waits for the reply.
+3. The terminal answers with its cursor **as of when it read the `DSR`**.
+4. The reply is captured on the input thread and went `InteractDispatch::MoveCursor`
+   → `SetConsoleCursorPositionImpl`, which writes a `CUP` to the terminal.
+5. The application had kept writing in between, so that `CUP` sent the
+   terminal's cursor back to a stale position mid-frame, and the relative
+   movement that followed landed offset from it.
+
+`MoveCursor` is only reached from a captured reply to our own `DSR`. The terminal
+is already where it said it is; echoing it back was redundant at best.
+
+#### Fix — terminal patch 0072
+
+`InteractDispatch::MoveCursor` sets conhost's own cursor
+(`SCREEN_INFORMATION::SetCursorPosition`), raises the accessibility cursor event
+`SetConsoleCursorPositionImpl` raised, releases the re-sync waiters, and writes
+nothing. The viewport snap `SetConsoleCursorPositionImpl` also did is dropped:
+the position is clamped into the virtual viewport first, so the snap could only
+move conhost's own window, which a ConPTY terminal never sees.
+
+**Known limit, as the report says:** conhost's cursor is still set to the stale
+position, because it has parsed more output since the `DSR`. That affects only
+what conhost reports to clients, not what the terminal shows. A full fix would
+remember where in the stream the `DSR` went out and apply the reply as a delta
+from there.
+
+#### Measured
+
+`VtIoTests::CursorPositionReportIsNotEchoedToTheTerminal` arms the latch, writes
+application output that moves the cursor, delivers the reply through
+`InteractDispatch::MoveCursor`, then writes one more character. **Checked in both
+directions:**
+
+| | stream the terminal receives | |
+|---|---|---|
+| without the fix | `ESC[3;5H` `ESC[1;1H` `X` | fails |
+| with it | `ESC[3;5H` `X` | passes |
+
+`VtIoTests` 18 → **19/19**. The full `Conhost.Unit.Tests.dll` (less
+`ResizeCursorUnchanged`, the pre-existing abort KD-26 noted) runs 5044 of 5055;
+the 10 failures are `ScreenBufferTests` insert/delete-chars and horizontal
+scroll cases. They are not this change: nothing in `ScreenBufferTests` reaches
+`InteractDispatch::MoveCursor` (its only callers are the CPR capture, the new
+test, and the parser tests' own mock). A baseline run without the fix was not
+completed — the Debug test host raises CRT assert dialogs on the desktop in
+`ScreenBufferTests`, and those are also the likely source of the failures.
+
+**Not yet checked live** against `discobox` or another fast-ticking TUI.
