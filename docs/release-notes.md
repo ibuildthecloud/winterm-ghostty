@@ -32,6 +32,27 @@ Nothing switches engine by itself. Add `"engine": "ghostty"` to a profile — or
 
 To confirm a pane is really using it, open the search box (`Ctrl+Shift+F`): on a ghostty pane the regex and case toggles are greyed out.
 
+## New in 0.2.16
+
+### Full-screen programs no longer leave text drawn in the wrong place
+
+A full-screen program that redraws a few cells at a time — an animation, a
+spinner — could have that text land a couple of rows below and to the right of
+where it belongs, and stay there until something rewrote those rows. It was
+most likely while the window was being resized, or just as it opened.
+
+The console host behind every pane sometimes asks the terminal where its
+cursor is. The answer describes the moment the question was read, but the
+program has usually drawn more by the time it arrives, and the host then sent
+that old position back to the terminal — moving the cursor backwards in the
+middle of the program's frame. It no longer sends anything back: the terminal
+is already where it said it was
+([KD-32](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/known-defects.md),
+[#21](https://github.com/ibuildthecloud/winterm-ghostty/issues/21)).
+
+Covered by a new console-host unit test that fails without the fix. Not yet
+confirmed against the program it was reported in.
+
 ## New in 0.2.15
 
 ### Touchpad scrolling is smooth
