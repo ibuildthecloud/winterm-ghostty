@@ -3229,3 +3229,48 @@ completed — the Debug test host raises CRT assert dialogs on the desktop in
 `ScreenBufferTests`, and those are also the likely source of the failures.
 
 **Not yet checked live** against `discobox` or another fast-ticking TUI.
+
+### KD-33 — The padding turned grey after a program set the background — **fixed 2026-10-19, found by the reporter**
+
+**Reported by the user** with a screenshot: a grey border around one ghostty
+tab, on the padding, while the other tabs had none. It lasted until the tab
+was closed. The user connected it to switching between the local desktop and
+an RDP session.
+
+#### Cause
+
+The grey sampled at **`#282C34`**, ghostty's built-in default background,
+against black cells. `GhosttyControlCore::BackgroundColor()` and
+`ForegroundColor()` were constant stubs returning ghostty's defaults.
+TermControl paints the padding (`RootGrid`'s brush) from the profile's
+appearance at startup, so this normally goes unseen. But on
+`GHOSTTY_ACTION_COLOR_CHANGE` of kind background it re-reads
+`_core.BackgroundColor()`. libghostty raises that action only for **OSC 11
+(set) and OSC 111 (reset)**, so the first one any program in the tab sent
+painted the padding grey. The stub never changes, so nothing short of
+closing the tab could clear it. That is why it shows on one tab and not the
+others.
+
+The RDP switch was not measured. The likely link is that a TUI re-sends
+OSC 11/111 when it redraws or regains focus, but that is an unconfirmed guess.
+
+#### Fix — terminal patch 0073
+
+The core keeps the colour each `COLOR_CHANGE` action carries, foreground and
+background, and falls back to the profile scheme's defaults until one arrives.
+OSC 111's action carries the restored default, so a reset returns the padding
+to the profile colour.
+
+#### Measured
+
+A portable build was run with a 24px-padded profile whose command line emits
+`OSC 11;#c00000` (and, in the second run, `OSC 111` a second later). Each
+window was captured with `wgc-shot` and the padding and cells were sampled:
+
+| build | probe | padding | cells |
+|---|---|---|---|
+| before | OSC 11 red | `#282C34` | `#C00000` |
+| after | OSC 11 red | `#C00000` | `#C00000` |
+| after | OSC 11, then OSC 111 | `#0C0C0C` | `#0C0C0C` (Campbell) |
+
+**Not yet confirmed by the reporter** in their own RDP workflow.

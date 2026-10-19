@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Darren Shepherd <darren@obot.ai>
+Date: Mon, 19 Oct 2026 09:46:38 -0700
+Subject: [PATCH] fix(control): the padding turned grey after a program set the
+ background (KD-33)
+
+BackgroundColor() and ForegroundColor() were constant stubs returning
+ghostty's own defaults. TermControl paints the padding from
+BackgroundColor() whenever ghostty reports a background colour change, so
+the first OSC 11 or 111 a program sent painted the padding #282c34 for the
+life of the tab.
+
+Remember the colour each GHOSTTY_ACTION_COLOR_CHANGE carries and fall back
+to the profile's scheme until one arrives.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../TerminalControl/GhosttyControlCore.cpp    | 41 ++++++++++++++++++-
+ .../TerminalControl/GhosttyControlCore.h      |  6 +++
+ 2 files changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.cpp b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+index a13b4aad8..0a5e154c0 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.cpp
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.cpp
+@@ -604,8 +604,16 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+             const auto kind = action.action.color_change.kind;
+             const til::color color{ action.action.color_change.r, action.action.color_change.g, action.action.color_change.b };
+             _raiseOnUiThread([this, kind, color]() {
++                // Remember it before raising: TermControl answers the event
++                // by reading BackgroundColor() back to paint the padding, and
++                // libghostty has no call that reports the current colour.
++                if (kind == GHOSTTY_ACTION_COLOR_KIND_FOREGROUND)
++                {
++                    _foregroundColor = color;
++                }
+                 if (kind == GHOSTTY_ACTION_COLOR_KIND_BACKGROUND)
+                 {
++                    _backgroundColor = color;
+                     BackgroundColorChanged.raise(*this, nullptr);
+                 }
+                 TabColorChanged.raise(*this, nullptr);
+@@ -1842,8 +1850,37 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+     void GhosttyControlCore::ResetPreviewColorScheme() {}
+     void GhosttyControlCore::SetOverrideColorScheme(const Core::ICoreScheme&) {}
+ 
+-    til::color GhosttyControlCore::ForegroundColor() const { return til::color{ 0xFF, 0xFF, 0xFF }; }
+-    til::color GhosttyControlCore::BackgroundColor() const { return til::color{ 0x28, 0x2C, 0x34 }; }
++    // The colour the application last set with OSC 10/11 (or restored with
++    // OSC 110/111), else the profile's scheme - the same default the
++    // translator hands ghostty. These were constant stubs returning ghostty's
++    // own default, #282c34, and the padding is painted from
++    // BackgroundColor(): the first OSC 11 or 111 a program sent turned the
++    // padding that grey for the life of the tab (KD-33).
++    til::color GhosttyControlCore::ForegroundColor() const
++    {
++        if (_foregroundColor)
++        {
++            return *_foregroundColor;
++        }
++        if (const auto scheme = _settings.try_as<Core::ICoreScheme>())
++        {
++            return til::color{ scheme.DefaultForeground() };
++        }
++        return til::color{ 0xFF, 0xFF, 0xFF };
++    }
++
++    til::color GhosttyControlCore::BackgroundColor() const
++    {
++        if (_backgroundColor)
++        {
++            return *_backgroundColor;
++        }
++        if (const auto scheme = _settings.try_as<Core::ICoreScheme>())
++        {
++            return til::color{ scheme.DefaultBackground() };
++        }
++        return til::color{ 0x28, 0x2C, 0x34 };
++    }
+ 
+     float GhosttyControlCore::Opacity() const noexcept { return 1.0f; }
+     bool GhosttyControlCore::UseAcrylic() const noexcept { return false; }
+diff --git a/src/cascadia/TerminalControl/GhosttyControlCore.h b/src/cascadia/TerminalControl/GhosttyControlCore.h
+index 748023316..3e06376d1 100644
+--- a/src/cascadia/TerminalControl/GhosttyControlCore.h
++++ b/src/cascadia/TerminalControl/GhosttyControlCore.h
+@@ -333,6 +333,12 @@ namespace winrt::Microsoft::Terminal::Control::implementation
+         float _panelHeight{ 0 };
+         float _compositionScale{ 1.0f };
+ 
++        // The last dynamic colours ghostty reported through
++        // GHOSTTY_ACTION_COLOR_CHANGE; empty until a program sets one. UI
++        // thread only. See BackgroundColor().
++        std::optional<til::color> _foregroundColor;
++        std::optional<til::color> _backgroundColor;
++
+         // Whether ghostty believes the left button is down. WT never reports
+         // a release outside VT mouse mode, so this tracks it - see
+         // _releaseMouseIfHeld.
