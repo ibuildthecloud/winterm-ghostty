@@ -32,6 +32,20 @@ Nothing switches engine by itself. Add `"engine": "ghostty"` to a profile — or
 
 To confirm a pane is really using it, open the search box (`Ctrl+Shift+F`): on a ghostty pane the regex and case toggles are greyed out.
 
+## New in 0.2.17
+
+### No more grey border around a ghostty pane
+
+A ghostty pane could grow a grey border, on its padding, that stayed until the
+tab was closed. Any program that set or reset the terminal's background colour
+caused it, even to the colour it already had, which is why it seemed to appear
+from nowhere. The padding is now painted the same colour as the rest of the
+pane, and follows it when a program changes it
+([KD-33](https://github.com/ibuildthecloud/winterm-ghostty/blob/main/docs/known-defects.md)).
+
+To clear the border on an older build without closing the tab, save the
+settings: any settings reload repaints the padding.
+
 ## New in 0.2.16
 
 ### Full-screen programs no longer leave text drawn in the wrong place

@@ -3273,4 +3273,8 @@ window was captured with `wgc-shot` and the padding and cells were sampled:
 | after | OSC 11 red | `#C00000` | `#C00000` |
 | after | OSC 11, then OSC 111 | `#0C0C0C` | `#0C0C0C` (Campbell) |
 
-**Not yet confirmed by the reporter** in their own RDP workflow.
+**Reproduced by the reporter** on 0.2.16 with `printf '\e]11;#000000'` and
+with `printf '\e]111'` in a ghostty pane: both turn the padding grey at once.
+They watched the fixed build run set-then-reset, which stayed clean, and
+confirmed that saving the settings clears the grey on an unfixed build. Not yet
+confirmed in their own workflow across an RDP switch. Shipped in 0.2.17.
